@@ -1,0 +1,33 @@
+[package]
+name = "agent-sidekick"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+directories = "6.0.0"
+keyring = "4.2.0"
+rmcp = { version = "3.6.0", features = ["server", "transport-io", "macros"] }
+rpassword = "7.5.4"
+schemars = "1.2.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.0", features = ["full"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.28.0", features = ["v4"] }
+which = "8.0.6"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_JobObjects", "Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.191"
+
+[dev-dependencies]
+tempfile = "3.27.0"
