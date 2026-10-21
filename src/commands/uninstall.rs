@@ -78,6 +78,16 @@ fn remove_registration() -> Result<()> {
     } else {
         println!("MCP server `{APP_NAME}` was not registered in user scope.");
     }
+    // Entries in local/project scope (for the current directory) are left alone.
+    if let Ok(Some(entry)) = claude_cli::mcp_get(&found.path) {
+        if !entry.is_user_scope() {
+            println!(
+                "Note: `{APP_NAME}` is still registered here ({}). Remove it with {}.",
+                entry.scope.as_deref().unwrap_or("unknown scope"),
+                claude_cli::remove_hint(&entry)
+            );
+        }
+    }
     Ok(())
 }
 
