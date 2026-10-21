@@ -630,3 +630,19 @@ Not changed (design or scope), as the verifier also allowed:
 - "Prüfung nicht möglich (<reason>)": the reason is the probe's (English) error text; kept, like the English registration and doctor output.
 - The Gemini prompt as one argument (Windows ~32 KiB limit) is documented above.
 - The WSL ETXTBSY failure in `runner_fake_claude::long_prompt_is_sent_via_stdin` is a pre-existing race with the fake script, not wizard code; it did not occur in this run.
+
+## End-user README (2026-10-21)
+
+- **Language and split:** `README.md` is for end users and in German (target audience: universities in NRW; the setup wizard is German too). The previous English README, minus Quickstart and Updating, is now `docs/REFERENCE.md` (technical reference: backends, configuration, tools, CLI, security); relative links were adjusted. Tests that parse the documented config examples, `doctor`'s hint and the template header now point to `docs/REFERENCE.md`. Release archives still contain `README.md` (now the German user guide).
+- **Draft by kiconnect:** gpt-oss-120b wrote the draft from a fact sheet in 2 steps (17k tokens in, 24 s). Review corrections: the installer was described as checking prerequisites and asking for profiles (that is the setup wizard); the second Claude account was listed as a general prerequisite; the Node.js download and `winget` were missing; "keys in the keyring *and* as a file" (the file is only a fallback); missing FAQ answer for a missing Node.js, "separate terminal" and `setup --backend sidekick` for the token, version pinning; non-breaking hyphens; missing blank lines before headings and code blocks; gender-neutral wording. The reply claimed 173 lines; the file had 103.
+- **KI:connect key facts** come from the RWTH IT Center Help page "API keys and access (KI:connect / RWTHgpt)" (last changed 2026-10-19): API Key Management under your name, Create Key, one month validity extended by each web login, "Rotate" after expiry, same quota as the web interface, limited parallel requests. Screenshots are placeholders ("Screenshot folgt").
+
+## Manual checks before the first release tag (not automatable here)
+
+- One-liner on a **fresh Windows 11** machine (`irm .../install.ps1 | iex`): download, checksum, user PATH entry, wizard start, registration, `/mcp` in VS Code.
+- One-liner on a **fresh Linux** machine (x86_64; aarch64 if available): rc-file offer, wizard via `/dev/tty`, Secret Service keyring or file fallback.
+- **Plugin installation** (`/plugin marketplace add AAPPHH/agent-sidekick`, `/plugin install agent-sidekick@agent-sidekick`) in a real Claude Code with the published repository.
+- The wizard in a **real terminal** (only tested with scripted answers): hidden input, npm install of OpenCode, the KI:connect key check, registration and doctor.
+- **Gemini** with a real key (the backend has never made a model call).
+- **Second Claude account** end to end (`setup-token`, a real `sidekick_run`; so far only tested against a fake API).
+- The **aarch64 musl** build (only built by the release workflow on the `ubuntu-24.04-arm` runner).

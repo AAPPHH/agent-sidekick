@@ -34,7 +34,7 @@ fn resolve_str(text: &str) -> Result<Backends, String> {
     resolve_in(text, &abs("cfg"))
 }
 
-/// The KI:connect example from the README / examples/config.toml.
+/// The KI:connect example from docs/REFERENCE.md / examples/config.toml.
 const KICONNECT: &str = r#"
 [backends.kiconnect]
 harness = "opencode"
@@ -1289,10 +1289,10 @@ description = "b"
     }
 }
 
-/// The opencode examples in the README and (commented out) in examples/config.toml resolve.
+/// The opencode examples in docs/REFERENCE.md and (commented out) in examples/config.toml resolve.
 #[test]
 fn documented_examples_are_valid() {
-    let readme = include_str!("../../../README.md").replace("\r\n", "\n");
+    let readme = include_str!("../../../docs/REFERENCE.md").replace("\r\n", "\n");
     let marker = "```toml\n[backends.kiconnect]\nharness = \"opencode\"";
     let start = readme.find(marker).unwrap() + "```toml\n".len();
     let end = start + readme[start..].find("```").unwrap();

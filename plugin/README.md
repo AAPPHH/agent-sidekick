@@ -19,11 +19,11 @@ irm https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.ps
 ```
 
 Or from source: `cargo install --path .` in a clone. See the main
-[README](https://github.com/AAPPHH/agent-sidekick#quickstart) for details.
+[README](https://github.com/AAPPHH/agent-sidekick#installation-zwei-befehle) for details.
 
 ## 2. Store the tokens, without registering
 
-Create the token(s) as described in the main README (Quickstart step 2), then store them
+Create the token(s) as described in the main README (section "Token für das Claude-Zweitkonto erzeugen"), then store them
 **without** the MCP registration, because the plugin does the registering:
 
 ```sh
