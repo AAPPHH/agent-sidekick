@@ -271,13 +271,13 @@ impl System for Fake {
         self.secrets
             .borrow()
             .contains_key(id)
-            .then(|| "fake keyring".to_owned())
+            .then(|| "im Fake-Schlüsselbund".to_owned())
     }
     fn store_secret(&self, id: &SecretId, secret: &Token) -> Result<String> {
         self.secrets
             .borrow_mut()
             .insert(id.clone(), secret.expose().to_owned());
-        Ok("fake keyring".to_owned())
+        Ok("im Fake-Schlüsselbund".to_owned())
     }
     fn probe_get(&self, url: &str, bearer: Option<&str>) -> ProbeResponse {
         self.probes
@@ -518,6 +518,10 @@ fn nothing_selected_is_asked_again_then_aborts() {
         vec![A::Many(vec![]), A::Many(vec![1]), A::Secret(CLAUDE_TOKEN)],
     );
     assert!(out.contains("Bitte mindestens ein Profil wählen."), "{out}");
+    assert!(
+        out.contains("OAuth-Token von Backend `sidekick` gespeichert im Fake-Schlüsselbund."),
+        "{out}"
+    );
     assert_eq!(fake.resolved().names(), ["sidekick"]);
 
     let fake = Fake::new();
@@ -904,6 +908,7 @@ fn empty_or_multiline_secret_is_asked_again() {
             A::Secret(""),
             A::Secret(""),
             A::Secret(""),
+            A::Yes, // go on without the key
         ],
     );
     assert!(
@@ -912,6 +917,40 @@ fn empty_or_multiline_secret_is_asked_again() {
     );
     assert!(fake.secrets.borrow().is_empty());
     assert!(fake.cfg().exists());
+
+    // Not going on without the key (or EOF at that question): abort, nothing written.
+    let fake = Fake::new();
+    let (err, _) = run_err(
+        &fake,
+        vec![
+            A::Many(vec![2]),
+            A::Secret(""),
+            A::Secret(""),
+            A::Secret(""),
+            A::No,
+        ],
+    );
+    assert!(err.contains("Es wurde nichts geändert"), "{err}");
+    assert_nothing_written(&fake);
+}
+
+#[test]
+fn short_secret_gets_the_redaction_warning() {
+    let fake = Fake::new();
+    let (_, out) = run_ok(&fake, vec![A::Many(vec![2]), A::Secret("k3y")]);
+    assert!(
+        out.contains(&format!("kürzer als {MIN_SECRET_LEN} Zeichen")),
+        "{out}"
+    );
+    assert_eq!(
+        fake.secret(&SecretId::Command("gemini".into())).as_deref(),
+        Some("k3y")
+    );
+
+    // A normal key: no warning.
+    let fake = Fake::new();
+    let (_, out) = run_ok(&fake, vec![A::Many(vec![2]), A::Secret(GEMINI_KEY)]);
+    assert!(!out.contains("kürzer als"), "{out}");
 }
 
 /// A local HTTP server answering one status per connection, in order.

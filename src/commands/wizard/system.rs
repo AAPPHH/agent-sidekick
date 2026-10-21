@@ -11,7 +11,7 @@ use crate::backends::reach::{self, ProbeResponse};
 use crate::backends::ResolveDefaults;
 use crate::harness::HarnessKind;
 use crate::locate::Os;
-use crate::token::{self, SecretId, Token};
+use crate::token::{self, SecretId, Token, TokenSource};
 
 /// Timeout of the KI:connect key check (`GET {base_url}/models`).
 pub const KEY_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -152,11 +152,11 @@ impl System for RealSystem {
     fn stored_secret(&self, id: &SecretId) -> Option<String> {
         token::load_secret(id)
             .ok()
-            .map(|(_, source)| source.to_string())
+            .map(|(_, source)| source_label(&source))
     }
 
     fn store_secret(&self, id: &SecretId, secret: &Token) -> Result<String> {
-        Ok(token::store_secret(id, secret)?.to_string())
+        Ok(source_label(&token::store_secret(id, secret)?))
     }
 
     fn probe_get(&self, url: &str, bearer: Option<&str>) -> ProbeResponse {
@@ -182,9 +182,32 @@ impl System for RealSystem {
     }
 }
 
+/// German description of where a secret is stored (the `Display` of [`TokenSource`] is
+/// the English one of `setup` and `doctor`).
+fn source_label(source: &TokenSource) -> String {
+    match source {
+        TokenSource::Env => format!("in der Umgebungsvariable {}", token::ENV_TOKEN),
+        TokenSource::Keyring => format!(
+            "im Schlüsselbund des Betriebssystems (Dienst {})",
+            token::KEYRING_SERVICE
+        ),
+        TokenSource::File(p) => format!("in der Datei {}", p.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_labels_are_german() {
+        assert_eq!(
+            source_label(&TokenSource::File(PathBuf::from("x").join("token"))),
+            format!("in der Datei {}", PathBuf::from("x").join("token").display())
+        );
+        assert!(source_label(&TokenSource::Keyring).starts_with("im Schlüsselbund"));
+        assert!(source_label(&TokenSource::Env).starts_with("in der Umgebungsvariable"));
+    }
 
     /// Read-only look at the real machine (runs `npm root -g` and `--version`s); run by
     /// hand with `cargo test real_locators -- --ignored --nocapture`.

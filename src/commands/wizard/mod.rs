@@ -25,8 +25,8 @@ use crate::backends::reach::ProbeResponse;
 use crate::backends::{Backend, BackendKind, Backends};
 use crate::config::Config;
 use crate::locate::Os;
-use crate::redact::redact_all;
-use crate::token::{SecretId, Token, EXPECTED_PREFIX};
+use crate::redact::{redact_all, MIN_SECRET_LEN};
+use crate::token::{self, SecretId, Token, EXPECTED_PREFIX};
 use crate::APP_NAME;
 use io::Prompter;
 use system::{System, Tool};
@@ -358,11 +358,11 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
             anyhow::anyhow!(
                 "{}: Speichern fehlgeschlagen: {}. Nächster Schritt: `agent-sidekick setup \
                  --backend {name}`",
-                id,
+                secret_label(id),
                 redact_all(&format!("{e:#}"))
             )
         })?;
-        p.say(&format!("Gespeichert: {id} in {source}"));
+        p.say(&format!("{} gespeichert {source}.", secret_label(id)));
     }
     drop(secrets);
 
@@ -682,6 +682,16 @@ fn ask_secret(
                  Token aus `claude setup-token`. Er wird trotzdem gespeichert."
             ));
         }
+        // Same rule as `setup` (token::check_*_format): short values are not redacted.
+        if matches!(
+            token::check_command_secret_format(token.expose()),
+            token::FormatCheck::Warn(_)
+        ) {
+            p.say(&format!(
+                "Warnung: Der Schlüssel ist kürzer als {MIN_SECRET_LEN} Zeichen und wird deshalb \
+                 nicht aus Logs und Ausgaben entfernt. Er wird trotzdem gespeichert."
+            ));
+        }
         match verify_key(p, s, prof, backend, &token)? {
             Verified::Keep => return Ok(Some((id, token))),
             Verified::Retry => continue,
@@ -696,8 +706,21 @@ fn ask_secret(
     }
 }
 
+/// German name of a stored secret (the `Display` of [`SecretId`] is the English one of
+/// `setup` and `doctor`).
+fn secret_label(id: &SecretId) -> String {
+    match id {
+        SecretId::Oauth(n) => format!("OAuth-Token von Backend `{n}`"),
+        SecretId::Endpoint(n) => format!("API-Schlüssel von Backend `{n}`"),
+        SecretId::Command(n) => format!("Schlüssel von Backend `{n}`"),
+        SecretId::Backend(n) => format!("Provider-Schlüssel von Backend `{n}`"),
+    }
+}
+
 /// Read a secret until it is non-empty and has no control characters (three tries).
-/// `None`: given up.
+/// `None`: given up, and the user chose to go on without it. After three bad inputs the
+/// wizard asks on a line prompt, so a closed input (EOF: the hidden prompt then reads an
+/// empty string) aborts there instead of silently going on; nothing is written yet.
 fn read_valid_secret(p: &mut dyn Prompter, prompt: &str) -> Result<Option<Token>> {
     for _ in 0..3 {
         let token = p.secret(prompt)?;
@@ -708,6 +731,12 @@ fn read_valid_secret(p: &mut dyn Prompter, prompt: &str) -> Result<Option<Token>
         } else {
             return Ok(Some(token));
         }
+    }
+    if !p.confirm("Ohne diesen Schlüssel weitermachen?", true)? {
+        bail!(
+            "Abgebrochen. Es wurde nichts geändert. Nächster Schritt: den Schlüssel bereitlegen \
+             und `agent-sidekick setup` erneut ausführen."
+        );
     }
     Ok(None)
 }
