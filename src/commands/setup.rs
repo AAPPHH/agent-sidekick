@@ -3,8 +3,9 @@
 //! - Without `--backend`: asks for the OAuth token of every claude-oauth backend (in name
 //!   order), prints a hint for claude-endpoint/command backends, then (re-)registers the
 //!   MCP server with Claude Code.
-//! - With `--backend <name>`: handles only that backend (OAuth token, endpoint API key or
-//!   an info line) and never changes the MCP registration.
+//! - With `--backend <name>`: handles only that backend (OAuth token, endpoint API key, the
+//!   `secret_env` value of a command backend, or an info line) and never changes the MCP
+//!   registration.
 
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -31,7 +32,8 @@ pub struct SetupArgs {
     /// Explicit path to the `claude` executable (skips auto-detection).
     #[arg(long, value_name = "PATH")]
     pub claude: Option<PathBuf>,
-    /// Set up only this backend (token or API key); the MCP registration is not changed.
+    /// Set up only this backend (token, API key or command secret); the MCP registration is
+    /// not changed.
     #[arg(long, value_name = "NAME")]
     pub backend: Option<String>,
 }
@@ -47,13 +49,20 @@ pub enum Step {
     EndpointUsesEnv { name: String, var: String },
     /// claude-endpoint without `api_key_env` in a full setup: hint to `setup --backend`.
     EndpointHint { name: String },
-    /// command: nothing to store.
+    /// command with `secret_env`, only with `--backend`: prompt for the secret.
+    CommandSecret { name: String, var: String },
+    /// command with `secret_env` in a full setup: hint to `setup --backend`.
+    CommandSecretHint { name: String, var: String },
+    /// command without `secret_env`: nothing to store.
     CommandInfo { name: String },
 }
 
 impl Step {
     pub fn asks_secret(&self) -> bool {
-        matches!(self, Step::OauthToken { .. } | Step::EndpointKey { .. })
+        matches!(
+            self,
+            Step::OauthToken { .. } | Step::EndpointKey { .. } | Step::CommandSecret { .. }
+        )
     }
 }
 
@@ -87,6 +96,20 @@ pub fn plan(backends: &Backends, only: Option<&str>) -> Result<Vec<Step>, String
                     config_dir: config_dir.clone(),
                 },
                 BackendKind::ClaudeEndpoint { .. } => Step::EndpointHint { name },
+                BackendKind::Command {
+                    secret_env: Some(var),
+                    ..
+                } if single => Step::CommandSecret {
+                    name,
+                    var: var.clone(),
+                },
+                BackendKind::Command {
+                    secret_env: Some(var),
+                    ..
+                } => Step::CommandSecretHint {
+                    name,
+                    var: var.clone(),
+                },
                 BackendKind::Command { .. } => Step::CommandInfo { name },
             }
         })
@@ -124,6 +147,8 @@ fn step_name(step: &Step) -> &str {
         | Step::EndpointKey { name, .. }
         | Step::EndpointUsesEnv { name, .. }
         | Step::EndpointHint { name }
+        | Step::CommandSecret { name, .. }
+        | Step::CommandSecretHint { name, .. }
         | Step::CommandInfo { name } => name,
     }
 }
@@ -267,6 +292,19 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
             "Backend `{name}` (claude-endpoint): run `{APP_NAME} setup --backend {name}` to store \
              its API key."
         ),
+        Step::CommandSecret { name, var } => {
+            let secret = read_secret(token_stdin, &secret_prompt(name, var))?;
+            if let FormatCheck::Warn(msg) = token::check_command_secret_format(secret.expose()) {
+                eprintln!("warning: {msg}");
+            }
+            let source = token::store_secret(&SecretId::Command(name.clone()), &secret)?;
+            drop(secret);
+            println!("Value for {var} of backend `{name}` stored in {source}.");
+        }
+        Step::CommandSecretHint { name, var } => println!(
+            "Backend `{name}` (command): run `{APP_NAME} setup --backend {name}` to store the \
+             value for {var}."
+        ),
         Step::CommandInfo { name } => {
             let program = backends
                 .get(name)
@@ -284,6 +322,11 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Prompt for the `secret_env` value of a command backend.
+fn secret_prompt(name: &str, var: &str) -> String {
+    format!("Value for {var} of backend {name} (input hidden): ")
 }
 
 /// `--claude` wins over auto-detection (`config_claude_path`: `claude_path` in config.toml).
@@ -408,7 +451,9 @@ fn looks_like_dev_build(exe: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::backends::tests::{abs, command, endpoint, oauth, sample};
+    use super::super::backends::tests::{
+        abs, command, command_with_secret, endpoint, oauth, sample,
+    };
     use super::*;
 
     #[test]
@@ -567,6 +612,64 @@ mod tests {
         assert!(
             w.contains("claude mcp remove agent-sidekick -s project`"),
             "{w}"
+        );
+    }
+
+    #[test]
+    fn command_secret_steps() {
+        let b = Backends::new(vec![
+            oauth("sidekick", true),
+            command_with_secret("kic", "OPENAI_API_KEY", false),
+            command("plain", false),
+        ]);
+        // Full setup: only a hint for the command secret, no prompt.
+        let full = plan(&b, None).unwrap();
+        assert_eq!(
+            full,
+            vec![
+                Step::CommandSecretHint {
+                    name: "kic".into(),
+                    var: "OPENAI_API_KEY".into()
+                },
+                Step::CommandInfo {
+                    name: "plain".into()
+                },
+                Step::OauthToken {
+                    name: "sidekick".into(),
+                    config_dir: abs(".claude-sidekick")
+                },
+            ]
+        );
+        let asked: Vec<&str> = full
+            .iter()
+            .filter(|s| s.asks_secret())
+            .map(step_name)
+            .collect();
+        assert_eq!(asked, ["sidekick"]);
+        // --token-stdin in a full setup still means the single oauth token.
+        assert!(check_token_stdin(&full, true, false).is_ok());
+
+        // --backend kic: prompt for the value; --token-stdin works.
+        let one = plan(&b, Some("kic")).unwrap();
+        assert_eq!(
+            one,
+            vec![Step::CommandSecret {
+                name: "kic".into(),
+                var: "OPENAI_API_KEY".into()
+            }]
+        );
+        assert!(one[0].asks_secret());
+        assert!(check_token_stdin(&one, true, true).is_ok());
+        // A command backend without secret_env still has nothing to store.
+        let none = plan(&b, Some("plain")).unwrap();
+        assert!(check_token_stdin(&none, true, true).is_err());
+    }
+
+    #[test]
+    fn command_secret_prompt_names_variable_and_backend() {
+        assert_eq!(
+            secret_prompt("kic", "OPENAI_API_KEY"),
+            "Value for OPENAI_API_KEY of backend kic (input hidden): "
         );
     }
 

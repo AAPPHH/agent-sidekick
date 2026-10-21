@@ -90,8 +90,8 @@ pub fn check_format(token: &str) -> FormatCheck {
     }
 }
 
-/// Which stored secret: the OAuth token of a claude-oauth backend or the API key of a
-/// claude-endpoint backend. A claude-oauth backend named `sidekick` uses the v0.1
+/// Which stored secret: the OAuth token of a claude-oauth backend, the API key of a
+/// claude-endpoint backend or the `secret_env` value of a command backend. A claude-oauth backend named `sidekick` uses the v0.1
 /// locations (keyring user `oauth-token`, file `token`, env `AGENT_SIDEKICK_TOKEN`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SecretId {
@@ -99,6 +99,8 @@ pub enum SecretId {
     Oauth(String),
     /// API key of the claude-endpoint backend with this name.
     Endpoint(String),
+    /// Secret of the command backend with this name (handed over in its `secret_env`).
+    Command(String),
 }
 
 impl SecretId {
@@ -107,21 +109,25 @@ impl SecretId {
         SecretId::Oauth(crate::backends::IMPLICIT_BACKEND.to_owned())
     }
 
-    /// Keyring user name: `oauth-token`, `oauth-token-<name>` or `endpoint-<name>`.
+    /// Keyring user name: `oauth-token`, `oauth-token-<name>`, `endpoint-<name>` or
+    /// `cmd-<name>`.
     pub fn keyring_user(&self) -> String {
         match self {
             SecretId::Oauth(_) if self.is_legacy() => KEYRING_USER.to_owned(),
             SecretId::Oauth(n) => format!("{KEYRING_USER}-{n}"),
             SecretId::Endpoint(n) => format!("endpoint-{n}"),
+            SecretId::Command(n) => format!("cmd-{n}"),
         }
     }
 
-    /// File name in the config dir: `token`, `token-<name>` or `endpoint-<name>.key`.
+    /// File name in the config dir: `token`, `token-<name>`, `endpoint-<name>.key` or
+    /// `cmd-<name>.key`.
     pub fn file_name(&self) -> String {
         match self {
             SecretId::Oauth(_) if self.is_legacy() => LEGACY_FILE_NAME.to_owned(),
             SecretId::Oauth(n) => format!("{LEGACY_FILE_NAME}-{n}"),
             SecretId::Endpoint(n) => format!("endpoint-{n}.key"),
+            SecretId::Command(n) => format!("cmd-{n}.key"),
         }
     }
 
@@ -146,6 +152,7 @@ impl fmt::Display for SecretId {
         match self {
             SecretId::Oauth(n) => write!(f, "OAuth token of backend `{n}`"),
             SecretId::Endpoint(n) => write!(f, "API key of backend `{n}`"),
+            SecretId::Command(n) => write!(f, "secret of backend `{n}`"),
         }
     }
 }
@@ -216,6 +223,19 @@ pub fn check_endpoint_key_format(key: &str) -> FormatCheck {
         FormatCheck::Warn(format!(
             "key is shorter than {MIN_SECRET_LEN} characters, so it will not be redacted \
              from logs; fine for placeholder keys of local servers such as 'ollama'"
+        ))
+    } else {
+        FormatCheck::Ok
+    }
+}
+
+/// Format check for the `secret_env` value of a command backend: any value is accepted, but
+/// values shorter than [`MIN_SECRET_LEN`] are not redacted from logs and output.
+pub fn check_command_secret_format(value: &str) -> FormatCheck {
+    if value.trim().chars().count() < MIN_SECRET_LEN {
+        FormatCheck::Warn(format!(
+            "value is shorter than {MIN_SECRET_LEN} characters, so it will not be redacted \
+             from logs and run output"
         ))
     } else {
         FormatCheck::Ok
@@ -773,6 +793,10 @@ mod tests {
         SecretId::Endpoint(n.to_owned())
     }
 
+    fn cmd(n: &str) -> SecretId {
+        SecretId::Command(n.to_owned())
+    }
+
     #[test]
     fn secret_id_names() {
         let legacy = SecretId::legacy();
@@ -806,6 +830,22 @@ mod tests {
         // OAuth and endpoint secrets of the same backend name never share a slot.
         assert_ne!(oauth("local").keyring_user(), local.keyring_user());
         assert_ne!(oauth("local").file_name(), local.file_name());
+
+        let kic = cmd("kiconnect");
+        assert!(!kic.is_legacy());
+        assert_eq!(kic.keyring_user(), "cmd-kiconnect");
+        assert_eq!(kic.file_name(), "cmd-kiconnect.key");
+        assert_eq!(kic.env_override(), None);
+        assert_eq!(kic.to_string(), "secret of backend `kiconnect`");
+        // A command backend named `sidekick` is not the legacy secret either.
+        assert!(!cmd("sidekick").is_legacy());
+        assert_eq!(cmd("sidekick").env_override(), None);
+        assert_eq!(cmd("sidekick").keyring_user(), "cmd-sidekick");
+        // No slot is shared with the other kinds of the same name.
+        for other in [oauth("kiconnect"), endpoint("kiconnect")] {
+            assert_ne!(other.keyring_user(), kic.keyring_user());
+            assert_ne!(other.file_name(), kic.file_name());
+        }
     }
 
     #[test]
@@ -813,6 +853,7 @@ mod tests {
         assert_eq!(OsKeyring::for_id(&SecretId::legacy()).user, KEYRING_USER);
         assert_eq!(OsKeyring::for_id(&oauth("work")).user, "oauth-token-work");
         assert_eq!(OsKeyring::for_id(&endpoint("local")).user, "endpoint-local");
+        assert_eq!(OsKeyring::for_id(&cmd("aider")).user, "cmd-aider");
     }
 
     /// The legacy wrappers read and write exactly the v0.1 file.
@@ -827,6 +868,10 @@ mod tests {
         assert_eq!(
             secret_file(&endpoint("local")).unwrap(),
             dir.join("endpoint-local.key")
+        );
+        assert_eq!(
+            secret_file(&cmd("aider")).unwrap(),
+            dir.join("cmd-aider.key")
         );
     }
 
@@ -852,6 +897,7 @@ mod tests {
         for (id, secret) in [
             (oauth("work"), "sk-ant-oat01-WORKSECRET"),
             (endpoint("local"), "ollama"),
+            (cmd("kiconnect"), "cmd-secret-0123456789"),
         ] {
             let path = dir.path().join(id.file_name());
             assert!(matches!(
@@ -878,7 +924,7 @@ mod tests {
     #[test]
     fn roundtrip_keyring_store_per_id() {
         let dir = tempfile::tempdir().unwrap();
-        for id in [oauth("work"), endpoint("local")] {
+        for id in [oauth("work"), endpoint("local"), cmd("kiconnect")] {
             let path = dir.path().join(id.file_name());
             let kr = FakeStore::default();
             let src = store_with(&Token::new(SAMPLE), Some(&kr), &path).unwrap();
@@ -917,7 +963,12 @@ mod tests {
     fn env_override_only_for_legacy() {
         let dir = tempfile::tempdir().unwrap();
         let e = env(&[(ENV_TOKEN, "sk-ant-oat01-env")]);
-        for id in [oauth("work"), endpoint("local"), endpoint("sidekick")] {
+        for id in [
+            oauth("work"),
+            endpoint("local"),
+            endpoint("sidekick"),
+            cmd("sidekick"),
+        ] {
             let path = dir.path().join(id.file_name());
             assert!(matches!(
                 load_secret_with(&id, &e, None, Some(&path)),
@@ -960,12 +1011,51 @@ mod tests {
     }
 
     #[test]
+    fn command_secret_format() {
+        assert_eq!(check_command_secret_format("12345678"), FormatCheck::Ok);
+        for short in ["", "abc", " 1234567 \n"] {
+            match check_command_secret_format(short) {
+                FormatCheck::Warn(msg) => {
+                    assert!(msg.contains("shorter than 8 characters"), "{msg}");
+                    assert!(msg.contains("will not be redacted"), "{msg}");
+                }
+                FormatCheck::Ok => panic!("expected warning for {short:?}"),
+            }
+        }
+    }
+
+    /// A command secret stored for one backend is never found under another backend's id.
+    #[test]
+    fn command_secrets_are_per_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = cmd("a");
+        let b = cmd("b");
+        let a_path = dir.path().join(a.file_name());
+        let b_path = dir.path().join(b.file_name());
+        assert_ne!(a_path, b_path);
+        store_with(&Token::new("secret-of-backend-a"), None, &a_path).unwrap();
+        assert!(matches!(
+            load_secret_with(&b, env(&[]), None, Some(&b_path)),
+            Err(TokenError::Missing)
+        ));
+        let (t, _) = load_secret_with(&a, env(&[]), None, Some(&a_path)).unwrap();
+        assert_eq!(t.expose(), "secret-of-backend-a");
+    }
+
+    #[test]
     fn secret_id_texts_do_not_leak() {
         let secret = "SECRETSECRET-endpoint";
-        let ids = [SecretId::legacy(), oauth("work"), endpoint("local")];
+        let ids = [
+            SecretId::legacy(),
+            oauth("work"),
+            endpoint("local"),
+            cmd("aider"),
+        ];
         let mut texts = vec![
             format!("{:?}", check_endpoint_key_format(secret)),
             format!("{:?}", check_endpoint_key_format("short")),
+            format!("{:?}", check_command_secret_format(secret)),
+            format!("{:?}", check_command_secret_format("short")),
         ];
         for id in &ids {
             texts.push(format!("{id:?}"));

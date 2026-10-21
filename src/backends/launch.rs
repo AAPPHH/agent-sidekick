@@ -22,8 +22,22 @@ pub enum Credential {
     OauthToken(Token),
     /// claude-endpoint: becomes `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`.
     ApiKey(Token),
-    /// command backends.
+    /// command backend with `secret_env`: becomes that variable.
+    CommandSecret(Token),
+    /// command backends without `secret_env`.
     None,
+}
+
+impl Credential {
+    /// The secret value, if any (for redaction; never print it).
+    pub fn secret(&self) -> Option<&Token> {
+        match self {
+            Credential::OauthToken(t) | Credential::ApiKey(t) | Credential::CommandSecret(t) => {
+                Some(t)
+            }
+            Credential::None => None,
+        }
+    }
 }
 
 /// Prefixes of inherited variables that are always removed (session isolation).
@@ -133,7 +147,26 @@ fn load_credential_with(
                 )),
             }
         }
-        BackendKind::Command { .. } => Ok((Credential::None, "none needed".to_owned())),
+        BackendKind::Command {
+            secret_env: Some(var),
+            ..
+        } => {
+            let id = SecretId::Command(name.clone());
+            match secret_loader(&id) {
+                Ok((secret, source)) => Ok((Credential::CommandSecret(secret), source.to_string())),
+                Err(TokenError::Missing) | Err(TokenError::Empty) => Err(format!(
+                    "No secret stored for backend '{name}' (secret_env {var}). Run \
+                     'agent-sidekick setup --backend {name}' in a terminal."
+                )),
+                Err(TokenError::Storage(e)) => Err(format!(
+                    "Cannot read the {id}: {e}. Run 'agent-sidekick doctor' or \
+                     'agent-sidekick setup --backend {name}' in a terminal."
+                )),
+            }
+        }
+        BackendKind::Command {
+            secret_env: None, ..
+        } => Ok((Credential::None, "none needed".to_owned())),
     }
 }
 
@@ -283,7 +316,9 @@ fn set_var(env: &mut Vec<(OsString, OsString)>, name: &str, value: impl Into<OsS
 
 /// Child environment for `backend`: `base` minus the removed variables (session
 /// isolation, competing credentials), plus `pass_env` exceptions (global + per backend),
-/// the backend's `env` table, and the type-specific variables (see the design doc).
+/// the backend's `env` table, and the type-specific variables (see the design doc). For a
+/// command backend with `secret_env`, that variable is set to the stored secret last, so it
+/// replaces any inherited value of the same name.
 pub fn child_env(
     backend: &Backend,
     base: impl IntoIterator<Item = (OsString, OsString)>,
@@ -357,7 +392,14 @@ fn child_env_inner(
             env.retain(|(k, _)| !eq_name(k, OAUTH_TOKEN_ENV));
             mismatch
         }
-        (BackendKind::Command { .. }, cred) => !matches!(cred, Credential::None),
+        (BackendKind::Command { secret_env, .. }, cred) => match (secret_env, cred) {
+            (Some(var), Credential::CommandSecret(t)) => {
+                set_var(&mut env, var, t.expose());
+                false
+            }
+            (None, Credential::None) => false,
+            _ => true,
+        },
     };
     (env, mismatch)
 }
@@ -407,11 +449,16 @@ pub fn build_launch(
 ) -> Result<Launch, String> {
     let name = &backend.name;
     let ty = backend.backend_type();
+    let command_secret = match &backend.kind {
+        BackendKind::Command { secret_env, .. } => secret_env.as_deref(),
+        _ => None,
+    };
     let credential_ok = matches!(
-        (ty, credential),
-        (BackendType::ClaudeOauth, Credential::OauthToken(_))
-            | (BackendType::ClaudeEndpoint, Credential::ApiKey(_))
-            | (BackendType::Command, Credential::None)
+        (ty, command_secret, credential),
+        (BackendType::ClaudeOauth, _, Credential::OauthToken(_))
+            | (BackendType::ClaudeEndpoint, _, Credential::ApiKey(_))
+            | (BackendType::Command, None, Credential::None)
+            | (BackendType::Command, Some(_), Credential::CommandSecret(_))
     );
     if !credential_ok {
         return Err(format!(
@@ -443,9 +490,9 @@ pub fn build_launch(
                 model,
                 ..req.clone()
             };
-            let secrets = match credential {
-                Credential::OauthToken(t) | Credential::ApiKey(t) => Secrets::new([t.expose()]),
-                Credential::None => Secrets::none(),
+            let secrets = match credential.secret() {
+                Some(t) => Secrets::new([t.expose()]),
+                None => Secrets::none(),
             };
             Ok(crate::runner::claude_launch(
                 program, &req2, env, secrets, header,
@@ -454,6 +501,7 @@ pub fn build_launch(
         BackendKind::Command {
             command,
             prompt_via_stdin,
+            secret_env,
         } => {
             if crate::locate::is_batch_script(program) && !prompt_via_stdin {
                 return Err(format!(
@@ -486,12 +534,23 @@ pub fn build_launch(
             if non_blank(req.model.as_deref()).is_some() || tools_set {
                 header.push(COMMAND_IGNORED_NOTE.to_owned());
             }
+            if let Some(var) = secret_env {
+                // The name only; the value never goes into the header.
+                header.push(format!(
+                    "secret_env: {var} (stored secret, value not shown)"
+                ));
+            }
+            // Secrets shorter than MIN_SECRET_LEN are dropped here (not redacted).
+            let secrets = match credential.secret() {
+                Some(t) => Secrets::new([t.expose()]),
+                None => Secrets::none(),
+            };
             Ok(Launch {
                 program: program.to_path_buf(),
                 args,
                 env,
                 stdin,
-                secrets: Secrets::none(),
+                secrets,
                 header,
             })
         }
@@ -554,8 +613,28 @@ mod tests {
             BackendKind::Command {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
                 prompt_via_stdin: stdin,
+                secret_env: None,
             },
         )
+    }
+
+    /// A command backend that gets its stored secret in `var`.
+    fn command_with_secret(name: &str, var: &str) -> Backend {
+        backend(
+            name,
+            BackendKind::Command {
+                command: vec!["aider".into(), "{prompt}".into()],
+                prompt_via_stdin: false,
+                secret_env: Some(var.to_owned()),
+            },
+        )
+    }
+
+    const CMD_SECRET_A: &str = "cmd-secret-A-1234567890";
+    const CMD_SECRET_B: &str = "cmd-secret-B-0987654321";
+
+    fn cmd_cred(v: &str) -> Credential {
+        Credential::CommandSecret(Token::new(v))
     }
 
     fn oauth_cred() -> Credential {
@@ -1034,6 +1113,124 @@ mod tests {
         assert!(env.is_empty());
     }
 
+    #[test]
+    fn command_secret_env_is_set() {
+        let mut base = session_base();
+        base.push(("OPENAI_API_KEY".into(), "caller-openai-key-123456".into()));
+        let b = command_with_secret("kic", "OPENAI_API_KEY");
+        let env = child_env(&b, base, &[], &cmd_cred(CMD_SECRET_A));
+        assert_eq!(get(&env, "OPENAI_API_KEY"), Some(OsStr::new(CMD_SECRET_A)));
+        assert_eq!(count(&env, "OPENAI_API_KEY"), 1);
+        assert!(!contains_value(&env, "caller-openai-key"));
+        // The usual isolation still applies.
+        for v in SESSION_VARS {
+            assert!(!has(&env, v), "{v}");
+        }
+        assert!(!has(&env, "ANTHROPIC_API_KEY"));
+        assert!(!has(&env, "CLAUDE_CODE_OAUTH_TOKEN"));
+    }
+
+    #[test]
+    fn command_secret_overrides_pass_env_and_inherited_anthropic_key() {
+        // secret_env = ANTHROPIC_API_KEY (e.g. Aider with Claude models): the caller's
+        // inherited key is removed, and even with pass_env the stored secret wins.
+        let mut b = command_with_secret("aider", "ANTHROPIC_API_KEY");
+        let env = child_env(&b, session_base(), &[], &cmd_cred(CMD_SECRET_A));
+        assert_eq!(
+            get(&env, "ANTHROPIC_API_KEY"),
+            Some(OsStr::new(CMD_SECRET_A))
+        );
+        assert!(!contains_value(&env, "caller-api-key"));
+        b.pass_env = vec!["ANTHROPIC_API_KEY".into()];
+        let env = child_env(&b, session_base(), &[], &cmd_cred(CMD_SECRET_A));
+        assert_eq!(count(&env, "ANTHROPIC_API_KEY"), 1);
+        assert_eq!(
+            get(&env, "ANTHROPIC_API_KEY"),
+            Some(OsStr::new(CMD_SECRET_A))
+        );
+        assert!(!contains_value(&env, "caller-api-key"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_secret_replaces_inherited_value_case_insensitively() {
+        let b = command_with_secret("kic", "OPENAI_API_KEY");
+        let base = base(&[("openai_api_key", "caller-openai-key-123456")]);
+        let env = child_env(&b, base, &[], &cmd_cred(CMD_SECRET_A));
+        assert_eq!(count(&env, "OPENAI_API_KEY"), 1);
+        assert_eq!(get(&env, "OPENAI_API_KEY"), Some(OsStr::new(CMD_SECRET_A)));
+        assert!(!contains_value(&env, "caller-openai-key"));
+    }
+
+    #[test]
+    fn command_secret_only_for_its_backend() {
+        let shared = session_base();
+        let a = child_env(
+            &command_with_secret("a", "OPENAI_API_KEY"),
+            shared.clone(),
+            &[],
+            &cmd_cred(CMD_SECRET_A),
+        );
+        assert!(contains_value(&a, CMD_SECRET_A));
+        // Another command backend with its own secret in the same variable.
+        let b = child_env(
+            &command_with_secret("b", "OPENAI_API_KEY"),
+            shared.clone(),
+            &[],
+            &cmd_cred(CMD_SECRET_B),
+        );
+        assert!(!contains_value(&b, CMD_SECRET_A));
+        assert_eq!(get(&b, "OPENAI_API_KEY"), Some(OsStr::new(CMD_SECRET_B)));
+        // A command backend without secret_env and the claude-* types never see it.
+        let plain = child_env(
+            &command("c", &["x", "{prompt}"], false),
+            shared.clone(),
+            &[],
+            &Credential::None,
+        );
+        let o = child_env(&oauth("s"), shared.clone(), &[], &oauth_cred());
+        let e = child_env(
+            &endpoint("e", EndpointAuth::XApiKey),
+            shared,
+            &[],
+            &key_cred(KEY_A),
+        );
+        for env in [&plain, &o, &e] {
+            assert!(!contains_value(env, CMD_SECRET_A));
+            assert!(!has(env, "OPENAI_API_KEY"));
+        }
+    }
+
+    #[test]
+    fn mismatched_command_credentials_put_no_secret_anywhere() {
+        let with = command_with_secret("kic", "OPENAI_API_KEY");
+        let without = command("c", &["x", "{prompt}"], false);
+        let cases = [
+            // secret_env set, but no / the wrong kind of credential.
+            (&with, Credential::None),
+            (&with, oauth_cred()),
+            (&with, key_cred(KEY_A)),
+            // A command secret handed to a backend without secret_env.
+            (&without, cmd_cred(CMD_SECRET_A)),
+        ];
+        for (b, cred) in cases {
+            let (env, mismatch) = child_env_inner(b, session_base(), &[], &cred);
+            assert!(mismatch, "{} {cred:?}", b.name);
+            assert!(!has(&env, "OPENAI_API_KEY"));
+            assert!(!contains_value(&env, CMD_SECRET_A));
+            assert!(!contains_value(&env, OAUTH_TOKEN));
+            assert!(!contains_value(&env, KEY_A));
+        }
+        // A command secret handed to claude-* backends.
+        for b in [oauth("s"), endpoint("e", EndpointAuth::XApiKey)] {
+            let (env, mismatch) = child_env_inner(&b, session_base(), &[], &cmd_cred(CMD_SECRET_A));
+            assert!(mismatch);
+            assert!(!contains_value(&env, CMD_SECRET_A));
+        }
+        let (_, m) = child_env_inner(&with, session_base(), &[], &cmd_cred(CMD_SECRET_A));
+        assert!(!m);
+    }
+
     // ---- substitute --------------------------------------------------------
 
     #[test]
@@ -1199,6 +1396,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(l.stdin.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn command_secret_launch_header_and_secrets() {
+        let b = command_with_secret("kic", "OPENAI_API_KEY");
+        let l = build_launch(
+            &b,
+            &req("x"),
+            &cmd_cred(CMD_SECRET_A),
+            Path::new("/usr/bin/aider"),
+            session_base(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            get(&l.env, "OPENAI_API_KEY"),
+            Some(OsStr::new(CMD_SECRET_A))
+        );
+        assert_eq!(l.secrets.values(), [CMD_SECRET_A.to_owned()]);
+        assert!(
+            l.header.contains(
+                &"secret_env: OPENAI_API_KEY (stored secret, value not shown)".to_owned()
+            ),
+            "{:?}",
+            l.header
+        );
+        assert!(!l.header.iter().any(|h| h.contains(CMD_SECRET_A)));
+        assert!(!l
+            .args
+            .iter()
+            .any(|a| a.to_string_lossy().contains(CMD_SECRET_A)));
+
+        // Short secrets are passed but not redacted.
+        let l = build_launch(
+            &b,
+            &req("x"),
+            &cmd_cred("short"),
+            Path::new("/usr/bin/aider"),
+            Vec::new(),
+            &[],
+        )
+        .unwrap();
+        assert!(l.secrets.is_empty());
+        assert_eq!(get(&l.env, "OPENAI_API_KEY"), Some(OsStr::new("short")));
+
+        // Wrong credential kinds are rejected before anything is built.
+        let p = Path::new("/usr/bin/aider");
+        for cred in [Credential::None, oauth_cred(), key_cred(KEY_A)] {
+            let err = build_launch(&b, &req("x"), &cred, p, Vec::new(), &[]).unwrap_err();
+            assert!(err.contains("credential type does not match"), "{err}");
+        }
+        let plain = command("c", &["c"], true);
+        let err = build_launch(
+            &plain,
+            &req("x"),
+            &cmd_cred(CMD_SECRET_A),
+            p,
+            Vec::new(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("credential type does not match"), "{err}");
     }
 
     #[test]
@@ -1428,6 +1687,51 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("'ollama'"), "{err}");
+    }
+
+    #[test]
+    fn load_command_secret() {
+        let b = command_with_secret("kic", "OPENAI_API_KEY");
+        let loader = |id: &SecretId| {
+            assert_eq!(id, &SecretId::Command("kic".into()));
+            Ok((
+                Token::new(CMD_SECRET_A),
+                TokenSource::File(PathBuf::from("/c/cmd-kic.key")),
+            ))
+        };
+        let (cred, source) = load_credential_with(&b, &no_env, &loader).unwrap();
+        assert_eq!(cred, cmd_cred(CMD_SECRET_A));
+        assert!(source.contains("cmd-kic.key"), "{source}");
+        assert!(!source.contains(CMD_SECRET_A));
+        // The environment is never consulted, even if the variable is set there.
+        let env = |_: &str| -> Option<String> { panic!("environment must not be read") };
+        assert!(load_credential_with(&b, &env, &loader).is_ok());
+
+        let err = load_credential_with(&b, &no_env, &missing).unwrap_err();
+        assert_eq!(
+            err,
+            "No secret stored for backend 'kic' (secret_env OPENAI_API_KEY). Run \
+             'agent-sidekick setup --backend kic' in a terminal."
+        );
+        let storage = |_: &SecretId| Err(TokenError::Storage("locked".into()));
+        let err = load_credential_with(&b, &no_env, &storage).unwrap_err();
+        assert!(
+            err.contains("Cannot read the secret of backend `kic`: locked"),
+            "{err}"
+        );
+        assert!(err.contains("setup --backend kic"), "{err}");
+    }
+
+    #[test]
+    fn credential_secret_accessor() {
+        assert_eq!(oauth_cred().secret().unwrap().expose(), OAUTH_TOKEN);
+        assert_eq!(key_cred(KEY_A).secret().unwrap().expose(), KEY_A);
+        assert_eq!(
+            cmd_cred(CMD_SECRET_A).secret().unwrap().expose(),
+            CMD_SECRET_A
+        );
+        assert!(Credential::None.secret().is_none());
+        assert!(!format!("{:?}", cmd_cred(CMD_SECRET_A)).contains(CMD_SECRET_A));
     }
 
     #[test]

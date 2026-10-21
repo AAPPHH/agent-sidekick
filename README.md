@@ -62,7 +62,7 @@ A backend is a place where `sidekick_run` executes a prompt. Backends are config
 |------|------|------------|
 | `claude-oauth` | The official `claude` CLI with a Claude account's OAuth token (the v0.1 behaviour). | Token from `claude setup-token`, stored with `agent-sidekick setup`. |
 | `claude-endpoint` | The official `claude` CLI against an Anthropic-compatible endpoint, e.g. a local model in Ollama or LM Studio. | API key stored with `agent-sidekick setup --backend <name>`, or read from an environment variable (`api_key_env`). |
-| `command` | Any other agent CLI, e.g. Aider, started directly (no shell) with the prompt as one argument or on stdin. | None managed by agent-sidekick. |
+| `command` | Any other agent CLI, e.g. Aider, started directly (no shell) with the prompt as one argument or on stdin. | Optional: a secret stored with `agent-sidekick setup --backend <name>`, handed to the program in the variable named by `secret_env`. |
 
 **Upgrading from v0.1:** without a `[backends]` section nothing changes. There is one implicit backend named `sidekick` of type `claude-oauth` that uses the existing token, config dir and `default_model`.
 As soon as `[backends]` exists, only the backends listed there are available.
@@ -106,6 +106,27 @@ agent-sidekick backends list --check
 agent-sidekick backends test local
 ```
 
+### Command backend with a stored key
+
+A `command` backend can get a secret, e.g. the API key of a hosted OpenAI-compatible service, without putting it into `config.toml` or the MCP registration. `secret_env` names the variable the program reads it from. Example: Aider against the KI:connect.nrw gateway (any OpenAI-compatible endpoint works the same way):
+
+```toml
+[backends.kiconnect]
+type = "command"
+description = "Aider with gpt-oss-120b via KI:connect.nrw (university quota). Free, medium quality; edits files in cwd directly without asking. For boilerplate, tests and small, well-specified changes."
+cost = "free"
+command = ["aider", "--model", "openai/openai-gpt-oss-120b", "--no-git", "--yes-always", "--no-show-model-warnings", "--no-check-update", "--no-pretty", "--no-stream", "--message", "{prompt}"]
+env = { OPENAI_API_BASE = "https://chat.kiconnect.nrw/api/v1", PYTHONUTF8 = "1" }
+secret_env = "OPENAI_API_KEY"
+```
+
+```sh
+agent-sidekick setup --backend kiconnect    # asks for the value of OPENAI_API_KEY (input hidden)
+agent-sidekick backends test kiconnect
+```
+
+The value is stored like the other secrets (OS keyring user `cmd-kiconnect`, file fallback `cmd-kiconnect.key`, see [Secrets per backend](#secrets-per-backend)) and set as `OPENAI_API_KEY` for this backend's runs only, replacing an inherited value of that name. It never appears in `config.toml`, `sidekick_status`, `sidekick_backends`, `backends list`/`test` or `doctor` (they show only where it is stored), and it is redacted from the run's output and log. Values shorter than 8 characters are not redacted; `setup` warns about that. `PYTHONUTF8=1` avoids encoding errors of Aider on Windows.
+
 Notes for the `local` backend:
 
 - **Ollama** (0.14 or later serves the Anthropic Messages API): `ollama pull qwen3-coder`, base URL `http://localhost:11434`. A local Ollama ignores the key, so any value works. Keys shorter than 8 characters (such as `ollama`) are not redacted from the agent's output, so a placeholder never mangles it; `setup` warns about this.
@@ -144,7 +165,7 @@ A run waits for a slot of its backend first, then for a global slot; queued runs
 
 - `claude-oauth`: `claude` is found and a token is stored for the backend.
 - `claude-endpoint`: `claude` is found, the key is available (stored, or the `api_key_env` variable is set), and an HTTP `GET` of `base_url` answers within 2 seconds. Any HTTP response counts, also 4xx/5xx; connection errors and timeouts do not.
-- `command`: the program (`command[0]`) is found.
+- `command`: the program (`command[0]`) is found, and with `secret_env` a secret is stored for the backend.
 
 The HTTP probe is the only network request agent-sidekick makes itself. It goes only to the configured `base_url`, carries no credentials (user info in the URL is stripped), follows no redirects, has a 2 s timeout and runs only for `sidekick_backends`, `agent-sidekick backends list --check` / `backends test`, `doctor`, and right before a run on a `claude-endpoint` backend.
 Loopback hosts are probed directly; other hosts go through the proxy from `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (honouring `NO_PROXY`), as `claude` itself would. A proxy that answers for an unreachable upstream makes the endpoint look reachable.
@@ -156,7 +177,8 @@ Loopback hosts are probed directly; other hosts go through the proxy from `HTTPS
 | `claude-oauth` named `sidekick` (implicit or declared) | `oauth-token` | `token` | `AGENT_SIDEKICK_TOKEN` |
 | other `claude-oauth` | `oauth-token-<name>` | `token-<name>` | none |
 | `claude-endpoint` | `endpoint-<name>` | `endpoint-<name>.key` | `api_key_env` (a variable of the MCP server's environment) |
-| `command` | none | none | none |
+| `command` with `secret_env` | `cmd-<name>` | `cmd-<name>.key` | none (the value goes into the variable `secret_env` names) |
+| `command` without `secret_env` | none | none | none |
 
 A backend named `sidekick` therefore keeps using the token of a v0.1 installation. Files are created with mode 0600 (Unix) or a user-only ACL (Windows).
 `api_key_env` is read from the environment of the MCP server, i.e. what Claude Code passes to it; set the variable globally or add it to the registration (`claude mcp add ... -e NAME=value`).
@@ -177,7 +199,7 @@ Then the backend's `env` table is applied (it may set `CLAUDE_CODE_*` variables;
 |------|-----------------------|
 | `claude-oauth` | `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN` |
 | `claude-endpoint` | `CLAUDE_CONFIG_DIR`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` (`auth = "x-api-key"`) or `ANTHROPIC_AUTH_TOKEN` (`auth = "bearer"`). `CLAUDE_CODE_OAUTH_TOKEN` is never set. |
-| `command` | nothing |
+| `command` | nothing; with `secret_env`, that variable is set to the backend's stored secret (last, so it replaces an inherited value or a `pass_env` exception of the same name) |
 
 Each run's environment is built from the server's environment, so one backend's key never reaches another backend.
 
@@ -198,6 +220,7 @@ Each run's environment is built from the server's environment, so one backend's 
 - The `model` and `allowed_tools` parameters of `sidekick_run` are ignored for command backends (the log notes it); `model` in the backend's config is a config error. Put the model into the command instead.
 - Command backends are configured only in `config.toml`. `sidekick_run` can select one by name but can never supply or change a command.
 - The program runs with the permissions of the MCP server; tools like Aider with `--yes-always` edit files without asking.
+- `secret_env = "VAR"` hands the backend's stored secret to the program in `VAR`, see [Command backend with a stored key](#command-backend-with-a-stored-key). `VAR` must be a plain variable name (`A-Z`, `a-z`, `0-9`, `_`), must not be `CLAUDE_CODE_OAUTH_TOKEN`, `AGENT_SIDEKICK_TOKEN` or `AGENT_SIDEKICK_*`, and must not also be a key of `env` (config errors). `ANTHROPIC_API_KEY` is allowed, e.g. for Aider with Claude models. Without a stored secret the backend is not reachable and a run fails with a hint to `setup --backend <name>`.
 
 ### claude-endpoint backends
 
@@ -257,12 +280,12 @@ Shows running and queued runs, per backend and in total, with the global and per
 
 | Command | Purpose |
 |---------|---------|
-| `agent-sidekick setup [--token-stdin] [--no-register] [--claude PATH]` | Ask for the token of every `claude-oauth` backend and register the MCP server. Endpoint keys are not asked here. |
-| `agent-sidekick setup --backend <name> [--token-stdin]` | Set up one backend only: `claude-oauth` token, `claude-endpoint` API key (or a note that `api_key_env` is used), nothing to store for `command`. The MCP registration is not changed. |
+| `agent-sidekick setup [--token-stdin] [--no-register] [--claude PATH]` | Ask for the token of every `claude-oauth` backend and register the MCP server. Endpoint keys and command secrets are not asked here (a hint names the `setup --backend` call). |
+| `agent-sidekick setup --backend <name> [--token-stdin]` | Set up one backend only: `claude-oauth` token, `claude-endpoint` API key (or a note that `api_key_env` is used), the `secret_env` value of a `command` backend (nothing to store without `secret_env`). The MCP registration is not changed. |
 | `agent-sidekick backends list [--check]` | Table of name, type, cost, default and description; `--check` adds reachability. |
 | `agent-sidekick backends test <name>` | Reachability with details (claude version, resolved program, HTTP status). Exit code 0 if reachable, 1 otherwise. |
 | `agent-sidekick doctor` | Checks the installation and every backend, and prints next steps. |
-| `agent-sidekick uninstall [--purge]` | Removes the stored secrets of all configured backends (and the v0.1 token) and the MCP registration. |
+| `agent-sidekick uninstall [--purge]` | Removes the stored secrets of all configured backends (tokens, endpoint keys, command secrets, and the v0.1 token) and the MCP registration. |
 
 ## Configuration
 
@@ -295,6 +318,7 @@ pass_env = []             # inherited variables to keep for every backend, see a
 | `api_key_env` | claude-endpoint | none (stored key) | Name of an environment variable with the key. |
 | `command` | command | (required) | Program and arguments with `{prompt}`, `{cwd}`, `{max_turns}`. |
 | `prompt_via_stdin` | command | `false` | Send the prompt on stdin instead of `{prompt}`. |
+| `secret_env` | command | none | Variable that receives the backend's stored secret (`setup --backend <name>`), e.g. `OPENAI_API_KEY`. Not allowed: `CLAUDE_CODE_OAUTH_TOKEN`, `AGENT_SIDEKICK_*`, or a key that is also in `env`. Values shorter than 8 characters are not redacted. |
 
 Config directory:
 

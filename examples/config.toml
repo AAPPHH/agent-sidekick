@@ -1,4 +1,4 @@
-# agent-sidekick config.toml with three backends.
+# agent-sidekick config.toml with four backends.
 #
 # Copy to the config directory:
 #   Linux:   ~/.config/agent-sidekick/config.toml
@@ -69,3 +69,22 @@ env = { OLLAMA_API_BASE = "http://127.0.0.1:11434" }
 max_concurrent = 1
 # prompt_via_stdin = true   # required if command[0] is a .cmd/.bat script (then omit {prompt})
 # pass_env = ["ANTHROPIC_API_KEY"]   # a command backend may keep an inherited variable that is normally removed
+# secret_env = "ANTHROPIC_API_KEY"   # or hand it a stored secret instead, see 4)
+
+# 4) Aider against a hosted OpenAI-compatible API that needs a key (here the KI:connect.nrw
+#    gateway of German universities; any OpenAI-compatible endpoint works the same way).
+#    secret_env names the variable that receives the backend's stored secret. Store it with
+#    `agent-sidekick setup --backend kiconnect` (hidden prompt; OS keyring user
+#    `cmd-kiconnect`, file fallback `cmd-kiconnect.key` in the config directory). It is never
+#    written to config.toml, and it is redacted from logs and tool output (values shorter
+#    than 8 characters are not redacted). The variable must not also be set in `env`; it
+#    replaces an inherited value of the same name.
+#    PYTHONUTF8=1 avoids encoding errors of aider on Windows.
+[backends.kiconnect]
+type = "command"
+description = "Aider with gpt-oss-120b via KI:connect.nrw (university quota). Free, medium quality; edits files in cwd directly without asking. For boilerplate, tests and small, well-specified changes."
+cost = "free"
+command = ["aider", "--model", "openai/openai-gpt-oss-120b", "--no-git", "--yes-always", "--no-show-model-warnings", "--no-check-update", "--no-pretty", "--no-stream", "--message", "{prompt}"]
+env = { OPENAI_API_BASE = "https://chat.kiconnect.nrw/api/v1", PYTHONUTF8 = "1" }
+secret_env = "OPENAI_API_KEY"
+max_concurrent = 1

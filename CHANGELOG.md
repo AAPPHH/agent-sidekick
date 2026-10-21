@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reachability probe for `claude-endpoint` backends: HTTP GET of `base_url` without credentials, 2 s timeout.
 - CLI: `backends list [--check]`, `backends test <name>`, `setup --backend <name>`; `setup` asks for the token of every `claude-oauth` backend; `doctor` checks all backends.
 - Top-level and per-backend `pass_env` to keep specific inherited variables that session isolation would remove.
+- `secret_env` for `command` backends: a secret stored with `setup --backend <name>` (keyring user `cmd-<name>`, file `cmd-<name>.key`) is set in that variable for the backend's runs only, e.g. `OPENAI_API_KEY` for Aider against a hosted OpenAI-compatible API. It is redacted from output and logs and never shown by status, `sidekick_backends`, `backends test` or `doctor`; reachability requires it; `uninstall` removes it.
 - `examples/config.toml` and `examples/CLAUDE.md` (routing rules for the calling session).
 
 ### Changed

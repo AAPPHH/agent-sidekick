@@ -80,7 +80,8 @@ pub fn probe_http(base_url: &str, timeout: Duration) -> Reachability {
 }
 
 /// claude-oauth: claude found and a token stored; claude-endpoint: claude found, key
-/// available and `base_url` answers within [`PROBE_TIMEOUT`]; command: program found.
+/// available and `base_url` answers within [`PROBE_TIMEOUT`]; command: program found (and,
+/// with `secret_env`, its secret stored).
 /// Blocking (keyring, filesystem, network).
 pub fn check_backend(backend: &Backend, claude_path: Option<&Path>) -> Reachability {
     check_backend_with(
@@ -172,13 +173,34 @@ fn check_backend_with(
             }
             probe(base_url)
         }
-        BackendKind::Command { command, .. } => {
+        BackendKind::Command {
+            command,
+            secret_env,
+            ..
+        } => {
             let Some(program) = command.first().filter(|p| !p.trim().is_empty()) else {
                 return Reachability::unreachable("command is empty");
             };
-            match resolve_program(program) {
-                Ok(path) => Reachability::ok(format!("program {}", path.display())),
-                Err(e) => Reachability::unreachable(e),
+            let path = match resolve_program(program) {
+                Ok(path) => path,
+                Err(e) => return Reachability::unreachable(e),
+            };
+            let Some(var) = secret_env else {
+                return Reachability::ok(format!("program {}", path.display()));
+            };
+            let id = SecretId::Command(backend.name.clone());
+            match secret(&id) {
+                Ok(source) => Reachability::ok(format!(
+                    "program {}; secret_env {var} from {source}",
+                    path.display()
+                )),
+                Err(TokenError::Missing) | Err(TokenError::Empty) => {
+                    Reachability::unreachable(format!(
+                        "no secret stored for secret_env {var}; run `agent-sidekick setup --backend {}`",
+                        backend.name
+                    ))
+                }
+                Err(e) => Reachability::unreachable(format!("cannot read the {id}: {e}")),
             }
         }
     }
@@ -570,6 +592,18 @@ mod tests {
             BackendKind::Command {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
                 prompt_via_stdin: false,
+                secret_env: None,
+            },
+        )
+    }
+
+    fn command_with_secret(var: &str) -> Backend {
+        backend(
+            "kic",
+            BackendKind::Command {
+                command: vec!["aider".into(), "{prompt}".into()],
+                prompt_via_stdin: false,
+                secret_env: Some(var.to_owned()),
             },
         )
     }
@@ -845,6 +879,73 @@ mod tests {
             &resolve,
             &no_probe,
         );
+        assert!(!r.reachable);
+    }
+
+    #[test]
+    fn command_with_secret_env() {
+        let resolve = |p: &str| -> Result<PathBuf, String> {
+            if p == "aider" {
+                Ok(PathBuf::from("/usr/bin/aider"))
+            } else {
+                Err(format!("program `{p}` not found in PATH"))
+            }
+        };
+        let claude = || -> Result<PathBuf, String> { panic!("claude not needed") };
+        let seen = std::cell::RefCell::new(None);
+        let secret = |id: &SecretId| -> Result<String, TokenError> {
+            *seen.borrow_mut() = Some(id.clone());
+            Ok("OS keyring (service agent-sidekick)".to_owned())
+        };
+        let b = command_with_secret("OPENAI_API_KEY");
+        let r = check_backend_with(&b, &claude, &secret, &no_env, &resolve, &no_probe);
+        assert!(r.reachable, "{r:?}");
+        assert_eq!(*seen.borrow(), Some(SecretId::Command("kic".into())));
+        assert_eq!(
+            r.detail,
+            format!(
+                "program {}; secret_env OPENAI_API_KEY from OS keyring (service agent-sidekick)",
+                Path::new("/usr/bin/aider").display()
+            )
+        );
+
+        // Program found, secret missing.
+        let r = check_backend_with(&b, &claude, &secret_missing, &no_env, &resolve, &no_probe);
+        assert!(!r.reachable);
+        assert_eq!(
+            r.detail,
+            "no secret stored for secret_env OPENAI_API_KEY; run `agent-sidekick setup --backend kic`"
+        );
+
+        // Storage error.
+        let r = check_backend_with(&b, &claude, &secret_broken, &no_env, &resolve, &no_probe);
+        assert!(!r.reachable);
+        assert!(
+            r.detail.contains("cannot read the secret of backend `kic`"),
+            "{r:?}"
+        );
+        assert!(r.detail.contains("keyring locked"), "{r:?}");
+
+        // The program check comes first; the store is not consulted then.
+        let mut missing_prog = command_with_secret("OPENAI_API_KEY");
+        if let BackendKind::Command { command, .. } = &mut missing_prog.kind {
+            command[0] = "nope".into();
+        }
+        let no_secret = |_: &SecretId| -> Result<String, TokenError> { panic!("no secret") };
+        let r = check_backend_with(
+            &missing_prog,
+            &claude,
+            &no_secret,
+            &no_env,
+            &resolve,
+            &no_probe,
+        );
+        assert!(!r.reachable);
+        assert_eq!(r.detail, "program `nope` not found in PATH");
+
+        // The environment variable itself is never consulted.
+        let env = |_: &str| -> Option<String> { panic!("environment must not be read") };
+        let r = check_backend_with(&b, &claude, &secret_missing, &env, &resolve, &no_probe);
         assert!(!r.reachable);
     }
 }

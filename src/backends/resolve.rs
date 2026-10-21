@@ -258,7 +258,7 @@ fn resolve_one(
     }
 
     // Fields that are not allowed for this type.
-    let set_fields: [(&str, bool, &[BackendType]); 7] = [
+    let set_fields: [(&str, bool, &[BackendType]); 8] = [
         (
             "model",
             raw.model.is_some(),
@@ -284,6 +284,11 @@ fn resolve_one(
         (
             "prompt_via_stdin",
             raw.prompt_via_stdin.is_some(),
+            &[BackendType::Command],
+        ),
+        (
+            "secret_env",
+            raw.secret_env.is_some(),
             &[BackendType::Command],
         ),
     ];
@@ -346,6 +351,15 @@ fn resolve_one(
         }
         BackendType::Command => {
             let prompt_via_stdin = raw.prompt_via_stdin.unwrap_or(false);
+            let secret_ok = match raw.secret_env.as_deref() {
+                Some(var) => {
+                    let e = check_secret_env(var, &env);
+                    let ok = e.is_empty();
+                    errs.extend(e);
+                    ok
+                }
+                None => true,
+            };
             match raw.command.as_deref() {
                 None => {
                     errs.push("`command` is required for type `command`".to_owned());
@@ -375,9 +389,10 @@ fn resolve_one(
                                 .to_owned(),
                         );
                     }
-                    (errs.len() == before).then(|| BackendKind::Command {
+                    (errs.len() == before && secret_ok).then(|| BackendKind::Command {
                         command: cmd.to_vec(),
                         prompt_via_stdin,
+                        secret_env: raw.secret_env.clone(),
                     })
                 }
             }
@@ -467,6 +482,47 @@ fn config_dir_for(
 fn starts_with_tilde(p: &Path) -> bool {
     p.to_str()
         .is_some_and(|s| s == "~" || s.starts_with("~/") || s.starts_with("~\\"))
+}
+
+/// Errors for the `secret_env` of a command backend: a portable variable name
+/// (`[A-Za-z_][A-Za-z0-9_]*`), not one of the agent's own secrets (they are never handed to
+/// a command backend), and not also set by the backend's `env` table. `ANTHROPIC_API_KEY`
+/// and the like are allowed (e.g. Aider with Anthropic models).
+fn check_secret_env(var: &str, env: &BTreeMap<String, String>) -> Vec<String> {
+    let mut errs = Vec::new();
+    if !valid_secret_env_name(var) {
+        errs.push(format!(
+            "`secret_env`: invalid variable name {var:?} (use letters, digits and `_`, not starting with a digit)"
+        ));
+        return errs;
+    }
+    let reserved_prefix = var
+        .get(..RESERVED_ENV_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(RESERVED_ENV_PREFIX));
+    if reserved_prefix
+        || SECRET_PASS_ENV_COMMAND
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(var))
+    {
+        errs.push(format!(
+            "`secret_env` must not be `{var}` (reserved: {}, {RESERVED_ENV_PREFIX}*)",
+            SECRET_PASS_ENV_COMMAND.join(", ")
+        ));
+    }
+    if env.keys().any(|k| k.eq_ignore_ascii_case(var)) {
+        errs.push(format!(
+            "`secret_env` `{var}` is also set in `env`; remove it there (the stored secret is              set by agent-sidekick)"
+        ));
+    }
+    errs
+}
+
+/// `^[A-Za-z_][A-Za-z0-9_]*$`
+fn valid_secret_env_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// Errors for a list of variable names to keep from the inherited environment.
@@ -723,6 +779,7 @@ pass_env = ["OPENAI_API_BASE"]
                     "{prompt}".into()
                 ],
                 prompt_via_stdin: false,
+                secret_env: None,
             }
         );
     }
@@ -788,7 +845,8 @@ prompt_via_stdin = true
             b.get("cmd").unwrap().kind,
             BackendKind::Command {
                 command: vec!["tool".into()],
-                prompt_via_stdin: true
+                prompt_via_stdin: true,
+                secret_env: None,
             }
         );
     }
@@ -1120,6 +1178,115 @@ prompt_via_stdin = true
             "type = \"command\"\ndescription = \"d\"\ncommand = [\"t\", \"--msg={prompt}\"]\n"
         ))
         .is_ok());
+    }
+
+    fn cmd_with(extra: &str) -> String {
+        one(&format!(
+            "type = \"command\"\ndescription = \"d\"\ncommand = [\"aider\", \"{{prompt}}\"]\n{extra}"
+        ))
+    }
+
+    #[test]
+    fn secret_env_on_command_backend() {
+        let b = resolve_str(&cmd_with(
+            "secret_env = \"OPENAI_API_KEY\"\nenv = { OPENAI_API_BASE = \"https://h/api/v1\" }\n",
+        ))
+        .unwrap();
+        let d = b.default_backend();
+        assert_eq!(
+            d.kind,
+            BackendKind::Command {
+                command: vec!["aider".into(), "{prompt}".into()],
+                prompt_via_stdin: false,
+                secret_env: Some("OPENAI_API_KEY".into()),
+            }
+        );
+        assert_eq!(
+            d.secret_id(),
+            Some(crate::token::SecretId::Command("x".into()))
+        );
+        // Without secret_env a command backend has no stored secret.
+        let b = resolve_str(&cmd_with("")).unwrap();
+        assert_eq!(b.default_backend().secret_id(), None);
+        // Anthropic keys are fine for a command backend (e.g. Aider with Claude models).
+        for var in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "_X", "a1"] {
+            assert!(
+                resolve_str(&cmd_with(&format!("secret_env = \"{var}\"\n"))).is_ok(),
+                "{var}"
+            );
+        }
+    }
+
+    /// The commented example in the repository stays valid.
+    #[test]
+    fn example_config_is_valid() {
+        let b = resolve_str(include_str!("../../examples/config.toml")).unwrap();
+        assert_eq!(b.names(), vec!["aider", "kiconnect", "local", "sidekick"]);
+        assert!(matches!(
+            &b.get("kiconnect").unwrap().kind,
+            BackendKind::Command { secret_env: Some(v), .. } if v == "OPENAI_API_KEY"
+        ));
+    }
+
+    #[test]
+    fn secret_env_not_allowed_for_claude_types() {
+        let e = err_of(&one(
+            "type = \"claude-oauth\"\ndescription = \"d\"\nsecret_env = \"OPENAI_API_KEY\"\n",
+        ));
+        assert_eq!(
+            e,
+            "backends.x: field `secret_env` is not allowed for type `claude-oauth`"
+        );
+        let e = err_of(&one(
+            "type = \"claude-endpoint\"\ndescription = \"d\"\nbase_url = \"http://h\"\nsecret_env = \"K\"\n",
+        ));
+        assert_eq!(
+            e,
+            "backends.x: field `secret_env` is not allowed for type `claude-endpoint`"
+        );
+    }
+
+    #[test]
+    fn secret_env_invalid_names() {
+        for var in ["", "A=B", "1ABC", "A B", "A-B", "Ä"] {
+            let e = err_of(&cmd_with(&format!("secret_env = \"{var}\"\n")));
+            assert!(
+                e.contains("`secret_env`: invalid variable name"),
+                "{var:?}: {e}"
+            );
+            assert_eq!(e.lines().count(), 1, "{e}");
+        }
+    }
+
+    #[test]
+    fn secret_env_reserved_names() {
+        for var in [
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "claude_code_oauth_token",
+            "AGENT_SIDEKICK_TOKEN",
+            "AGENT_SIDEKICK_ANYTHING",
+            "agent_sidekick_x",
+        ] {
+            let e = err_of(&cmd_with(&format!("secret_env = \"{var}\"\n")));
+            assert!(
+                e.contains(&format!("`secret_env` must not be `{var}`")),
+                "{var}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_env_conflicts_with_env_table() {
+        for key in ["OPENAI_API_KEY", "openai_api_key"] {
+            let e = err_of(&cmd_with(&format!(
+                "secret_env = \"OPENAI_API_KEY\"\nenv = {{ {key} = \"value-not-shown\" }}\n"
+            )));
+            assert!(
+                e.contains("`secret_env` `OPENAI_API_KEY` is also set in `env`"),
+                "{key}: {e}"
+            );
+            assert!(!e.contains("value-not-shown"), "{e}");
+        }
     }
 
     #[test]
