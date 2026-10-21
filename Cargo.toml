@@ -27,6 +27,7 @@ toml = "1.1.8"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 uuid = { version = "1.28.0", features = ["v4"] }
 which = "8.0.6"
 
