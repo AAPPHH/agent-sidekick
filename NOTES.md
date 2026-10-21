@@ -198,3 +198,34 @@ State as of 2026-10-21, version 0.2.0.
    repository URL (`OWNER/agent-sidekick` placeholders in `install.sh`, `install.ps1` and the README, plus
    `repository` in Cargo.toml), push, then tag `v0.2.0`. The `ubuntu-24.04-arm` runner is free for public repos only.
 6. **macOS** runtime behaviour (Keychain, process groups): CI only.
+
+## Distribution (release, install, plugin, update)
+
+Owner decision: `Cargo.toml` has `repository = "https://github.com/AAPPHH/agent-sidekick"` (git user AAPPHH). It is the single place to change the owner; scripts, release, plugin and update derive owner/repo from it. This supersedes the "`repository` is intentionally left out" bullet under Open points.
+
+### Claude Code plugin + marketplace
+
+Files: `.claude-plugin/marketplace.json` (repo root = marketplace root, marketplace `name` `agent-sidekick`, one entry `agent-sidekick` with `source: "./plugin"`), `plugin/.claude-plugin/plugin.json`, `plugin/.mcp.json`, `plugin/skills/delegate/SKILL.md`, `plugin/README.md`. No `.mcp.json` at the repo root (that would be a project-scope server prompting everyone who opens the repo).
+
+Format sources (checked 2026-10-21): https://code.claude.com/docs/en/plugins-reference (manifest fields, `userConfig`, `${user_config.KEY}` substituted in MCP server config, `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}`/`${CLAUDE_PROJECT_DIR}` resolve in stdio `command`/`args`/`env`), https://code.claude.com/docs/en/plugin-marketplaces (marketplace.json needs `name`, `owner`, `plugins[]` with `name` + `source`; relative source from the marketplace root, no `..`; entry name must equal plugin.json `name`; install id `<entry>@<marketplace>`), https://code.claude.com/docs/en/mcp (plugin servers start automatically, register as `plugin:<plugin>:<server>`, tools are `mcp__plugin_<plugin>_<server>__<tool>`), https://code.claude.com/docs/en/plugins/components (instructions go in a skill; a CLAUDE.md at the plugin root is not loaded).
+
+Decisions:
+
+- Command: `${user_config.binary}` with `userConfig.binary` default `"agent-sidekick"`, args `["serve"]`. Without configuration the server is started as the bare `agent-sidekick` from Claude Code's PATH; users whose GUI app does not see the PATH set the absolute path via `/plugin configure agent-sidekick@agent-sidekick` (or `claude plugin configure ... --values-stdin`). No absolute default path: install locations differ per OS (`~/.local/bin` vs `%LOCALAPPDATA%\Programs\agent-sidekick`) and there is no documented portable variable for them in plugin MCP configs (`${VAR:-default}` expansion is documented for project/user `.mcp.json`, not for plugins; not relied on).
+- No `AGENT_SIDEKICK_CLAUDE` in the plugin's server env: unlike `setup`, the plugin cannot know the path of `claude`. The server falls back to `claude_path` in config.toml, PATH, then well-known locations (`locate.rs`); plugin/README.md tells users to set `claude_path` if runs fail with "claude not found".
+- `version: "0.3.0"` in plugin.json pins plugin updates to that string: the release step must bump it together with Cargo.toml (`claude plugin tag` checks plugin.json and the marketplace entry agree).
+- Skill `delegate` (`/agent-sidekick:delegate`, also model-invoked) is a backend-agnostic condensation of `examples/CLAUDE.md` (~70 tokens always-on per `claude plugin details`).
+- Plugin vs `setup` registration: use one. Plugin users run `agent-sidekick setup --no-register` and remove an old registration with `claude mcp remove agent-sidekick -s user`; `setup` users don't install the plugin.
+
+Verification (claude 2.1.296, temporary `CLAUDE_CONFIG_DIR` in the session scratchpad, `AGENT_SIDEKICK_CONFIG_DIR` temp, `AGENT_SIDEKICK_DISABLE_KEYRING=1`; the real `~/.claude` and `%APPDATA%\agent-sidekick` were not touched):
+
+- `claude plugin validate --strict ./plugin` and `claude plugin validate --strict .`: both "Validation passed" (the marketplace run advises an install line in README.md: `/plugin install agent-sidekick --marketplace <owner>/<repo>`, one-step form on Claude Code 2.1.275+).
+- `claude plugin marketplace add <worktree>` then `claude plugin install agent-sidekick@agent-sidekick` (and bare `claude plugin install agent-sidekick`): installed, enabled; `claude plugin details agent-sidekick` lists Skills (1) delegate and MCP servers (1) agent-sidekick.
+- `claude mcp list`: binary not on PATH, default option -> `plugin:agent-sidekick:agent-sidekick: agent-sidekick serve - Failed to connect`; with the debug build on PATH -> `Connected`; with `binary` set to the absolute path and not on PATH -> `Connected`. So the default substitution of `${user_config.binary}` works even while the option shows "not set".
+- Duplicates: with a user-scope `agent-sidekick` registration whose command and args are identical to the plugin's, `claude mcp list` showed only the user-scope server (Claude Code skipped the plugin copy). With different commands (setup's absolute path vs the plugin's bare name, the normal case) both were listed and connected: two processes, every tool twice. The dedup rule is observed behaviour, not documented.
+- `agent-sidekick doctor` with only the plugin: `[FAIL] MCP registration: agent-sidekick is not registered`, next step `run agent-sidekick setup`, which would create the duplicate.
+
+Open points:
+
+- For feat/harness (doctor/setup owners): `doctor` should recognise the plugin registration (e.g. `claude plugin list` shows `agent-sidekick@...` enabled, or `claude mcp list` has `plugin:agent-sidekick:agent-sidekick`) and then warn about a duplicate user-scope registration instead of failing; `setup` could skip registering (or warn) when the plugin is enabled. Not changed here to keep this branch out of src/.
+- Not tested: install from the GitHub marketplace (`/plugin marketplace add AAPPHH/agent-sidekick`) since the repo is not published; the interactive `/plugin` dialogs and the userConfig prompt on enable; VS Code with a GUI-reduced PATH.

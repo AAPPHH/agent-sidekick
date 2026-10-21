@@ -6,6 +6,7 @@ rust-version = "1.89"
 description = "Local MCP server that delegates prompts from Claude Code to a second, headless Claude Code instance with its own credentials"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/AAPPHH/agent-sidekick"
 keywords = ["mcp", "claude", "claude-code", "agent", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 

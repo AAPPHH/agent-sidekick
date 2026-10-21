@@ -39,6 +39,8 @@ It is a single binary with no runtime dependencies besides the official `claude`
    agent-sidekick setup
    ```
 
+   Alternative: register the server through the Claude Code plugin instead (adds a `delegate` skill; use either the plugin or `setup`'s registration, not both). Run `agent-sidekick setup --no-register`, then in Claude Code `/plugin marketplace add AAPPHH/agent-sidekick` and `/plugin install agent-sidekick@agent-sidekick`. See [plugin/README.md](plugin/README.md).
+
 4. **Reload VS Code** (Command Palette: "Developer: Reload Window") or restart Claude Code, then check that the agent-sidekick server shows up as connected in `/mcp`.
 
 5. **Optional: add backends** (local model, other agent CLIs) in `config.toml`, see [Backends](#backends).
