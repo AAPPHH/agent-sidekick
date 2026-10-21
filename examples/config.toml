@@ -139,3 +139,22 @@ max_concurrent = 1
 # request_timeout_s = 600                  # header timeout before OpenCode retries (default 300)
 # harness_path = "C:/Users/<you>/AppData/Roaming/npm/node_modules/opencode-ai/bin/opencode.exe"
 # api_key_env = "KICONNECT_API_KEY"        # read the key from the MCP server's environment instead
+
+# 6) Optional, commented out: the OpenAI Codex CLI (harness = "codex", since 0.3.0) with your
+#    ChatGPT plan. Install it first (`npm install -g @openai/codex`), then run
+#    `agent-sidekick setup --backend codex`: it creates the backend's own CODEX_HOME
+#    (<config-dir>/codex/codex/) with a generated config.toml and prints the `codex login`
+#    command for exactly that directory; your own ~/.codex is not used. With
+#    auth = "api-key" the same command stores an OpenAI API key instead (keyring user
+#    `backend-codex`). The agent's shell commands never see the key. max_turns is ignored
+#    (timeout_s is the limit), allowed_tools too (use read_only).
+# [backends.codex]
+# harness = "codex"
+# auth = "chatgpt"                         # or "api-key"
+# description = "OpenAI Codex agent (GPT models). Strong for code changes, debugging and reviews; edits files and runs commands in cwd inside Codex's sandbox."
+# max_concurrent = 1                       # one ChatGPT login: avoid parallel token refreshes
+# models = ["gpt-6.1-sol", "gpt-6-luna"]   # optional allowlist; without it Codex's default
+# read_only = true                         # Codex's read-only sandbox (review-only runs)
+# windows_sandbox = "mxc"                  # Windows: mxc (default), elevated, unelevated
+# base_url = "https://gateway.example/v1"  # api-key only: a Responses-compatible provider
+# api_key_env = "OPENAI_API_KEY_SIDEKICK"  # api-key only: key from the MCP server's environment

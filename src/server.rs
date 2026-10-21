@@ -83,12 +83,12 @@ pub struct RunParams {
     /// sidekick_backends: `models`, `default_model`). Validated against the backend's
     /// allowlist when it has one (an unlisted model is an error; nothing runs). Default: the
     /// backend's `default_model`, else the account's/endpoint's default. A backend with
-    /// `models: null` accepts any model if it is a Claude backend (e.g. "sonnet", "opus") and
-    /// ignores the model if it is a command backend.
+    /// `models: null` accepts any model if it is a Claude or Codex backend (e.g. "sonnet",
+    /// "opus") and ignores the model if it is a command backend.
     pub model: Option<String>,
     /// Tools the agent may use without asking, e.g. ["Read", "Edit", "Bash(git:*)"].
-    /// Default: Claude Code's defaults for headless mode. Ignored by command and opencode
-    /// backends (opencode: use the backend's read_only setting).
+    /// Default: Claude Code's defaults for headless mode. Ignored by command, opencode and
+    /// codex backends (opencode/codex: use the backend's read_only setting).
     pub allowed_tools: Option<Vec<String>>,
     /// Timeout in seconds (1-7200) for each attempt; the whole process tree is killed when it
     /// expires. With a fallback the request can take up to about twice this.
