@@ -53,6 +53,10 @@ pub fn run(args: UninstallArgs) -> Result<ExitCode> {
         println!("No stored tokens or API keys found.");
     }
     step("removing the MCP registration", remove_registration());
+    step(
+        "removing the Codex MCP registration",
+        remove_codex_registration(),
+    );
     if args.purge {
         step("removing the config directory", purge_config_dir());
     }
@@ -229,6 +233,33 @@ fn remove_registration() -> Result<()> {
                 claude_cli::remove_hint(&entry)
             );
         }
+    }
+    Ok(())
+}
+
+/// Remove `[mcp_servers.agent-sidekick]` from the user's Codex config (`$CODEX_HOME` or
+/// `~/.codex`), after a backup; the rest of the file stays as it is.
+fn remove_codex_registration() -> Result<()> {
+    use super::codex_host::{self, Written};
+    let Some(path) = codex_host::real_config_path() else {
+        println!("Skipping the Codex registration (home directory unknown).");
+        return Ok(());
+    };
+    match codex_host::unregister(&path, &codex_host::timestamp()).map_err(anyhow::Error::msg)? {
+        None => println!(
+            "MCP server `{APP_NAME}` was not registered in Codex ({}).",
+            path.display()
+        ),
+        Some(Written::Changed { backup }) => {
+            println!(
+                "Removed MCP server `{APP_NAME}` from Codex ({}).",
+                path.display()
+            );
+            if let Some(b) = backup {
+                println!("Backup of the previous Codex config: {}", b.display());
+            }
+        }
+        Some(Written::Unchanged) => {}
     }
     Ok(())
 }

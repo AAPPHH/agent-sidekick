@@ -31,17 +31,18 @@ use crate::redact::{redact_all, Secrets};
 use crate::runner::{self, RunError, RunOutcome, RunRequest, TAIL_CHARS};
 use crate::token::{self, SecretId, Token, TokenError, TokenSource};
 
-const INSTRUCTIONS: &str = "agent-sidekick delegates work to a separate, headless agent on one \
-of the configured backends (e.g. a second Claude Code instance with its own account, an \
-OpenCode or Gemini CLI agent on another provider, or a local model). Without `backend`, a run \
-goes to the configured default backend. Call `sidekick_backends` to see the configured backends \
-with their description, cost and reachability, and pick one by its description and cost, and a \
-model from its `models`. Use \
-`sidekick_run` to hand off a self-contained prompt (optionally with `backend`, `model` and a \
-`fallback`); it runs in the given working directory and returns which backend and model ran, \
-exit code, log path and the tail of the output. Use `sidekick_status` to see running/queued \
-jobs per backend and diagnose setup problems. If a run fails because no token or key is stored, ask the user to run \
-`agent-sidekick setup` (or `agent-sidekick setup --backend <name>`) in a terminal.";
+/// Server instructions. Codex uses (at least) the first 512 characters for tool selection, so
+/// the tools and the long run time come first (tested in tests/mcp_handshake.rs).
+const INSTRUCTIONS: &str = "agent-sidekick hands a self-contained task to a separate, \
+headless agent (another Claude Code account, OpenCode, Codex, Gemini or a local model). \
+`sidekick_backends`: the configured backends with description, cost, models and reachability; \
+pick one by description and cost. `sidekick_run`: run a prompt in a working directory \
+(optional `backend`, `model`, `fallback`); it returns when the agent is done, which can take \
+many minutes. `sidekick_status`: running/queued jobs and setup problems. Without `backend`, a \
+run goes to the configured default backend. The result names the backend and model that ran, \
+the exit code, the log path and the tail of the output. If a run fails because no token, key \
+or login is stored, ask the user to run `agent-sidekick setup` (or `agent-sidekick setup \
+--backend <name>`) in a terminal.";
 
 /// Upper bound for all reachability checks of one `sidekick_backends` call.
 const BACKENDS_CHECK_BUDGET: Duration = Duration::from_secs(PROBE_TIMEOUT.as_secs() + 1);

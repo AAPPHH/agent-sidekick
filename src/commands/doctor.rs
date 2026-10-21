@@ -90,8 +90,79 @@ pub(crate) fn run_checks() -> Vec<Check> {
     checks.push(cfg_check);
     checks.extend(check_backends(cfg_valid, &cfg, claude.is_ok()));
     checks.push(check_registration(claude.as_ref().ok()));
+    if let Some(c) = check_codex_registration(cfg_valid.then_some(&cfg)) {
+        checks.push(c);
+    }
     checks.push(check_logs_dir());
     checks
+}
+
+/// The registration in the Codex CLI's config, when Codex is installed (`None`: not
+/// installed, nothing to check). Read-only: the file is parsed, Codex is not started.
+fn check_codex_registration(cfg: Option<&Config>) -> Option<Check> {
+    crate::harness::codex::locate_real(None).ok()?;
+    let path = super::codex_host::real_config_path();
+    Some(codex_registration_check(
+        path.as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        cfg,
+    ))
+}
+
+/// [`check_codex_registration`] for the Codex config at `path`.
+pub(crate) fn codex_registration_check(
+    path: Option<&Path>,
+    self_exe: Option<&Path>,
+    cfg: Option<&Config>,
+) -> Check {
+    use super::codex_host;
+    const NAME: &str = "Codex MCP registration";
+    const REGISTER: &str = "run `agent-sidekick setup --codex`";
+    let Some(path) = path else {
+        return Check::warn(NAME, "the Codex config cannot be located", "set CODEX_HOME");
+    };
+    let entry = match codex_host::read_entry_at(path) {
+        Ok(Some(e)) => e,
+        // Optional (only needed to use agent-sidekick from Codex): not a warning.
+        Ok(None) => {
+            return Check::ok(
+                NAME,
+                format!(
+                    "not registered in {} (optional; `{APP_NAME} setup --codex` registers it \
+                     to use {APP_NAME} from Codex)",
+                    path.display()
+                ),
+            )
+        }
+        Err(e) => {
+            return Check::warn(
+                NAME,
+                format!("cannot read the Codex config: {e}"),
+                format!("fix {}", path.display()),
+            )
+        }
+    };
+    let needed = cfg.map(codex_host::config_vars).unwrap_or_default();
+    let problems = codex_host::entry_problems(&entry, self_exe, &needed);
+    let detail = format!("registered in {}", path.display());
+    if problems.is_empty() {
+        return Check::ok(
+            NAME,
+            format!(
+                "{detail} (tool_timeout_sec {})",
+                entry.tool_timeout_sec.unwrap_or_default()
+            ),
+        );
+    }
+    let detail = format!("{detail}; {}", problems.join("; "));
+    let timeout_bad = entry
+        .tool_timeout_sec
+        .is_none_or(|t| t < codex_host::TOOL_TIMEOUT_SEC as f64);
+    if timeout_bad && entry.enabled {
+        Check::fail(NAME, detail, REGISTER)
+    } else {
+        Check::warn(NAME, detail, REGISTER)
+    }
 }
 
 /// Every check's detail goes through redaction, just in case.
@@ -1119,5 +1190,64 @@ mod tests {
 
         std::fs::create_dir(logs.join(crate::logging::LOG_FILE_NAME)).unwrap();
         assert_eq!(check_logs_dir_at(&logs).status, Status::Fail);
+    }
+
+    #[test]
+    fn codex_registration_states() {
+        use crate::commands::codex_host::{register, Registration};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codex").join("config.toml");
+        let exe = dir.path().join("agent-sidekick.exe");
+        std::fs::write(&exe, "").unwrap();
+
+        // No config / not registered: OK with a hint (optional feature).
+        let c = codex_registration_check(Some(&path), Some(&exe), None);
+        assert_eq!(c.status, Status::Ok, "{c:?}");
+        assert!(c.detail.contains("setup --codex"), "{}", c.detail);
+
+        // Registered by setup: OK.
+        let reg = Registration {
+            command: exe.clone(),
+            env: vec![],
+            env_vars: vec!["OAI".into()],
+        };
+        register(&path, &reg, "t1").unwrap();
+        let cfg: Config = toml::from_str(
+            "[backends.a]\nharness = \"codex\"\nauth = \"api-key\"\napi_key_env = \"OAI\"\n\
+             description = \"d\"\ndefault = true\n",
+        )
+        .unwrap();
+        let c = codex_registration_check(Some(&path), Some(&exe), Some(&cfg));
+        assert_eq!(c.status, Status::Ok, "{c:?}");
+        assert!(c.detail.contains("tool_timeout_sec 15000"), "{}", c.detail);
+
+        // A variable the config needs that Codex does not forward: WARN.
+        let cfg2: Config = toml::from_str(
+            "[backends.a]\nharness = \"codex\"\nauth = \"api-key\"\napi_key_env = \"OTHER\"\n\
+             description = \"d\"\ndefault = true\n",
+        )
+        .unwrap();
+        let c = codex_registration_check(Some(&path), Some(&exe), Some(&cfg2));
+        assert_eq!(c.status, Status::Warn, "{c:?}");
+        assert!(c.detail.contains("does not pass OTHER"), "{}", c.detail);
+
+        // Added by `codex mcp add` (no timeout): every run would be cut after 60 s.
+        std::fs::write(
+            &path,
+            format!(
+                "[mcp_servers.agent-sidekick]\ncommand = {}\nargs = [\"serve\"]\n",
+                toml::Value::String(exe.to_string_lossy().into_owned())
+            ),
+        )
+        .unwrap();
+        let c = codex_registration_check(Some(&path), Some(&exe), None);
+        assert_eq!(c.status, Status::Fail, "{c:?}");
+        assert!(c.detail.contains("after 60 s"), "{}", c.detail);
+        assert!(c.next_step.unwrap().contains("setup --codex"));
+
+        // Unreadable TOML: WARN.
+        std::fs::write(&path, "not = = toml").unwrap();
+        let c = codex_registration_check(Some(&path), Some(&exe), None);
+        assert_eq!(c.status, Status::Warn, "{c:?}");
     }
 }

@@ -68,6 +68,8 @@ fn run(args: &[&str], config_dir: &Path, update_url: &str) -> Output {
         )
         .env("AGENT_SIDEKICK_DISABLE_KEYRING", "1")
         .env("AGENT_SIDEKICK_CLAUDE", config_dir.join("no-such-claude"))
+        // doctor reads the Codex config when Codex is installed: never the user's real one.
+        .env("CODEX_HOME", config_dir.join("codex-home"))
         .env("AGENT_SIDEKICK_UPDATE_URL", update_url);
     cmd.output().expect("run agent-sidekick")
 }

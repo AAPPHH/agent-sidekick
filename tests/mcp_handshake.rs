@@ -10,6 +10,68 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use support::{text_of, Server};
 
+/// The messages Codex 0.163.0 sends (recorded against a fake MCP server): its own
+/// `clientInfo`, elicitation and `codex/auth-change` capabilities, a progress token on
+/// `tools/list`, and `tools/call` with Codex's `_meta` (call/thread/session ids, turn
+/// metadata). The server answers them like any other client, without a Claude-only feature.
+#[test]
+fn handshake_as_sent_by_codex() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = Server::start(dir.path(), &[]);
+    let init = server.request(
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"elicitation": {"form": {}, "url": {}}, "experimental": {"codex/auth-change": {}}},
+            "clientInfo": {"name": "codex-mcp-client", "title": "Codex", "version": "0.163.0"}
+        }),
+    );
+    assert_eq!(init["serverInfo"]["name"], "agent-sidekick", "{init}");
+    assert_eq!(init["protocolVersion"], "2025-06-18", "{init}");
+    // Codex uses (at least) the first 512 characters of the instructions for tool selection:
+    // they must already name the tools and the long run time.
+    let instructions = init["instructions"].as_str().expect("instructions");
+    let head: String = instructions.chars().take(512).collect();
+    for needle in [
+        "sidekick_backends",
+        "sidekick_run",
+        "sidekick_status",
+        "minutes",
+    ] {
+        assert!(
+            head.contains(needle),
+            "{needle} not in the first 512 chars: {head}"
+        );
+    }
+    server.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let list = server.request("tools/list", json!({"_meta": {"progressToken": 0}}));
+    let names: Vec<&str> = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    let res = server.request(
+        "tools/call",
+        json!({
+            "name": "sidekick_status",
+            "arguments": {},
+            "_meta": {
+                "progressToken": 1,
+                "callId": "call_1",
+                "threadId": "t",
+                "sessionId": "s",
+                "windowId": "t:0",
+                "itemId": "fc_1",
+                "x-codex-turn-metadata": {"sandbox_mode": "read-only", "model": "gpt-6.1-sol"}
+            }
+        }),
+    );
+    assert_ne!(res["isError"], json!(true), "{res}");
+    assert!(text_of(&res).contains("running"), "{res}");
+}
+
 #[test]
 fn handshake_lists_tools_and_validates_params() {
     let dir = tempfile::tempdir().unwrap();

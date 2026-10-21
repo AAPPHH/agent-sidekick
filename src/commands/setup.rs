@@ -45,6 +45,10 @@ pub struct SetupArgs {
     /// setup instead (ask for the claude-oauth tokens of config.toml, then register).
     #[arg(long)]
     pub no_wizard: bool,
+    /// Only register the MCP server with the OpenAI Codex CLI (in `$CODEX_HOME/config.toml`,
+    /// default `~/.codex/config.toml`; a backup is written first); ask for nothing else.
+    #[arg(long, conflicts_with_all = ["backend", "token_stdin", "no_register", "register_only"])]
+    pub codex: bool,
 }
 
 impl SetupArgs {
@@ -56,6 +60,7 @@ impl SetupArgs {
             && self.backend.is_none()
             && !self.register_only
             && !self.no_wizard
+            && !self.codex
     }
 }
 
@@ -312,6 +317,9 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
         std::io::stdout().is_terminal(),
     ) {
         return super::wizard::run_interactive();
+    }
+    if args.codex {
+        return setup_codex(args.claude.as_deref());
     }
     // The configuration first: a broken config.toml must fail before anything is asked.
     let (cfg, backends) = load_backends().map_err(|e| anyhow!(e))?;
@@ -596,6 +604,89 @@ fn secret_prompt(name: &str, var: &str) -> String {
     format!("Value for {var} of backend {name} (input hidden): ")
 }
 
+/// `setup --codex`: register the MCP server with the Codex CLI.
+fn setup_codex(claude_flag: Option<&Path>) -> Result<ExitCode> {
+    // A broken config.toml does not block the registration; only the variable list is
+    // incomplete then.
+    let cfg = match crate::config::Config::load() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "warning: config.toml: {}; registering without its api_key_env/pass_env names",
+                crate::redact::redact_all(&format!("{e:#}"))
+            );
+            None
+        }
+    };
+    let self_exe = std::env::current_exe().context("determining the path of this executable")?;
+    if looks_like_dev_build(&self_exe) {
+        eprintln!(
+            "warning: {} looks like a cargo build output; the Codex registration will point \
+             there. Install with `cargo install --path .` (or copy the binary somewhere stable) \
+             for regular use.",
+            self_exe.display()
+        );
+    }
+    let claude_path = cfg.as_ref().and_then(|c| c.claude_path.clone());
+    let claude = match resolve_claude(claude_flag, claude_path.as_deref()) {
+        Ok(found) => Some(found.path),
+        Err(e) => {
+            eprintln!(
+                "note: Claude Code not found ({}); AGENT_SIDEKICK_CLAUDE is not set, so \
+                 backends with harness `claude` cannot run from Codex (other harnesses can). \
+                 Pass --claude <path> to set it.",
+                crate::redact::redact_all(&format!("{e:#}"))
+            );
+            None
+        }
+    };
+    let path = super::codex_host::real_config_path().ok_or_else(|| {
+        anyhow!("cannot determine the Codex config (home directory unknown); set CODEX_HOME")
+    })?;
+    register_codex(&path, &self_exe, claude.as_deref(), cfg.as_ref())?;
+    if crate::harness::codex::locate_real(None).is_err() {
+        println!(
+            "Note: the Codex CLI was not found here; `{APP_NAME} harness install codex` shows \
+             how to install it."
+        );
+    }
+    println!(
+        "\nDone. Start a new Codex session (`codex`); `/mcp` there lists `{APP_NAME}`. Check with \
+         `{APP_NAME} doctor`."
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write the Codex registration into the Codex config at `path` (see
+/// [`super::codex_host`]) and say what happened.
+pub(crate) fn register_codex(
+    path: &Path,
+    self_exe: &Path,
+    claude: Option<&Path>,
+    cfg: Option<&crate::config::Config>,
+) -> Result<()> {
+    use super::codex_host::{self, Registration, Written, TOOL_TIMEOUT_SEC};
+    let reg = Registration::new(self_exe, claude, cfg, &|k| std::env::var_os(k));
+    match codex_host::register(path, &reg, &codex_host::timestamp()).map_err(|e| anyhow!(e))? {
+        Written::Unchanged => println!(
+            "MCP server `{APP_NAME}` is already registered in Codex ({}); nothing changed.",
+            path.display()
+        ),
+        Written::Changed { backup } => {
+            println!(
+                "Registered MCP server `{APP_NAME}` in Codex: {} ({} serve, tool_timeout_sec \
+                 {TOOL_TIMEOUT_SEC})",
+                path.display(),
+                self_exe.display()
+            );
+            if let Some(b) = backup {
+                println!("Backup of the previous Codex config: {}", b.display());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `--claude` wins over auto-detection (`config_claude_path`: `claude_path` in config.toml).
 fn resolve_claude(explicit: Option<&Path>, config_claude_path: Option<&Path>) -> Result<Located> {
     if let Some(p) = explicit {
@@ -823,17 +914,19 @@ mod tests {
             backend: None,
             register_only: false,
             no_wizard: false,
+            codex: false,
         };
         assert!(wants_wizard(&bare, true, true));
         assert!(!wants_wizard(&bare, false, true));
         assert!(!wants_wizard(&bare, true, false));
-        let variants: [fn(&mut SetupArgs); 6] = [
+        let variants: [fn(&mut SetupArgs); 7] = [
             |a| a.token_stdin = true,
             |a| a.no_register = true,
             |a| a.claude = Some("/x/claude".into()),
             |a| a.backend = Some("kiconnect".into()),
             |a| a.register_only = true,
             |a| a.no_wizard = true,
+            |a| a.codex = true,
         ];
         for set in variants {
             let mut args = bare_clone(&bare);
@@ -850,6 +943,7 @@ mod tests {
             backend: a.backend.clone(),
             register_only: a.register_only,
             no_wizard: a.no_wizard,
+            codex: a.codex,
         }
     }
 
