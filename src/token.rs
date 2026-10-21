@@ -523,6 +523,22 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    /// The ACL set on the temp file must survive the rename: no inherited ACEs.
+    #[cfg(windows)]
+    #[test]
+    fn file_acl_has_no_inherited_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        write_token_file(&path, &Token::new(SAMPLE)).unwrap();
+        let out = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success());
+        assert!(!text.contains("(I)"), "inherited ACEs present: {text}");
+    }
+
     #[test]
     fn load_order() {
         let dir = tempfile::tempdir().unwrap();
