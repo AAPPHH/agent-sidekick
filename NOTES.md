@@ -701,11 +701,19 @@ User request: agent-sidekick must run under Codex (Codex as MCP host) and drive 
 ### Open items (not verifiable here)
 
 1. ChatGPT-login runs against the real backend (default model, rate limits, token refresh under concurrent runs). Hence `max_concurrent = 1` in the template.
-2. What Codex creates as "PATH alias helper binaries" when `CODEX_HOME` is outside the temp directory (all test homes were under `%TEMP%`); check on the first real run in `<config-dir>/codex/<name>`.
+2. The exact names and location of the "PATH alias helper binaries" Codex creates when `CODEX_HOME` is outside the temp directory (all test homes were under `%TEMP%`, where it only prints "Refusing to create helper binaries"); check on the first real run in `<config-dir>/codex/<name>`. Known from the verifier's run with 0.163.0 and `--ephemeral` in a temp home: `goals_1`, `logs_2`, `memories_1`, `queue_1`, `state_5.sqlite` (each with `-shm`/`-wal`), `installation_id`, `skills/` (documented in REFERENCE known limits).
 3. Whether interactive Codex sends `notifications/cancelled` on a tool timeout or user interrupt, and how its approval prompt for `sidekick_run` looks ("always allow" option?). stdin EOF / process end kills runs either way.
 4. Unix: the allowlist of MCP child variables (so whether `DBUS_SESSION_BUS_ADDRESS` via `env_vars` is enough for the Secret Service keyring) and the npm vendor layout. Without D-Bus the server cannot read the keyring and falls back to the key file, so a secret that `setup` stored in the keyring would look missing under Codex.
 5. Whether `.tmp/plugins-clone-*` in `CODEX_HOME` means a network sync on every run, and whether Codex reads more of the real home than `CODEX_HOME`.
 6. Model list: still the user's decision; the template uses Codex's default model and documents `models`.
+
+### Verifier findings (second pass)
+
+- **Codex config file mode (Unix, fixed).** `write_with_backup` wrote the temp file with `std::fs::write`, so after the rename `~/.codex/config.toml` had the umask mode (0600 became 0644 in WSL), exposing other MCP servers' `env` secrets to other local users. Now the temp file is opened with 0600 and then set to the original's exact mode (`set_permissions`, so the umask cannot strip or widen it) before any content is written; a new file gets 0600. A symlinked `config.toml` is resolved (`canonicalize`) and its target replaced, so the link survives. Unix unit test `writes_keep_the_file_mode_and_follow_symlinks`. Windows: no change (ACLs of a new file come from the directory; the rename keeps that behaviour).
+- **Run-log header duplicates (fixed, all harnesses).** `runner::header` printed `# max_turns:` and `# model:` from the request even when the adapter had its own `max_turns:` line, and showed `(default)` when the backend's default model was used. The generic lines are now left out when an adapter line starts with `max_turns:` / `model:`, or (model) when the `backend:` line contains `, model ` (that line is built from `effective_model`). Matching on header prefixes instead of a new `Launch` field keeps the five `Launch` constructors unchanged.
+- **Remove hint (fixed, also on main).** `claude_cli::remove_hint` now returns a full lowercase clause ("remove it with `...`" / "remove it where it is configured [(scope)]"), so the three callers no longer produce "Remove it with remove it where ...".
+- **README credential caveat.** "Deine Schlüssel sehen diese Befehle nicht" was true for environment variables only; the sandbox can read `auth.json` and the file-fallback key files (verified in a real run). README and REFERENCE Security now say so. agent-sidekick never reads the ChatGPT tokens, so it cannot redact them.
+- **`default = true`.** Exactly one default backend is required by design (`zero_defaults_even_with_single_backend`); the REFERENCE codex snippet now shows `# default = true` with a comment instead of changing the rule.
 
 ### Checks
 

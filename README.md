@@ -83,7 +83,7 @@ Melde dich im Browser mit dem ChatGPT-Konto an, dessen Abo genutzt werden soll. 
 
 Mit einem OpenAI-API-Schlüssel wählst du im Setup „OpenAI-API-Schlüssel“ und fügst den Schlüssel von <https://platform.openai.com/api-keys> ein. Abgerechnet wird dann pro Token über dein OpenAI-Konto.
 
-Ohne weitere Angabe nimmt Codex sein Standardmodell. Codex arbeitet im Projektordner in seiner Sandbox: Es darf dort Dateien ändern, seine Befehle haben aber kein Netzwerk. Deine Schlüssel sehen diese Befehle nicht.
+Ohne weitere Angabe nimmt Codex sein Standardmodell. Codex arbeitet im Projektordner in seiner Sandbox: Es darf dort Dateien ändern, seine Befehle haben aber kein Netzwerk. Deine Schlüssel stehen nicht in den Umgebungsvariablen dieser Befehle. Lesen darf die Sandbox aber die ganze Festplatte: Codex kann also Dateien mit Zugangsdaten öffnen, etwa die ChatGPT-Anmeldung `auth.json` im Codex-Ordner des Backends oder, wenn kein Schlüsselbund verfügbar ist, die Schlüsseldateien von agent-sidekick (`backend-<name>.key`). Lass Codex deshalb nur in Projekten arbeiten, denen du vertraust.
 
 ### agent-sidekick in Codex verwenden
 
