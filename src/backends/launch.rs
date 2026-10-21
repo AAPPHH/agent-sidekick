@@ -236,7 +236,19 @@ pub(crate) fn resolve_command_program(
              a bare program name that is found in PATH"
         ));
     }
-    let not_found = || format!("backend {backend}: program '{program}' not found in PATH");
+    which_in_absolute_path(program, path_var, cwd)
+        .ok_or_else(|| format!("backend {backend}: program '{program}' not found in PATH"))
+}
+
+/// A bare program name looked up in the absolute, non-empty entries of `path_var` only
+/// (on Windows with PATHEXT). On Unix, `which::which` resolves an empty entry (a trailing
+/// `:`) or a relative one (`.`) against the current directory, so a program planted in the
+/// working directory could be found and run; here such entries are dropped.
+pub(crate) fn which_in_absolute_path(
+    program: &str,
+    path_var: Option<OsString>,
+    cwd: &Path,
+) -> Option<PathBuf> {
     let dirs: Vec<PathBuf> = path_var
         .as_deref()
         .map(|v| {
@@ -246,10 +258,10 @@ pub(crate) fn resolve_command_program(
         })
         .unwrap_or_default();
     if dirs.is_empty() {
-        return Err(not_found());
+        return None;
     }
-    let joined = std::env::join_paths(dirs).map_err(|_| not_found())?;
-    which::which_in(program, Some(joined), cwd).map_err(|_| not_found())
+    let joined = std::env::join_paths(dirs).ok()?;
+    which::which_in(program, Some(joined), cwd).ok()
 }
 
 /// Unix: any exec bit set (metadata follows symlinks). Elsewhere: always true.

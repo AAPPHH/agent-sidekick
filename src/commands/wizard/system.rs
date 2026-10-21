@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::npm::{self, Invocation};
+use crate::backends::launch::which_in_absolute_path;
 use crate::backends::reach::{self, ProbeResponse};
 use crate::backends::ResolveDefaults;
 use crate::harness::HarnessKind;
@@ -72,6 +73,14 @@ fn is_file(p: &Path) -> bool {
     p.is_file()
 }
 
+/// `program` in the absolute PATH entries only: never from the current directory through an
+/// empty or relative entry (the wizard runs what it finds and writes node's path into
+/// config.toml), the same rule as for command backends.
+fn path_lookup(program: &str) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    which_in_absolute_path(program, std::env::var_os("PATH"), &cwd)
+}
+
 impl System for RealSystem {
     fn os(&self) -> Os {
         Os::current()
@@ -92,7 +101,7 @@ impl System for RealSystem {
     }
 
     fn find_node(&self) -> Option<PathBuf> {
-        which::which("node").ok().filter(|p| p.is_absolute())
+        path_lookup("node")
     }
 
     fn find_opencode(&self) -> Option<PathBuf> {
@@ -101,7 +110,7 @@ impl System for RealSystem {
 
     fn npm(&self, node: &Path) -> Option<Invocation> {
         let npm_in_path = match Os::current() {
-            Os::Unix => which::which("npm").ok(),
+            Os::Unix => path_lookup("npm"),
             Os::Windows => None,
         };
         npm::npm_base(node, Os::current(), &is_file, npm_in_path.as_deref())
@@ -210,6 +219,54 @@ mod tests {
         );
         assert!(source_label(&TokenSource::Keyring).starts_with("im Schlüsselbund"));
         assert!(source_label(&TokenSource::Env).starts_with("in der Umgebungsvariable"));
+    }
+
+    /// node/npm are looked up like command programs: an executable `node` in the current
+    /// directory is not found through an empty or relative PATH entry (on Unix, `which`
+    /// would resolve those against the current directory).
+    #[test]
+    fn node_is_never_found_in_cwd_through_empty_path_entries() {
+        let cwd = tempfile::TempDir::new().unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        let name = if cfg!(windows) { "node.exe" } else { "node" };
+        let make = |dir: &Path| {
+            let p = dir.join(name);
+            std::fs::write(&p, "").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            p
+        };
+        make(cwd.path());
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let bin_dir = bin.path().display().to_string();
+        for path in [
+            String::new(),
+            ".".to_owned(),
+            format!("{bin_dir}{sep}"),
+            format!("{sep}{bin_dir}"),
+            format!("{bin_dir}{sep}.{sep}{sep}"),
+        ] {
+            assert_eq!(
+                which_in_absolute_path("node", Some(path.clone().into()), cwd.path()),
+                None,
+                "{path:?}"
+            );
+        }
+        // A node in an absolute PATH entry is found.
+        let real = make(bin.path());
+        let found = which_in_absolute_path(
+            "node",
+            Some(format!("{sep}{bin_dir}{sep}").into()),
+            cwd.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::canonicalize(found).unwrap(),
+            std::fs::canonicalize(real).unwrap()
+        );
     }
 
     /// Read-only look at the real machine (runs `npm root -g` and `--version`s); run by
