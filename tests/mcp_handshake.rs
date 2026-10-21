@@ -1,203 +1,14 @@
 //! Speaks raw newline-delimited JSON-RPC to `agent-sidekick serve` over stdio.
 
-use std::io::{BufRead, BufReader, Write};
+mod support;
+
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::process::Command;
+use std::time::Duration;
 
 use serde_json::{json, Value};
-
-const TIMEOUT: Duration = Duration::from_secs(20);
-
-struct Server {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    lines: Receiver<String>,
-    next_id: u64,
-}
-
-impl Server {
-    fn start(config_dir: &Path, extra_env: &[(&str, &str)]) -> Self {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent-sidekick"));
-        cmd.arg("serve")
-            .env("AGENT_SIDEKICK_CONFIG_DIR", config_dir)
-            .env(
-                "AGENT_SIDEKICK_CLAUDE_CONFIG_DIR",
-                config_dir.join("claude"),
-            )
-            .env("AGENT_SIDEKICK_DISABLE_KEYRING", "1")
-            .env_remove("AGENT_SIDEKICK_TOKEN")
-            .env_remove("AGENT_SIDEKICK_CLAUDE")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
-        let mut child = cmd.spawn().expect("spawn agent-sidekick serve");
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (tx, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            child,
-            stdin: Some(stdin),
-            lines,
-            next_id: 1,
-        }
-    }
-
-    fn send(&mut self, msg: &Value) {
-        let stdin = self.stdin.as_mut().expect("stdin open");
-        writeln!(stdin, "{msg}").unwrap();
-        stdin.flush().unwrap();
-    }
-
-    /// Send a request without waiting for its response; returns its id.
-    fn send_request(&mut self, method: &str, params: Value) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        id
-    }
-
-    /// Wait for the response to `id`; returns it and every notification seen before it.
-    fn wait_response(&mut self, id: u64, within: Duration) -> (Value, Vec<Value>) {
-        let deadline = Instant::now() + within;
-        let mut notifications = Vec::new();
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = self
-                .lines
-                .recv_timeout(left)
-                .unwrap_or_else(|_| panic!("no response to request {id} within {within:?}"));
-            let msg: Value = serde_json::from_str(&line)
-                .unwrap_or_else(|e| panic!("non-JSON line on stdout ({e}): {line}"));
-            if msg.get("id") == Some(&json!(id)) {
-                assert!(msg.get("error").is_none(), "request {id} failed: {msg}");
-                return (msg["result"].clone(), notifications);
-            }
-            if msg.get("id").is_none() {
-                notifications.push(msg);
-            }
-        }
-    }
-
-    fn cancel(&mut self, id: u64) {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/cancelled",
-            "params": {"requestId": id, "reason": "test"}
-        }));
-    }
-
-    /// `(running, queued)` from `sidekick_status`.
-    fn counts(&mut self) -> (u64, u64) {
-        let text = text_of(&self.call_tool("sidekick_status", json!({})));
-        let field = |name: &str| {
-            text.lines()
-                .find_map(|l| l.strip_prefix(name))
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or_else(|| panic!("no '{name}' in status: {text}"))
-        };
-        (field("running:"), field("queued:"))
-    }
-
-    /// Poll `sidekick_status` until it reports `want` = (running, queued).
-    fn wait_counts(&mut self, want: (u64, u64), within: Duration) {
-        let deadline = Instant::now() + within;
-        loop {
-            let got = self.counts();
-            if got == want {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "status stuck at (running, queued) = {got:?}, wanted {want:?}"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    /// Wait until the server process exits on its own.
-    fn wait_exit(&mut self, within: Duration) -> std::process::ExitStatus {
-        let deadline = Instant::now() + within;
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "server still running after {within:?}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Send a request and wait (with a deadline) for the response with the same id.
-    /// Every stdout line must be JSON: anything else means logs leak into the protocol.
-    fn request(&mut self, method: &str, params: Value) -> Value {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = self
-                .lines
-                .recv_timeout(left)
-                .unwrap_or_else(|_| panic!("no response to {method} within {TIMEOUT:?}"));
-            let msg: Value = serde_json::from_str(&line)
-                .unwrap_or_else(|e| panic!("non-JSON line on stdout ({e}): {line}"));
-            if msg.get("id") == Some(&json!(id)) {
-                assert!(msg.get("error").is_none(), "{method} failed: {msg}");
-                return msg["result"].clone();
-            }
-        }
-    }
-
-    fn initialize(&mut self) -> Value {
-        let result = self.request(
-            "initialize",
-            json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "handshake-test", "version": "0.0.0"}
-            }),
-        );
-        self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
-        result
-    }
-
-    fn call_tool(&mut self, name: &str, args: Value) -> Value {
-        self.request("tools/call", json!({"name": name, "arguments": args}))
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn text_of(result: &Value) -> String {
-    result["content"]
-        .as_array()
-        .expect("content array")
-        .iter()
-        .filter_map(|c| c["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+use support::{text_of, Server};
 
 #[test]
 fn handshake_lists_tools_and_validates_params() {
@@ -219,6 +30,12 @@ fn handshake_lists_tools_and_validates_params() {
             .clone()
     };
     find("sidekick_status");
+    let backends_tool = find("sidekick_backends");
+    let desc = backends_tool["description"].as_str().unwrap();
+    assert!(
+        desc.contains("description") && desc.contains("cost"),
+        "{desc}"
+    );
     let run = find("sidekick_run");
     assert!(run["description"]
         .as_str()
@@ -233,10 +50,49 @@ fn handshake_lists_tools_and_validates_params() {
         "model",
         "allowed_tools",
         "timeout_s",
+        "backend",
+        "fallback",
     ] {
         assert!(props.contains_key(key), "missing property {key}: {schema}");
     }
+    assert_eq!(props.len(), 8, "unexpected properties: {schema}");
     assert_eq!(schema["required"], json!(["prompt"]), "{schema}");
+    for key in ["backend", "fallback"] {
+        let p = &props[key];
+        let ty = &p["type"];
+        assert!(
+            ty == "string" || ty.as_array().is_some_and(|a| a.contains(&json!("string"))),
+            "{p}"
+        );
+        assert!(
+            p["description"].as_str().is_some_and(|d| !d.is_empty()),
+            "{p}"
+        );
+    }
+    assert!(props["fallback"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("timeout"));
+
+    // Without config.toml there is exactly the implicit backend.
+    let res = server.call_tool("sidekick_backends", json!({}));
+    assert_ne!(res["isError"], json!(true), "{res}");
+    let text = text_of(&res);
+    assert!(!text.contains("sk-ant-"), "{text}");
+    let report: Value = serde_json::from_str(&text).expect("sidekick_backends returns JSON");
+    assert_eq!(report["config_error"], Value::Null, "{report}");
+    let list = report["backends"].as_array().expect("backends array");
+    assert_eq!(list.len(), 1, "{report}");
+    let b = &list[0];
+    assert_eq!(b["name"], "sidekick", "{report}");
+    assert_eq!(b["type"], "claude-oauth", "{report}");
+    assert_eq!(b["cost"], "quota", "{report}");
+    assert_eq!(b["default"], true, "{report}");
+    assert!(b["description"].as_str().is_some_and(|d| !d.is_empty()));
+    assert!(b["reachable"].is_boolean(), "{report}");
+    assert!(b["detail"].is_string(), "{report}");
+    assert_eq!(b["running"], 0, "{report}");
+    assert_eq!(b["queued"], 0, "{report}");
     let at = &props["allowed_tools"];
     let at_type = &at["type"];
     assert!(
@@ -269,6 +125,16 @@ fn handshake_lists_tools_and_validates_params() {
     let res = server.call_tool("sidekick_run", json!({"prompt": "hello", "max_turns": 201}));
     assert_eq!(res["isError"], json!(true), "{res}");
     assert!(text_of(&res).contains("max is 200"), "{res}");
+
+    // Unknown backend names are rejected before anything runs.
+    let res = server.call_tool(
+        "sidekick_run",
+        json!({"prompt": "hello", "backend": "nope"}),
+    );
+    assert_eq!(res["isError"], json!(true), "{res}");
+    let text = text_of(&res);
+    assert!(text.contains("unknown backend 'nope'"), "{text}");
+    assert!(text.contains("sidekick"), "{text}");
 }
 
 /// Needs the real `token` and `locate` modules (stubs panic in the server branch).
@@ -285,8 +151,12 @@ fn status_reports_token_source_without_leaking() {
     let status = server.call_tool("sidekick_status", json!({}));
     assert_ne!(status["isError"], json!(true), "{status}");
     let text = text_of(&status);
-    assert!(text.contains("token: missing"), "{text}");
+    assert!(text.contains("token (sidekick): missing"), "{text}");
     assert!(text.contains("claude: NOT FOUND"), "{text}");
+    assert!(
+        text.contains("sidekick (claude-oauth, default): running 0, queued 0"),
+        "{text}"
+    );
     drop(server);
 
     let secret = "sk-ant-oat01-TESTTOKENabc123_-xyz";
@@ -294,7 +164,10 @@ fn status_reports_token_source_without_leaking() {
     server.initialize();
     let status = server.call_tool("sidekick_status", json!({}));
     let text = text_of(&status);
-    assert!(text.contains("token: present (environment"), "{text}");
+    assert!(
+        text.contains("token (sidekick): present (environment"),
+        "{text}"
+    );
     assert!(!text.contains("sk-ant-"), "{text}");
     assert!(!text.contains("TESTTOKEN"), "{text}");
 }
@@ -446,7 +319,6 @@ fn cancelled_while_queued_never_starts() {
 }
 
 #[test]
-#[ignore = "needs runner::run to honour the CancellationToken (runner review fix); enable after merge"]
 fn cancelled_running_run_is_killed() {
     let setup = HangingSetup::new(None);
     let mut server = setup.start(&[]);
