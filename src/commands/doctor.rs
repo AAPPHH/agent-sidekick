@@ -665,7 +665,7 @@ fn registration_check(
             NAME,
             detail,
             format!(
-                "this entry takes precedence over a user-scope one here; remove it with {}, \
+                "this entry takes precedence over a user-scope one here; {}, \
                  then {REREGISTER} to register in user scope (all projects)",
                 claude_cli::remove_hint(entry)
             ),

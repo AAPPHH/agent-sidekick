@@ -800,7 +800,7 @@ fn shadow_warning(entry: &claude_cli::McpEntry) -> Option<String> {
     }
     Some(format!(
         "another `{APP_NAME}` entry ({scope}) takes precedence over the user-scope registration \
-         in this directory and may point to an old binary. Remove it with {}.",
+         in this directory and may point to an old binary; {}.",
         claude_cli::remove_hint(entry)
     ))
 }

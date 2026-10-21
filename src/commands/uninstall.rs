@@ -228,7 +228,7 @@ fn remove_registration() -> Result<()> {
     if let Ok(Some(entry)) = claude_cli::mcp_get(&found.path) {
         if !entry.is_user_scope() {
             println!(
-                "Note: `{APP_NAME}` is still registered here ({}). Remove it with {}.",
+                "Note: `{APP_NAME}` is still registered here ({}); {}.",
                 entry.scope.as_deref().unwrap_or("unknown scope"),
                 claude_cli::remove_hint(&entry)
             );
