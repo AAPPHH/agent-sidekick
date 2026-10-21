@@ -1,13 +1,16 @@
 //! Harness adapters: the agent CLI a backend runs ("harness") and how agent-sidekick drives
 //! it.
 //!
-//! A backend (`[backends.<name>]`) names its harness with `harness = "claude" | "command"`
-//! (or, legacy, with `type = "claude-oauth" | "claude-endpoint" | "command"`). Each harness
-//! has one adapter implementing [`Harness`]:
+//! A backend (`[backends.<name>]`) names its harness with
+//! `harness = "claude" | "opencode" | "command"` (or, legacy, with
+//! `type = "claude-oauth" | "claude-endpoint" | "command"`; opencode has no legacy form).
+//! Each harness has one adapter implementing [`Harness`]:
 //!
 //! - [`claude::ClaudeHarness`]: the official `claude` CLI, in OAuth mode (a Claude account's
 //!   token, internal type `claude-oauth`) or endpoint mode (an Anthropic-compatible
 //!   `base_url` with an API key, internal type `claude-endpoint`).
+//! - [`opencode::OpencodeHarness`]: the OpenCode CLI (`opencode run --format json`) against
+//!   an OpenAI-compatible endpoint, Ollama or OpenRouter, isolated per backend.
 //! - [`command::CommandHarness`]: any other agent CLI, configured as an argument array with
 //!   placeholders.
 //!
@@ -33,6 +36,7 @@ use crate::token::{SecretId, Token, TokenError, TokenSource};
 
 pub mod claude;
 pub mod command;
+pub mod opencode;
 
 #[cfg(test)]
 mod equivalence_tests;
@@ -45,16 +49,23 @@ pub const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 #[serde(rename_all = "lowercase")]
 pub enum HarnessKind {
     Claude,
+    #[serde(rename = "opencode")]
+    OpenCode,
     Command,
 }
 
 impl HarnessKind {
     /// Every known harness, in the order `harness list` prints them.
-    pub const ALL: [HarnessKind; 2] = [HarnessKind::Claude, HarnessKind::Command];
+    pub const ALL: [HarnessKind; 3] = [
+        HarnessKind::Claude,
+        HarnessKind::OpenCode,
+        HarnessKind::Command,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             HarnessKind::Claude => "claude",
+            HarnessKind::OpenCode => "opencode",
             HarnessKind::Command => "command",
         }
     }
@@ -69,6 +80,7 @@ impl HarnessKind {
         match ty {
             BackendType::ClaudeOauth | BackendType::ClaudeEndpoint => HarnessKind::Claude,
             BackendType::Command => HarnessKind::Command,
+            BackendType::OpenCode => HarnessKind::OpenCode,
         }
     }
 
@@ -76,6 +88,7 @@ impl HarnessKind {
     pub fn adapter(self) -> &'static dyn Harness {
         match self {
             HarnessKind::Claude => &claude::ClaudeHarness,
+            HarnessKind::OpenCode => &opencode::OpencodeHarness,
             HarnessKind::Command => &command::CommandHarness,
         }
     }
@@ -122,6 +135,25 @@ pub struct CheckDeps<'a> {
     pub resolve_program: &'a dyn Fn(&str) -> Result<PathBuf, String>,
     /// The HTTP probe of a `base_url`.
     pub probe: &'a dyn Fn(&str) -> Reachability,
+    /// The executable of a harness backend (opencode: `harness_path` or the lookup) or a
+    /// user-facing error.
+    pub locate: &'a dyn Fn(&Backend) -> Result<PathBuf, String>,
+    /// The stored secret itself (for the authenticated provider probe; never shown).
+    pub secret_value: &'a dyn Fn(&SecretId) -> Result<Token, TokenError>,
+    /// `GET url` with an optional bearer token (never redirected); see
+    /// [`crate::backends::reach::probe_get`].
+    pub probe_get: &'a dyn Fn(&str, Option<&str>) -> crate::backends::reach::ProbeResponse,
+}
+
+/// The result text of a run from a harness with structured output (see
+/// [`Harness::normalize_output`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Normalized {
+    /// What goes into the `sidekick_run` result (before the final tail cut).
+    pub text: String,
+    /// Why a run that exited 0 still counts as failed (e.g. no answer at all); `None`: the
+    /// exit code decides.
+    pub failure: Option<String>,
 }
 
 /// One harness adapter. Implementations are stateless unit structs; get one with
@@ -164,11 +196,21 @@ pub trait Harness: Sync {
     /// The [`Launch`] (program, argv, environment, stdin, secrets, log header) of one run.
     fn build_launch(&self, input: LaunchInput<'_>) -> Result<Launch, String>;
 
-    /// Text of the run's output (stdout and stderr, merged and redacted by the runner) as it
-    /// goes into the `sidekick_run` result. Identity unless a harness emits a structured
-    /// format that needs translating.
-    fn normalize_output(&self, raw: &str) -> String {
-        raw.to_owned()
+    /// Text of the run's output as it goes into the `sidekick_run` result. `raw` is the
+    /// bounded output buffer of the runner (stdout and stderr merged, redacted, at most the
+    /// last 64-128 KiB, so it may start mid-line). `None` (the default): no translation, the
+    /// runner's tail is used unchanged (claude, command). Harnesses with a structured output
+    /// format (opencode JSON lines) return the readable text and, where the exit code is not
+    /// enough, a failure reason.
+    fn normalize_output(&self, _raw: &str) -> Option<Normalized> {
+        None
+    }
+
+    /// Checks right before a run, after the credential was loaded and the program found
+    /// (e.g. the provider endpoint answers). A failure means the run is not started (a
+    /// fallback may be used). Default: nothing to check.
+    fn pre_run_check(&self, _backend: &Backend, _credential: &Credential) -> Result<(), String> {
+        Ok(())
     }
 
     /// Reachability of `backend`: harness installed, credential available and, where the
@@ -215,7 +257,8 @@ mod tests {
             assert_eq!(h.adapter().kind(), h);
             assert_eq!(h.adapter().name(), h.as_str());
         }
-        assert_eq!(HarnessKind::parse("opencode"), None);
+        assert_eq!(HarnessKind::parse("opencode"), Some(HarnessKind::OpenCode));
+        assert_eq!(HarnessKind::parse("codex"), None);
         assert_eq!(HarnessKind::parse("Claude"), None);
     }
 
@@ -241,13 +284,15 @@ mod tests {
         assert!(claude.contains("curl -fsSL https://claude.ai/install.sh | bash"));
         assert!(claude.contains("irm https://claude.ai/install.ps1 | iex"));
         assert!(HarnessKind::Command.adapter().install_hint().is_none());
+        let opencode = HarnessKind::OpenCode.adapter().install_hint().unwrap();
+        assert!(opencode.contains("npm install -g opencode-ai"));
     }
 
     #[test]
     fn normalize_output_is_identity_for_claude_and_command() {
         let raw = "line 1\n\u{1b}[31mred\u{1b}[0m\n{\"json\": true}\n";
-        for h in HarnessKind::ALL {
-            assert_eq!(h.adapter().normalize_output(raw), raw);
+        for h in [HarnessKind::Claude, HarnessKind::Command] {
+            assert_eq!(h.adapter().normalize_output(raw), None);
         }
     }
 }

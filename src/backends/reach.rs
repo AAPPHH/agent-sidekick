@@ -53,9 +53,35 @@ impl Reachability {
 /// HTTP GET `base_url` without credentials; any HTTP response (also 4xx/5xx) counts as
 /// reachable, a connection error or timeout does not. Blocking.
 pub fn probe_http(base_url: &str, timeout: Duration) -> Reachability {
-    let target = match ProbeTarget::parse(base_url) {
+    match probe_get(base_url, None, timeout) {
+        ProbeResponse::Status { code, url, millis } => {
+            Reachability::ok(format!("HTTP {code} from {url} in {millis} ms"))
+        }
+        ProbeResponse::Failed(why) => Reachability::unreachable(format!("unreachable: {why}")),
+    }
+}
+
+/// Outcome of [`probe_get`]. Never contains credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeResponse {
+    /// Any HTTP response; `url` without `user:pass@`.
+    Status {
+        code: u16,
+        url: String,
+        millis: u128,
+    },
+    /// No HTTP response (invalid URL, connection error, timeout, TLS, ...).
+    Failed(String),
+}
+
+/// HTTP `GET url` (same rules as [`probe_http`]: no redirects, one global timeout, loopback
+/// without proxy, body never read), optionally with `Authorization: Bearer <bearer>`. The
+/// bearer token is only ever sent to `url` itself (redirects are not followed) and never
+/// appears in the result. Blocking.
+pub fn probe_get(url: &str, bearer: Option<&str>, timeout: Duration) -> ProbeResponse {
+    let target = match ProbeTarget::parse(url) {
         Ok(t) => t,
-        Err(why) => return Reachability::unreachable(format!("unreachable: {why}")),
+        Err(why) => return ProbeResponse::Failed(why),
     };
 
     let mut config = ureq::Agent::config_builder()
@@ -68,15 +94,18 @@ pub fn probe_http(base_url: &str, timeout: Duration) -> Reachability {
     let agent: ureq::Agent = config.build().into();
 
     let start = Instant::now();
+    let mut request = agent.get(&target.url);
+    if let Some(token) = bearer {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
     // `call` returns once the response head is read; the body is dropped unread.
-    match agent.get(&target.url).call() {
-        Ok(resp) => Reachability::ok(format!(
-            "HTTP {} from {} in {} ms",
-            resp.status().as_u16(),
-            target.url,
-            start.elapsed().as_millis()
-        )),
-        Err(e) => Reachability::unreachable(format!("unreachable: {}", error_text(&e, timeout))),
+    match request.call() {
+        Ok(resp) => ProbeResponse::Status {
+            code: resp.status().as_u16(),
+            url: target.url,
+            millis: start.elapsed().as_millis(),
+        },
+        Err(e) => ProbeResponse::Failed(error_text(&e, timeout)),
     }
 }
 
@@ -130,6 +159,9 @@ fn check_backend_with(
             env_lookup,
             resolve_program,
             probe,
+            locate: &|b| b.harness().locate(b, None),
+            secret_value: &|id| crate::token::load_secret(id).map(|(token, _source)| token),
+            probe_get: &|url, bearer| probe_get(url, bearer, PROBE_TIMEOUT),
         },
     )
 }

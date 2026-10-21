@@ -51,6 +51,18 @@ pub fn run(args: UninstallArgs) -> Result<ExitCode> {
         step("removing the config directory", purge_config_dir());
     }
 
+    if !args.purge {
+        for dir in opencode_dirs(&resolved) {
+            if dir.exists() {
+                println!(
+                    "Note: {} holds an opencode backend's sessions, logs and generated config \
+                     (no keys); it was left in place. `uninstall --purge` removes it with the \
+                     config directory.",
+                    dir.display()
+                );
+            }
+        }
+    }
     for dir in left_in_place(&resolved) {
         if dir.exists() {
             println!(
@@ -84,6 +96,7 @@ pub fn secrets_to_delete(resolved: &Result<Backends, String>) -> (Vec<SecretId>,
                     BackendKind::ClaudeOauth { .. } => SecretId::Oauth(b.name.clone()),
                     BackendKind::ClaudeEndpoint { .. } => SecretId::Endpoint(b.name.clone()),
                     BackendKind::Command { .. } => SecretId::Command(b.name.clone()),
+                    BackendKind::OpenCode { .. } => SecretId::Backend(b.name.clone()),
                 });
             }
         }
@@ -99,6 +112,20 @@ pub fn secrets_to_delete(resolved: &Result<Backends, String>) -> (Vec<SecretId>,
     let mut seen = std::collections::HashSet::new();
     ids.retain(|id| seen.insert(id.clone()));
     (ids, note)
+}
+
+/// Isolation dirs of the opencode backends (`<config-dir>/opencode/<name>`).
+fn opencode_dirs(resolved: &Result<Backends, String>) -> Vec<PathBuf> {
+    match resolved {
+        Ok(backends) => backends
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BackendKind::OpenCode { base_dir, .. } => Some(base_dir.clone()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Claude config dirs that uninstall leaves in place (reported if they exist).
@@ -203,6 +230,30 @@ mod tests {
             "sidekick is the legacy secret and must appear once"
         );
         assert!(ids.contains(&SecretId::legacy()));
+    }
+
+    #[test]
+    fn opencode_provider_keys_are_removed() {
+        use crate::backends::OpencodeProvider;
+        let backends = Backends::new(vec![
+            oauth("sidekick", true),
+            super::super::backends::tests::opencode(
+                "kic",
+                OpencodeProvider::OpenaiCompatible,
+                None,
+                false,
+            ),
+            // Also without a key-based provider: a key may have been stored earlier.
+            super::super::backends::tests::opencode("local", OpencodeProvider::Ollama, None, false),
+        ]);
+        let resolved = Ok(backends);
+        let (ids, _) = secrets_to_delete(&resolved);
+        assert!(ids.contains(&SecretId::Backend("kic".into())));
+        assert!(ids.contains(&SecretId::Backend("local".into())));
+        assert_eq!(opencode_dirs(&resolved).len(), 2);
+        assert!(left_in_place(&resolved)
+            .iter()
+            .all(|d| !d.to_string_lossy().contains("opencode")));
     }
 
     #[test]

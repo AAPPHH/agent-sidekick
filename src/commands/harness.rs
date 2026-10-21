@@ -22,7 +22,7 @@ pub enum HarnessCommand {
     List,
     /// Print the official install command(s) of a harness. Nothing is run.
     Install {
-        /// Harness name (`claude` or `command`).
+        /// Harness name (`claude`, `opencode` or `command`).
         name: String,
     },
 }
@@ -191,8 +191,27 @@ mod tests {
 
     #[test]
     fn install_text_unknown_harness() {
-        let e = install_text("opencode").unwrap_err();
-        assert_eq!(e, "unknown harness `opencode`; known: claude, command");
+        let e = install_text("codex").unwrap_err();
+        assert_eq!(
+            e,
+            "unknown harness `codex`; known: claude, opencode, command"
+        );
+    }
+
+    #[test]
+    fn install_text_opencode_prints_official_commands() {
+        let t = install_text("opencode").unwrap();
+        assert!(t.contains("does not run them"), "{t}");
+        assert!(
+            t.contains("  npm (all platforms):   npm install -g opencode-ai"),
+            "{t}"
+        );
+        assert!(t.contains("scoop install opencode"), "{t}");
+        assert!(t.contains("choco install opencode"), "{t}");
+        assert!(
+            t.contains("curl -fsSL https://opencode.ai/install | bash"),
+            "{t}"
+        );
     }
 
     #[test]

@@ -440,3 +440,66 @@ fn sigterm_shuts_down_with_run_in_flight() {
     // generous margin for slow CI runners.
     server.wait_exit(Duration::from_secs(20));
 }
+
+/// With an opencode backend configured, the tool list and the sidekick_run schema stay the
+/// same, and sidekick_backends/sidekick_status describe the backend without secrets.
+#[test]
+fn handshake_unchanged_with_opencode_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-opencode");
+    let config = format!(
+        "[backends.kic]\nharness = \"opencode\"\nprovider = \"openai-compatible\"\n\
+         base_url = \"http://127.0.0.1:9/api/v1\"\nmodels = [\"m1\", \"m2\"]\n\
+         description = \"KI:connect via OpenCode\"\ndefault = true\nharness_path = '{}'\n",
+        missing.display()
+    );
+    std::fs::write(dir.path().join("config.toml"), config).unwrap();
+    std::fs::write(
+        dir.path().join("backend-kic.key"),
+        "kic-handshake-key-0123456789",
+    )
+    .unwrap();
+    let mut server = Server::start(dir.path(), &[]);
+    server.initialize();
+    let list = server.request("tools/list", json!({}));
+    let mut names: Vec<&str> = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["sidekick_backends", "sidekick_run", "sidekick_status"]
+    );
+    let run = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "sidekick_run")
+        .unwrap();
+    assert_eq!(
+        run["inputSchema"]["properties"].as_object().unwrap().len(),
+        8
+    );
+
+    let text = text_of(&server.call_tool("sidekick_backends", json!({})));
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let b = &report["backends"][0];
+    assert_eq!(b["name"], "kic");
+    assert_eq!(b["type"], "opencode");
+    assert_eq!(b["reachable"], false);
+    assert!(
+        b["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("opencode not installed"),
+        "{b}"
+    );
+    assert!(!text.contains("kic-handshake-key"));
+    let status = text_of(&server.call_tool("sidekick_status", json!({})));
+    assert!(status.contains("kic (opencode, default)"), "{status}");
+    assert!(status.contains("provider key (kic): present"), "{status}");
+    assert!(!status.contains("kic-handshake-key"));
+}

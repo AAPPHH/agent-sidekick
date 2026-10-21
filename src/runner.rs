@@ -174,6 +174,13 @@ pub struct RunOutcome {
     pub log_path: PathBuf,
     /// Last [`TAIL_CHARS`] characters of combined stdout+stderr, token redacted.
     pub tail: String,
+    /// The runner's bounded output buffer (redacted, the last 64-128 KiB of stdout+stderr,
+    /// may start mid-line), for harnesses whose structured output is translated
+    /// ([`crate::harness::Harness::normalize_output`]).
+    pub output: String,
+    /// Set when the run exited 0 but still counts as failed (e.g. a harness that produced no
+    /// answer); see [`crate::harness::Normalized::failure`].
+    pub failure: Option<String>,
     pub duration: Duration,
 }
 
@@ -1092,6 +1099,8 @@ pub async fn run_launch(
             cancelled: true,
             log_path,
             tail: CANCELLED_BEFORE_START_MSG.to_owned(),
+            output: CANCELLED_BEFORE_START_MSG.to_owned(),
+            failure: None,
             duration: Duration::ZERO,
         });
     }
@@ -1223,6 +1232,7 @@ pub async fn run_launch(
     }
     let _ = sink.file.flush();
     let tail = cut_tail(&sink.tail, TAIL_CHARS, sink.dropped_chars);
+    let output = std::mem::take(&mut sink.tail);
     drop(sink);
     // Dropping `killer` kills whatever is left of the tree on every platform (Windows: job
     // handle; Unix: process group SIGKILL plus the Linux sweep), unless it was already
@@ -1243,6 +1253,8 @@ pub async fn run_launch(
         cancelled,
         log_path,
         tail,
+        output,
+        failure: None,
         duration,
     })
 }

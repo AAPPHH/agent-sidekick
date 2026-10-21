@@ -70,13 +70,25 @@ pub enum Step {
     CommandSecretHint { name: String, var: String },
     /// command without `secret_env`: nothing to store.
     CommandInfo { name: String },
+    /// opencode with a key-based provider, only with `--backend`: prompt for the provider key
+    /// (keyring user `backend-<name>`).
+    ProviderKey { name: String },
+    /// opencode with a key-based provider in a full setup: hint to `setup --backend`.
+    ProviderKeyHint { name: String },
+    /// opencode with `api_key_env`: nothing to store, explain the env var.
+    ProviderUsesEnv { name: String, var: String },
+    /// opencode with provider `ollama`: no key.
+    ProviderNoKey { name: String },
 }
 
 impl Step {
     pub fn asks_secret(&self) -> bool {
         matches!(
             self,
-            Step::OauthToken { .. } | Step::EndpointKey { .. } | Step::CommandSecret { .. }
+            Step::OauthToken { .. }
+                | Step::EndpointKey { .. }
+                | Step::CommandSecret { .. }
+                | Step::ProviderKey { .. }
         )
     }
 
@@ -90,7 +102,11 @@ impl Step {
             | Step::EndpointHint { config_dir, .. } => Some(config_dir),
             Step::CommandSecret { .. }
             | Step::CommandSecretHint { .. }
-            | Step::CommandInfo { .. } => None,
+            | Step::CommandInfo { .. }
+            | Step::ProviderKey { .. }
+            | Step::ProviderKeyHint { .. }
+            | Step::ProviderUsesEnv { .. }
+            | Step::ProviderNoKey { .. } => None,
         }
     }
 }
@@ -172,6 +188,18 @@ pub fn plan(backends: &Backends, only: Option<&str>) -> Result<Vec<Step>, String
                     var: var.clone(),
                 },
                 BackendKind::Command { .. } => Step::CommandInfo { name },
+                BackendKind::OpenCode { provider, .. } if !provider.needs_key() => {
+                    Step::ProviderNoKey { name }
+                }
+                BackendKind::OpenCode {
+                    api_key_env: Some(var),
+                    ..
+                } => Step::ProviderUsesEnv {
+                    name,
+                    var: var.clone(),
+                },
+                BackendKind::OpenCode { .. } if single => Step::ProviderKey { name },
+                BackendKind::OpenCode { .. } => Step::ProviderKeyHint { name },
             }
         })
         .collect())
@@ -224,7 +252,11 @@ fn step_name(step: &Step) -> &str {
         | Step::EndpointHint { name, .. }
         | Step::CommandSecret { name, .. }
         | Step::CommandSecretHint { name, .. }
-        | Step::CommandInfo { name } => name,
+        | Step::CommandInfo { name }
+        | Step::ProviderKey { name }
+        | Step::ProviderKeyHint { name }
+        | Step::ProviderUsesEnv { name, .. }
+        | Step::ProviderNoKey { name } => name,
     }
 }
 
@@ -411,6 +443,29 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
         Step::CommandSecretHint { name, var } => println!(
             "Backend `{name}` (command): run `{APP_NAME} setup --backend {name}` to store the \
              value for {var}."
+        ),
+        Step::ProviderKey { name } => {
+            let key = read_secret(
+                token_stdin,
+                &format!("Provider API key for backend `{name}` (input hidden): "),
+            )?;
+            if let FormatCheck::Warn(msg) = token::check_command_secret_format(key.expose()) {
+                eprintln!("warning: {msg}");
+            }
+            let source = token::store_secret(&SecretId::Backend(name.clone()), &key)?;
+            drop(key);
+            println!("Provider key for backend `{name}` stored in {source}.");
+        }
+        Step::ProviderKeyHint { name } => println!(
+            "Backend `{name}` (opencode): run `{APP_NAME} setup --backend {name}` to store its \
+             provider API key."
+        ),
+        Step::ProviderUsesEnv { name, var } => println!(
+            "Backend `{name}` (opencode): the provider key is read from the environment \
+             variable {var}; nothing is stored. It must be set in the MCP server's environment."
+        ),
+        Step::ProviderNoKey { name } => println!(
+            "Backend `{name}` (opencode, provider ollama): no key needed; nothing to store."
         ),
         Step::CommandInfo { name } => {
             let program = backends
@@ -614,9 +669,45 @@ fn looks_like_dev_build(exe: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::backends::tests::{
-        abs, command, command_with_secret, endpoint, oauth, sample,
+        abs, command, command_with_secret, endpoint, oauth, opencode, sample,
     };
     use super::*;
+    use crate::backends::OpencodeProvider;
+
+    #[test]
+    fn opencode_steps() {
+        let backends = Backends::new(vec![
+            oauth("sidekick", true),
+            opencode("kic", OpencodeProvider::OpenaiCompatible, None, false),
+            opencode("or", OpencodeProvider::Openrouter, Some("OR_KEY"), false),
+            opencode("local", OpencodeProvider::Ollama, None, false),
+        ]);
+        let steps = plan(&backends, None).unwrap();
+        assert!(steps.contains(&Step::ProviderKeyHint { name: "kic".into() }));
+        assert!(steps.contains(&Step::ProviderUsesEnv {
+            name: "or".into(),
+            var: "OR_KEY".into()
+        }));
+        assert!(steps.contains(&Step::ProviderNoKey {
+            name: "local".into()
+        }));
+        // Only the OAuth token is asked for in a full setup.
+        assert_eq!(steps.iter().filter(|s| s.asks_secret()).count(), 1);
+
+        let single = plan(&backends, Some("kic")).unwrap();
+        assert_eq!(single, vec![Step::ProviderKey { name: "kic".into() }]);
+        assert!(single[0].asks_secret());
+        assert_eq!(single[0].config_dir(), None);
+        check_token_stdin(&single, true, true).unwrap();
+        let local = plan(&backends, Some("local")).unwrap();
+        assert_eq!(
+            local,
+            vec![Step::ProviderNoKey {
+                name: "local".into()
+            }]
+        );
+        assert!(check_token_stdin(&local, true, true).is_err());
+    }
 
     #[test]
     fn dev_build_detection() {

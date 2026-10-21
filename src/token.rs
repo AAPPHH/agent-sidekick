@@ -106,6 +106,8 @@ pub enum SecretId {
     Endpoint(String),
     /// Secret of the command backend with this name (handed over in its `secret_env`).
     Command(String),
+    /// Provider API key of a harness backend (opencode) with this name.
+    Backend(String),
 }
 
 impl SecretId {
@@ -114,25 +116,27 @@ impl SecretId {
         SecretId::Oauth(crate::backends::IMPLICIT_BACKEND.to_owned())
     }
 
-    /// Keyring user name: `oauth-token`, `oauth-token-<name>`, `endpoint-<name>` or
-    /// `cmd-<name>`.
+    /// Keyring user name: `oauth-token`, `oauth-token-<name>`, `endpoint-<name>`,
+    /// `cmd-<name>` or `backend-<name>`.
     pub fn keyring_user(&self) -> String {
         match self {
             SecretId::Oauth(_) if self.is_legacy() => KEYRING_USER.to_owned(),
             SecretId::Oauth(n) => format!("{KEYRING_USER}-{n}"),
             SecretId::Endpoint(n) => format!("endpoint-{n}"),
             SecretId::Command(n) => format!("cmd-{n}"),
+            SecretId::Backend(n) => format!("backend-{n}"),
         }
     }
 
-    /// File name in the config dir: `token`, `token-<name>`, `endpoint-<name>.key` or
-    /// `cmd-<name>.key`.
+    /// File name in the config dir: `token`, `token-<name>`, `endpoint-<name>.key`,
+    /// `cmd-<name>.key` or `backend-<name>.key`.
     pub fn file_name(&self) -> String {
         match self {
             SecretId::Oauth(_) if self.is_legacy() => LEGACY_FILE_NAME.to_owned(),
             SecretId::Oauth(n) => format!("{LEGACY_FILE_NAME}-{n}"),
             SecretId::Endpoint(n) => format!("endpoint-{n}.key"),
             SecretId::Command(n) => format!("cmd-{n}.key"),
+            SecretId::Backend(n) => format!("backend-{n}.key"),
         }
     }
 
@@ -158,6 +162,7 @@ impl fmt::Display for SecretId {
             SecretId::Oauth(n) => write!(f, "OAuth token of backend `{n}`"),
             SecretId::Endpoint(n) => write!(f, "API key of backend `{n}`"),
             SecretId::Command(n) => write!(f, "secret of backend `{n}`"),
+            SecretId::Backend(n) => write!(f, "provider key of backend `{n}`"),
         }
     }
 }

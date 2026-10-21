@@ -23,6 +23,7 @@ fn defaults() -> ResolveDefaults {
     ResolveDefaults {
         home: Some(abs("home")),
         legacy_agent_config_dir: Some(abs("home").join(".claude-sidekick")),
+        config_dir: Some(abs("config").join("agent-sidekick")),
     }
 }
 
@@ -137,6 +138,9 @@ fn credential(b: &Backend) -> Credential {
         BackendKind::Command {
             secret_env: None, ..
         } => Credential::None,
+        BackendKind::OpenCode { .. } => {
+            Credential::ProviderKey(Token::new(format!("provider-key-of-{}-123", b.name)))
+        }
     }
 }
 
@@ -478,8 +482,21 @@ fn harness_field_errors() {
     // Neither harness nor type.
     let e = resolve_str(&one("", "")).unwrap_err();
     assert!(e.contains("`type` is required"), "{e}");
-    assert!(e.contains("or `harness` (one of: claude, command)"), "{e}");
+    assert!(
+        e.contains("or `harness` (one of: claude, opencode, command)"),
+        "{e}"
+    );
     // Harnesses of later versions are not known yet.
-    let e = resolve_str(&one("harness = \"opencode\"", "")).unwrap_err();
+    let e = resolve_str(&one("harness = \"codex\"", "")).unwrap_err();
     assert!(e.starts_with("parse error"), "{e}");
+    // opencode has no legacy `type`.
+    let e = resolve_str(&one("type = \"opencode\"", "")).unwrap_err();
+    assert!(e.contains("`type = \"opencode\"` is not supported"), "{e}");
+    let e = resolve_str(&one(
+        "type = \"opencode\"
+harness = \"opencode\"",
+        "",
+    ))
+    .unwrap_err();
+    assert!(e.contains("write `harness = \"opencode\"`"), "{e}");
 }

@@ -214,10 +214,12 @@ fn command_secret_is_passed_and_never_shown() {
     );
     assert!(!log.contains(SECRET), "{log}");
 
-    // Another command backend never sees it (it keeps the inherited value).
+    // Another command backend never sees it, nor the inherited value of a variable that
+    // is another backend's `secret_env` (since 0.4.0, like `api_key_env`).
     let (is_error, text) = run(&mut server, &work, "plain");
     assert!(!is_error, "{text}");
-    assert!(text.contains(&format!("KEY:[{INHERITED}]")), "{text}");
+    assert!(text.contains("KEY:[]"), "{text}");
+    assert!(!text.contains(INHERITED), "{text}");
     assert!(!text.contains(SECRET), "{text}");
     assert!(!text.contains("[REDACTED]"), "{text}");
 

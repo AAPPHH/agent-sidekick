@@ -26,7 +26,10 @@ pub enum Credential {
     ApiKey(Token),
     /// command backend with `secret_env`: becomes that variable.
     CommandSecret(Token),
-    /// command backends without `secret_env`.
+    /// opencode backend: the provider key, becomes [`PROVIDER_KEY_ENV`] (referenced from
+    /// the generated opencode.json as `{env:AGENT_SIDEKICK_PROVIDER_KEY}`).
+    ProviderKey(Token),
+    /// command backends without `secret_env`, opencode backends of a provider without key.
     None,
 }
 
@@ -34,12 +37,51 @@ impl Credential {
     /// The secret value, if any (for redaction; never print it).
     pub fn secret(&self) -> Option<&Token> {
         match self {
-            Credential::OauthToken(t) | Credential::ApiKey(t) | Credential::CommandSecret(t) => {
-                Some(t)
-            }
+            Credential::OauthToken(t)
+            | Credential::ApiKey(t)
+            | Credential::CommandSecret(t)
+            | Credential::ProviderKey(t) => Some(t),
             Credential::None => None,
         }
     }
+}
+
+/// The variable an opencode child gets its provider key in.
+pub const PROVIDER_KEY_ENV: &str = "AGENT_SIDEKICK_PROVIDER_KEY";
+
+/// Prefixes of inherited variables removed for opencode backends (`pass_env` cannot keep
+/// them): OpenCode's own settings (`OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, ... could
+/// inject config or permissions; the adapter sets the ones it needs) and the caller's
+/// Anthropic settings and keys.
+const OPENCODE_REMOVED_PREFIXES: &[&str] = &["OPENCODE_", "ANTHROPIC_"];
+
+/// Exact names of inherited variables removed for opencode backends. `PWD`/`OLDPWD`:
+/// opencode takes its working directory from `PWD` before the process cwd. The provider
+/// keys OpenCode would pick up on its own. The npm cache location (the adapter sets its own).
+const OPENCODE_REMOVED_NAMES: &[&str] = &[
+    "PWD",
+    "OLDPWD",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    PROVIDER_KEY_ENV,
+    "npm_config_cache",
+];
+
+/// Of [`OPENCODE_REMOVED_PREFIXES`]/[`OPENCODE_REMOVED_NAMES`], what `pass_env` may still keep
+/// for an opencode backend (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, e.g. for tools the agent
+/// runs). Everything else stays removed.
+const OPENCODE_PASSABLE: &[&str] = &["OPENAI_API_KEY", "OPENROUTER_API_KEY"];
+
+/// Removed for opencode backends; `npm_config_*` names are compared case-insensitively on
+/// every OS (npm reads both spellings).
+fn opencode_removed(name: &OsStr) -> bool {
+    OPENCODE_REMOVED_PREFIXES
+        .iter()
+        .any(|p| has_prefix(name, p))
+        || in_list(name, OPENCODE_REMOVED_NAMES)
+        || name
+            .to_string_lossy()
+            .eq_ignore_ascii_case("npm_config_cache")
 }
 
 /// Prefixes of inherited variables that are always removed (session isolation).
@@ -262,6 +304,7 @@ fn is_removed(name: &OsStr, backend: &Backend) -> bool {
         || (ty != BackendType::ClaudeOauth
             && (eq_name(name, BASE_URL_ENV) || eq_name(name, CUSTOM_HEADERS_ENV)))
         || (ty == BackendType::ClaudeEndpoint && in_list(name, ENDPOINT_MODEL_VARS))
+        || (ty == BackendType::OpenCode && opencode_removed(name))
 }
 
 /// May an inherited variable that matches the removal rules be kept via `pass_env`?
@@ -271,6 +314,10 @@ fn may_pass(name: &OsStr, backend: &Backend) -> bool {
     }
     match backend.backend_type() {
         BackendType::Command => true,
+        BackendType::OpenCode => {
+            !in_list(name, CLAUDE_CREDENTIAL_VARS)
+                && (!opencode_removed(name) || in_list(name, OPENCODE_PASSABLE))
+        }
         BackendType::ClaudeOauth => !in_list(name, CLAUDE_CREDENTIAL_VARS),
         BackendType::ClaudeEndpoint => {
             !in_list(name, CLAUDE_CREDENTIAL_VARS)
@@ -282,7 +329,7 @@ fn may_pass(name: &OsStr, backend: &Backend) -> bool {
 }
 
 /// Set `name=value`, replacing every existing entry with the same name.
-fn set_var(env: &mut Vec<(OsString, OsString)>, name: &str, value: impl Into<OsString>) {
+pub(crate) fn set_var(env: &mut Vec<(OsString, OsString)>, name: &str, value: impl Into<OsString>) {
     env.retain(|(k, _)| !eq_name(k, name));
     env.push((name.into(), value.into()));
 }
@@ -372,6 +419,19 @@ fn child_env_inner(
             (None, Credential::None) => false,
             _ => true,
         },
+        (BackendKind::OpenCode { provider, .. }, cred) => {
+            let mismatch = match (provider.needs_key(), cred) {
+                (true, Credential::ProviderKey(k)) => {
+                    set_var(&mut env, PROVIDER_KEY_ENV, k.expose());
+                    false
+                }
+                (false, Credential::None) => false,
+                _ => true,
+            };
+            // Defence in depth: never an OAuth token for another harness.
+            env.retain(|(k, _)| !eq_name(k, OAUTH_TOKEN_ENV));
+            mismatch
+        }
     };
     (env, mismatch)
 }
@@ -440,12 +500,20 @@ pub fn build_launch(
         BackendKind::Command { secret_env, .. } => secret_env.as_deref(),
         _ => None,
     };
+    let needs_provider_key = match &backend.kind {
+        BackendKind::OpenCode { provider, .. } => provider.needs_key(),
+        _ => false,
+    };
     let credential_ok = matches!(
         (ty, command_secret, credential),
         (BackendType::ClaudeOauth, _, Credential::OauthToken(_))
             | (BackendType::ClaudeEndpoint, _, Credential::ApiKey(_))
             | (BackendType::Command, None, Credential::None)
             | (BackendType::Command, Some(_), Credential::CommandSecret(_))
+    ) || matches!(
+        (ty, needs_provider_key, credential),
+        (BackendType::OpenCode, true, Credential::ProviderKey(_))
+            | (BackendType::OpenCode, false, Credential::None)
     );
     if !credential_ok {
         return Err(format!(

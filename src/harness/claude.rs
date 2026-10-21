@@ -110,7 +110,9 @@ impl Harness for ClaudeHarness {
                     )),
                 }
             }
-            BackendKind::Command { .. } => Err(wrong_harness(self, backend)),
+            BackendKind::Command { .. } | BackendKind::OpenCode { .. } => {
+                Err(wrong_harness(self, backend))
+            }
         }
     }
 
@@ -125,7 +127,10 @@ impl Harness for ClaudeHarness {
             model,
             mut header,
         } = input;
-        if matches!(backend.kind, BackendKind::Command { .. }) {
+        if matches!(
+            backend.kind,
+            BackendKind::Command { .. } | BackendKind::OpenCode { .. }
+        ) {
             return Err(wrong_harness(self, backend));
         }
         let env = child_env(backend, base, global_pass_env, credential);
@@ -212,7 +217,9 @@ impl Harness for ClaudeHarness {
                 }
                 (deps.probe)(base_url)
             }
-            BackendKind::Command { .. } => Reachability::unreachable(wrong_harness(self, backend)),
+            BackendKind::Command { .. } | BackendKind::OpenCode { .. } => {
+                Reachability::unreachable(wrong_harness(self, backend))
+            }
         }
     }
 
