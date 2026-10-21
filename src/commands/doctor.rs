@@ -151,12 +151,24 @@ fn check_token() -> Check {
     }
 }
 
+/// Meaningful because CLI-mode logging never creates the config dir (see `logging`).
 fn check_config_dir() -> Check {
-    const NAME: &str = "config directory";
     match paths::config_dir() {
-        Ok(dir) if dir.is_dir() => Check::ok(NAME, dir.display().to_string()),
-        Ok(dir) => Check::fail(NAME, format!("{} does not exist", dir.display()), SETUP),
-        Err(e) => Check::fail(NAME, format!("{e:#}"), "set AGENT_SIDEKICK_CONFIG_DIR"),
+        Ok(dir) => check_config_dir_at(&dir),
+        Err(e) => Check::fail(
+            "config directory",
+            format!("{e:#}"),
+            "set AGENT_SIDEKICK_CONFIG_DIR",
+        ),
+    }
+}
+
+fn check_config_dir_at(dir: &Path) -> Check {
+    const NAME: &str = "config directory";
+    if dir.is_dir() {
+        Check::ok(NAME, dir.display().to_string())
+    } else {
+        Check::fail(NAME, format!("{} does not exist", dir.display()), SETUP)
     }
 }
 
@@ -227,7 +239,11 @@ fn check_registration(claude: Option<&Located>) -> Check {
     };
     match claude_cli::mcp_get(&found.path) {
         Ok(None) => Check::fail(NAME, format!("{APP_NAME} is not registered"), SETUP),
-        Ok(Some(entry)) => registration_check(&entry, std::env::current_exe().ok().as_deref()),
+        Ok(Some(entry)) => registration_check(
+            &entry,
+            std::env::current_exe().ok().as_deref(),
+            Some(&found.path),
+        ),
         Err(e) => match claude_cli::mcp_list_contains(&found.path) {
             Ok(true) => Check::ok(NAME, "registered (per `claude mcp list`)"),
             Ok(false) => Check::fail(NAME, format!("{APP_NAME} is not registered"), SETUP),
@@ -240,11 +256,43 @@ fn check_registration(claude: Option<&Located>) -> Check {
     }
 }
 
-fn registration_check(entry: &claude_cli::McpEntry, self_exe: Option<&Path>) -> Check {
+/// `found_claude` is the claude doctor located in this terminal; the server instead
+/// uses the `AGENT_SIDEKICK_CLAUDE` baked into the registration (no PATH fallback).
+fn registration_check(
+    entry: &claude_cli::McpEntry,
+    self_exe: Option<&Path>,
+    found_claude: Option<&Path>,
+) -> Check {
     const NAME: &str = "MCP registration";
     let scope = entry.scope.as_deref().unwrap_or("unknown scope");
     let status = entry.status.as_deref().unwrap_or("unknown status");
     let detail = format!("registered ({scope}), {status}");
+    if let Some(registered) = entry.claude_override() {
+        let registered_path = Path::new(registered);
+        if !registered_path.is_file() {
+            return Check::fail(
+                NAME,
+                format!(
+                    "{detail}; registered claude path {registered} no longer exists, \
+                     so every sidekick_run will fail"
+                ),
+                format!("{SETUP} again"),
+            );
+        }
+        if let Some(found) = found_claude {
+            if !same_path(registered_path, found) {
+                return Check::warn(
+                    NAME,
+                    format!(
+                        "{detail}; the server uses claude at {registered}, \
+                         but doctor found {}",
+                        found.display()
+                    ),
+                    format!("{SETUP} again if the server should use {}", found.display()),
+                );
+            }
+        }
+    }
     if let (Some(cmd), Some(exe)) = (entry.command.as_deref(), self_exe) {
         if !same_path(Path::new(cmd), exe) {
             return Check::warn(
@@ -267,18 +315,32 @@ fn registration_check(entry: &claude_cli::McpEntry, self_exe: Option<&Path>) -> 
         return Check::warn(
             NAME,
             detail,
-            format!("{SETUP} to register in user scope (all projects)"),
+            format!(
+                "this entry takes precedence over a user-scope one here; remove it with {}, \
+                 then {SETUP} to register in user scope (all projects)",
+                claude_cli::remove_hint(entry)
+            ),
         );
     }
     Check::ok(NAME, detail)
 }
 
+/// Same file: equal spelling (case-insensitive on Windows) or same canonical path.
 fn same_path(a: &Path, b: &Path) -> bool {
-    if cfg!(windows) {
-        a.to_string_lossy()
-            .eq_ignore_ascii_case(&b.to_string_lossy())
-    } else {
-        a == b
+    let equal = |a: &Path, b: &Path| {
+        if cfg!(windows) {
+            a.to_string_lossy()
+                .eq_ignore_ascii_case(&b.to_string_lossy())
+        } else {
+            a == b
+        }
+    };
+    if equal(a, b) {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => equal(&ca, &cb),
+        _ => false,
     }
 }
 
@@ -288,7 +350,31 @@ fn check_logs_dir() -> Check {
         Ok(d) => d,
         Err(e) => return Check::fail(NAME, format!("{e:#}"), "set AGENT_SIDEKICK_CONFIG_DIR"),
     };
-    match probe_writable(&dir) {
+    check_logs_dir_at(&dir)
+}
+
+/// Read-only apart from a probe file: doctor does not create missing directories.
+fn check_logs_dir_at(dir: &Path) -> Check {
+    const NAME: &str = "logs directory";
+    if !dir.is_dir() {
+        return Check::warn(
+            NAME,
+            format!(
+                "{} does not exist (created by setup or on the first server start)",
+                dir.display()
+            ),
+            SETUP,
+        );
+    }
+    let log_file = dir.join(crate::logging::LOG_FILE_NAME);
+    if log_file.exists() && !log_file.is_file() {
+        return Check::fail(
+            NAME,
+            format!("{} exists but is not a file", log_file.display()),
+            format!("remove or rename {}", log_file.display()),
+        );
+    }
+    match probe_writable(dir) {
         Ok(()) => Check::ok(NAME, format!("{} is writable", dir.display())),
         Err(e) => Check::fail(
             NAME,
@@ -299,7 +385,6 @@ fn check_logs_dir() -> Check {
 }
 
 fn probe_writable(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
     let probe = dir.join(format!(".doctor-probe-{}", uuid::Uuid::new_v4()));
     std::fs::write(&probe, b"probe")?;
     std::fs::remove_file(&probe)
@@ -357,20 +442,86 @@ mod tests {
             status: Some("✔ Connected".into()),
             command: Some("/bin/agent-sidekick".into()),
             args: Some("serve".into()),
+            env: Vec::new(),
         };
-        assert_eq!(registration_check(&e, Some(exe)).status, Status::Ok);
+        assert_eq!(registration_check(&e, Some(exe), None).status, Status::Ok);
         e.command = Some("/old/agent-sidekick".into());
-        assert_eq!(registration_check(&e, Some(exe)).status, Status::Warn);
+        assert_eq!(registration_check(&e, Some(exe), None).status, Status::Warn);
         e.command = Some("/bin/agent-sidekick".into());
         e.status = Some("✘ Failed to connect".into());
-        assert_eq!(registration_check(&e, Some(exe)).status, Status::Warn);
+        assert_eq!(registration_check(&e, Some(exe), None).status, Status::Warn);
+
+        e.status = Some("✔ Connected".into());
+        e.scope = Some("Project config (shared via .mcp.json)".into());
+        let c = registration_check(&e, Some(exe), None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c
+            .next_step
+            .unwrap()
+            .contains("claude mcp remove agent-sidekick -s project`"));
     }
 
     #[test]
-    fn probe_creates_dir_and_cleans_up() {
+    fn registered_claude_path_is_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let registered = dir.path().join("claude.exe");
+        let other = dir.path().join("other-claude.exe");
+        std::fs::write(&other, "").unwrap();
+        let exe = Path::new("/bin/agent-sidekick");
+        let out = format!(
+            "agent-sidekick:\n  Scope: User config (available in all your projects)\n  \
+             Status: ✔ Connected\n  Type: stdio\n  Command: /bin/agent-sidekick\n  \
+             Args: serve\n  Environment:\n    AGENT_SIDEKICK_CLAUDE={}\n",
+            registered.display()
+        );
+        let e = claude_cli::parse_mcp_get(&out, "agent-sidekick").unwrap();
+
+        // Registered path missing: FAIL, even if doctor found a working claude.
+        let c = registration_check(&e, Some(exe), Some(&other));
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("no longer exists"), "{}", c.detail);
+        assert!(c.next_step.unwrap().contains("setup` again"));
+
+        std::fs::write(&registered, "").unwrap();
+        // Exists and is the one doctor found: OK.
+        let c = registration_check(&e, Some(exe), Some(&registered));
+        assert_eq!(c.status, Status::Ok, "{}", c.detail);
+        assert_eq!(registration_check(&e, Some(exe), None).status, Status::Ok);
+        // Exists but differs from the one doctor found: WARN.
+        let c = registration_check(&e, Some(exe), Some(&other));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("doctor found"), "{}", c.detail);
+
+        // A directory is not a usable claude.
+        std::fs::remove_file(&registered).unwrap();
+        std::fs::create_dir(&registered).unwrap();
+        let c = registration_check(&e, Some(exe), Some(&other));
+        assert_eq!(c.status, Status::Fail);
+    }
+
+    #[test]
+    fn config_dir_check_fails_for_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let c = check_config_dir_at(&missing);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.next_step.unwrap().contains("setup"));
+        assert!(!missing.exists());
+        assert_eq!(check_config_dir_at(dir.path()).status, Status::Ok);
+    }
+
+    #[test]
+    fn logs_dir_check_is_read_only_and_cleans_up() {
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("logs");
-        probe_writable(&logs).unwrap();
+        assert_eq!(check_logs_dir_at(&logs).status, Status::Warn);
+        assert!(!logs.exists());
+
+        std::fs::create_dir(&logs).unwrap();
+        assert_eq!(check_logs_dir_at(&logs).status, Status::Ok);
         assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 0);
+
+        std::fs::create_dir(logs.join(crate::logging::LOG_FILE_NAME)).unwrap();
+        assert_eq!(check_logs_dir_at(&logs).status, Status::Fail);
     }
 }

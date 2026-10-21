@@ -114,19 +114,57 @@ pub struct McpEntry {
     pub status: Option<String>,
     pub command: Option<String>,
     pub args: Option<String>,
+    /// `KEY=VALUE` lines of the `Environment:` block, in order.
+    pub env: Vec<(String, String)>,
 }
 
 impl McpEntry {
     pub fn is_user_scope(&self) -> bool {
-        self.scope
-            .as_deref()
-            .is_some_and(|s| s.to_ascii_lowercase().starts_with("user"))
+        self.scope_flag() == Some("user")
     }
 
     pub fn is_connected(&self) -> bool {
         self.status
             .as_deref()
             .is_some_and(|s| s.contains("Connected") && !s.contains("Failed"))
+    }
+
+    /// The `-s` value for `claude mcp remove`, derived from the scope label
+    /// (`Local config (...)`, `Project config (...)`, `User config (...)`).
+    /// `None` for scopes that cannot be removed with `-s` (dynamic, enterprise, ...).
+    pub fn scope_flag(&self) -> Option<&'static str> {
+        scope_flag(self.scope.as_deref()?)
+    }
+
+    /// Value of `AGENT_SIDEKICK_CLAUDE` in the registration, if set.
+    pub fn claude_override(&self) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|(k, _)| k == ENV_CLAUDE)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Map a scope label from `claude mcp get` to the `-s` flag value.
+pub fn scope_flag(label: &str) -> Option<&'static str> {
+    let label = label.trim().to_ascii_lowercase();
+    ["local", "project", "user"]
+        .into_iter()
+        .find(|s| label.starts_with(s))
+}
+
+/// The exact command that removes `entry` (for hints), or a generic instruction
+/// when its scope has no `-s` flag.
+pub fn remove_hint(entry: &McpEntry) -> String {
+    match entry.scope_flag() {
+        Some("user") => format!("`claude mcp remove {APP_NAME} -s user`"),
+        Some(flag) => format!(
+            "`claude mcp remove {APP_NAME} -s {flag}` (run it in the project directory where it is configured)"
+        ),
+        None => format!(
+            "remove it where it is configured ({})",
+            entry.scope.as_deref().unwrap_or("unknown scope")
+        ),
     }
 }
 
@@ -137,7 +175,20 @@ pub fn parse_mcp_get(stdout: &str, name: &str) -> Option<McpEntry> {
     let mut lines = stdout.lines().skip_while(|l| l.trim() != header);
     lines.next()?;
     let mut entry = McpEntry::default();
+    // Indentation of the `Environment:` line while inside its block. Entries are
+    // indented deeper and split on `=`, because values (Windows paths) contain `:`.
+    let mut env_indent: Option<usize> = None;
     for line in lines {
+        let indent = line.len() - line.trim_start().len();
+        if let Some(block) = env_indent {
+            if !line.trim().is_empty() && indent > block {
+                if let Some((k, v)) = line.trim().split_once('=') {
+                    entry.env.push((k.to_owned(), v.to_owned()));
+                }
+                continue;
+            }
+            env_indent = None;
+        }
         let Some((key, value)) = line.trim().split_once(':') else {
             continue;
         };
@@ -147,6 +198,7 @@ pub fn parse_mcp_get(stdout: &str, name: &str) -> Option<McpEntry> {
             "Status" => entry.status = value,
             "Command" => entry.command = value,
             "Args" => entry.args = value,
+            "Environment" => env_indent = Some(indent),
             _ => {}
         }
     }
@@ -302,6 +354,14 @@ mod tests {
         assert!(e.is_connected());
         assert_eq!(e.command.as_deref(), Some("C:\\bin\\agent-sidekick.exe"));
         assert_eq!(e.args.as_deref(), Some("serve"));
+        assert_eq!(
+            e.env,
+            [(
+                "AGENT_SIDEKICK_CLAUDE".to_owned(),
+                "C:\\claude.exe".to_owned()
+            )]
+        );
+        assert_eq!(e.claude_override(), Some("C:\\claude.exe"));
 
         let failed = "agent-sidekick:\n  Scope: Local config\n  Status: ✘ Failed to connect\n";
         let e = parse_mcp_get(failed, "agent-sidekick").unwrap();
@@ -309,6 +369,70 @@ mod tests {
         assert!(!e.is_connected());
 
         assert!(parse_mcp_get("other:\n  Scope: User\n", "agent-sidekick").is_none());
+        assert_eq!(e.claude_override(), None);
+    }
+
+    /// Layout as printed by Claude Code 2.x: `Environment:` block followed by more keys.
+    #[test]
+    fn get_parsing_environment_block() {
+        let out = "agent-sidekick:\n  Scope: Local config (private to you in this project)\n  \
+                   Status: ✘ Failed to connect\n  Type: stdio\n  Command: /usr/bin/agent-sidekick\n  \
+                   Args: serve\n  Environment:\n    FOO=a=b\n    AGENT_SIDEKICK_CLAUDE=/opt/claude: x/claude\n  \
+                   Timeout: 5000ms\n\n\
+                   To remove this server, run: claude mcp remove agent-sidekick -s local\n";
+        let e = parse_mcp_get(out, "agent-sidekick").unwrap();
+        assert_eq!(
+            e.env,
+            [
+                ("FOO".to_owned(), "a=b".to_owned()),
+                (
+                    "AGENT_SIDEKICK_CLAUDE".to_owned(),
+                    "/opt/claude: x/claude".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(e.claude_override(), Some("/opt/claude: x/claude"));
+        assert_eq!(e.scope_flag(), Some("local"));
+        assert_eq!(e.command.as_deref(), Some("/usr/bin/agent-sidekick"));
+
+        // CRLF output and an Environment block at the very end.
+        let crlf = "agent-sidekick:\r\n  Scope: User config\r\n  Environment:\r\n    \
+                    AGENT_SIDEKICK_CLAUDE=C:\\c.exe\r\n";
+        let e = parse_mcp_get(crlf, "agent-sidekick").unwrap();
+        assert_eq!(e.claude_override(), Some("C:\\c.exe"));
+        assert!(e.is_user_scope());
+    }
+
+    #[test]
+    fn scope_mapping() {
+        let cases = [
+            (
+                "Local config (private to you in this project)",
+                Some("local"),
+            ),
+            ("Project config (shared via .mcp.json)", Some("project")),
+            ("User config (available in all your projects)", Some("user")),
+            ("Dynamic config (from command line)", None),
+            ("Enterprise config (managed by your organization)", None),
+        ];
+        for (label, flag) in cases {
+            assert_eq!(scope_flag(label), flag, "{label}");
+            let entry = McpEntry {
+                scope: Some(label.into()),
+                ..Default::default()
+            };
+            assert_eq!(entry.scope_flag(), flag);
+            assert_eq!(entry.is_user_scope(), flag == Some("user"));
+            let hint = remove_hint(&entry);
+            match flag {
+                Some(f) => assert!(
+                    hint.contains(&format!("claude mcp remove agent-sidekick -s {f}`")),
+                    "{hint}"
+                ),
+                None => assert!(hint.contains(label), "{hint}"),
+            }
+        }
+        assert_eq!(McpEntry::default().scope_flag(), None);
     }
 
     #[cfg(windows)]
