@@ -1,0 +1,32 @@
+# Delegation with agent-sidekick
+
+These rules are for the main Claude Code session. Adapt the backend names to your
+`config.toml` (this example matches `examples/config.toml`: `sidekick`, `local`, `aider`).
+
+- Before the first delegation in a session, call `sidekick_backends` and read each backend's
+  `description`, `cost` and `reachable`. Do not delegate to a backend that is not reachable.
+- Choose the backend by task:
+  - `local` (free, local model): boilerplate, test scaffolding, docstrings/comments,
+    mechanical refactors (renames, moving code, applying a pattern you have already
+    shown), formatting and lint fixes.
+  - `sidekick` (second Claude account, uses its quota): complex multi-file changes,
+    debugging, anything that needs real reasoning about the codebase.
+  - `aider` (free, edits files directly without asking): small, well-specified edits to
+    files you name in the prompt. Review the diff afterwards; its changes are not committed.
+  - Keep work you need to judge carefully (security, data migrations, public APIs) in this
+    session.
+- Always pass `cwd` (absolute path of the project). The server's own working directory is
+  arbitrary.
+- Write self-contained prompts: the delegated agent does not see this conversation. Name the
+  files, the goal and how to verify it (e.g. which test command must pass).
+- Use `fallback: "local"` only for tasks that are safe to retry: a failed primary run may
+  already have changed files in `cwd`. Never set a fallback for tasks with side effects
+  outside the working tree (deployments, migrations, pushes). Check `git status` after a
+  fallback run.
+- Never put secrets (tokens, passwords, API keys, customer data) into prompts. Prompts and
+  output are written to the run log.
+- Prefer `local`/`aider` when the `sidekick` account is busy (see `sidekick_status`) or for
+  bulk work; do not fan out many parallel `sidekick` runs.
+- After a delegated run, read the result (exit code, output tail) and verify the change
+  yourself (diff, tests) before building on it. The first line of the result names the
+  backend that actually ran.
