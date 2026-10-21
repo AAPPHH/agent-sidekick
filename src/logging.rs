@@ -69,6 +69,7 @@ fn open_log_file(dir: &Path, mode: Mode) -> Option<(NonBlocking, WorkerGuard)> {
                 );
                 return None;
             }
+            restrict_unix_permissions(dir);
         }
     }
     match build_appender(dir) {
@@ -81,6 +82,25 @@ fn open_log_file(dir: &Path, mode: Mode) -> Option<(NonBlocking, WorkerGuard)> {
             None
         }
     }
+}
+
+/// Unix: logs dir 0700 and the server log 0600 (pre-created before the appender opens it in
+/// append mode), like the per-run logs. Best effort; Windows relies on the profile ACLs.
+fn restrict_unix_permissions(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        let file = dir.join(LOG_FILE_NAME);
+        let _ = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(&file);
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// Unlike `tracing_appender::rolling::never`, this returns an error instead of panicking.
@@ -115,6 +135,19 @@ mod tests {
         drop(appender);
         let text = std::fs::read_to_string(dir.path().join(LOG_FILE_NAME)).unwrap();
         assert_eq!(text, "hello\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_mode_restricts_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let (_writer, guard) = open_log_file(&logs, Mode::Server).unwrap();
+        drop(guard);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&logs), 0o700);
+        assert_eq!(mode(&logs.join(LOG_FILE_NAME)), 0o600);
     }
 
     #[test]
