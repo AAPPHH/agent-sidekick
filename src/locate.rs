@@ -400,8 +400,22 @@ mod tests {
         let bin = TempDir::new().unwrap();
         let p = touch(bin.path(), "claude");
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = run(&[("PATH", path_of(&[bin.path()]))], None, None).unwrap_err();
-        assert!(matches!(err, LocateError::NotFound { .. }));
+        assert!(!is_executable_file(&p, Os::Unix));
+        assert_eq!(find_in_dir(bin.path(), Os::Unix), None);
+
+        // The full search falls through to fixed system dirs (/usr/local/bin, ...), which may
+        // hold a real claude on the test machine; only require that the non-executable file
+        // in PATH is never selected.
+        match run(&[("PATH", path_of(&[bin.path()]))], None, None) {
+            Ok(l) => {
+                assert_ne!(l.path, p, "non-executable file selected");
+                assert_eq!(l.source, LocateSource::WellKnown);
+            }
+            Err(e) => assert!(matches!(e, LocateError::NotFound { .. }), "{e:?}"),
+        }
+
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(find_in_dir(bin.path(), Os::Unix), Some(p));
     }
 
     #[test]
