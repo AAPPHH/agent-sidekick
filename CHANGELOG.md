@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Provider key per opencode backend: `agent-sidekick setup --backend <name>` (OS keyring user `backend-<name>`, file fallback `backend-<name>.key`; nothing for ollama); `uninstall` removes it; `sidekick_status` shows its source.
 - Reachability of opencode backends (`sidekick_backends`, `backends list --check`/`test`, `doctor`, and right before each run): OpenCode installed, key available, and the provider's model list answers (`GET {base_url}/models` with the key as bearer token; ollama `GET /api/tags`; OpenRouter's public list). 401/403 means the key was rejected.
 - `doctor` checks the harness executables used by the configured backends (opencode: path and version); `harness list`/`install` know `opencode` (`opencode --version` runs in a temporary isolated home).
-- A warning in the run log when the run's project contains OpenCode plugins (`.opencode/plugin(s)`), which OpenCode executes regardless of its flags.
+- A warning in the run log and the server log when the run's project contains OpenCode plugins (`.opencode/plugin(s)` with `.js`/`.ts` files, or a `plugin`/`plugins` entry in `opencode.json(c)` or `.opencode/opencode.json(c)` up to the repository root), which OpenCode executes regardless of its flags, with the provider key in their environment.
 - `agent-sidekick update`: checks the latest GitHub release and prints the platform's install one-liner (no download, no self-install). `AGENT_SIDEKICK_UPDATE_URL` overrides the API base.
 - `doctor` shows an update hint at most once a day (checked and shown once, result kept in `<config-dir>/update-check.json`); `doctor --offline` skips it.
 - Cargo.toml `repository` (https://github.com/AAPPHH/agent-sidekick).

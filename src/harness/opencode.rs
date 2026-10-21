@@ -4,10 +4,10 @@
 //!
 //! Isolation (see NOTES.md, "Harness adapters (0.4.0)"): every backend gets its own directory
 //! `<config-dir>/opencode/<name>/` with `home`, `config`, `data`, `state`, `cache` and `tmp`.
-//! `HOME`/`USERPROFILE` (and on Windows `APPDATA`/`LOCALAPPDATA`), the four `XDG_*_HOME`
-//! variables, `TEMP`/`TMP`/`TMPDIR` and `npm_config_cache` point there, so OpenCode reads no
-//! user config (it always loads `<home>/.opencode`, whatever the flags say) and writes nothing
-//! outside that directory. The generated `config/opencode/opencode.json` depends only on the
+//! `HOME`/`USERPROFILE` (and on Windows `HOMEDRIVE`/`HOMEPATH`, `APPDATA`/`LOCALAPPDATA`),
+//! the four `XDG_*_HOME` variables, `TEMP`/`TMP`/`TMPDIR` and `npm_config_cache` point there,
+//! so OpenCode reads no user config (it always loads `<home>/.opencode`, whatever the flags
+//! say) and writes nothing outside that directory. The generated `config/opencode/opencode.json` depends only on the
 //! backend's configuration (provider, models, permissions), so concurrent runs of one backend
 //! share it safely; per-run values (`max_turns` as `agent.build.steps`) go through
 //! `OPENCODE_CONFIG_CONTENT`. The permission set is also passed as `OPENCODE_PERMISSION`,
@@ -152,6 +152,11 @@ impl Dirs {
             vars.push(("USERPROFILE", self.home.clone().into()));
             vars.push(("APPDATA", self.appdata().into()));
             vars.push(("LOCALAPPDATA", self.localappdata().into()));
+            // Some tools derive the home from HOMEDRIVE + HOMEPATH instead of USERPROFILE.
+            if let Some((drive, path)) = split_drive(&self.home) {
+                vars.push(("HOMEDRIVE", drive));
+                vars.push(("HOMEPATH", path));
+            }
         }
         vars.extend([
             ("XDG_CONFIG_HOME", self.config.clone().into()),
@@ -165,6 +170,41 @@ impl Dirs {
         ]);
         vars
     }
+}
+
+/// Windows: split an absolute path into `HOMEDRIVE` (`C:` or `\\server\share`) and `HOMEPATH`
+/// (`\rest`). `None` for other prefixes (device paths) or a path without prefix.
+fn split_drive(path: &Path) -> Option<(OsString, OsString)> {
+    use std::path::{Component, Prefix};
+    let mut comps = path.components();
+    let Some(Component::Prefix(p)) = comps.next() else {
+        return None;
+    };
+    let drive: OsString = match p.kind() {
+        Prefix::Disk(d) | Prefix::VerbatimDisk(d) => format!("{}:", d as char).into(),
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            let mut s = OsString::from("\\\\");
+            s.push(server);
+            s.push("\\");
+            s.push(share);
+            s
+        }
+        _ => return None,
+    };
+    let mut rest = OsString::new();
+    for c in comps {
+        match c {
+            Component::RootDir | Component::CurDir => {}
+            other => {
+                rest.push("\\");
+                rest.push(other.as_os_str());
+            }
+        }
+    }
+    if rest.is_empty() {
+        rest.push("\\");
+    }
+    Some((drive, rest))
 }
 
 #[cfg(unix)]
@@ -438,12 +478,16 @@ pub fn git_bash(
         .find(|b| is_file(b))
 }
 
-/// `.opencode/plugin(s)` directories with `*.js`/`*.ts` files between `cwd` and its project
-/// root (the first directory upwards that contains `.git`, else the filesystem root).
-/// OpenCode 1.19 loads these project plugins even with `OPENCODE_DISABLE_PROJECT_CONFIG=1`
-/// and `OPENCODE_PURE=1` (verified in a real run; its second config loader scans `.opencode`
-/// directories without that gate), so a run in such a project executes that code.
-pub fn project_plugin_dirs(cwd: &Path) -> Vec<PathBuf> {
+/// Sources of project plugins between `cwd` and its project root (the first directory
+/// upwards that contains `.git`, else the filesystem root): `.opencode/plugin(s)` directories
+/// with `*.js`/`*.ts` files, and the config documents `opencode.json(c)` and
+/// `.opencode/opencode.json(c)` that name plugins (`plugin`/`plugins`, which may be file URLs
+/// or npm packages). OpenCode 1.19 loads all of these even with
+/// `OPENCODE_DISABLE_PROJECT_CONFIG=1` and `OPENCODE_PURE=1` (verified in real runs; its second
+/// config loader scans `.opencode` directories and `opencode.json(c)` documents without that
+/// gate), so a run in such a project executes that code, with the provider key in its
+/// environment.
+pub fn project_plugin_sources(cwd: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for dir in cwd.ancestors() {
         for sub in ["plugin", "plugins"] {
@@ -458,11 +502,38 @@ pub fn project_plugin_dirs(cwd: &Path) -> Vec<PathBuf> {
                 found.push(d);
             }
         }
+        for doc_dir in [dir.to_path_buf(), dir.join(".opencode")] {
+            for file in ["opencode.json", "opencode.jsonc"] {
+                let f = doc_dir.join(file);
+                if std::fs::read_to_string(&f).is_ok_and(|t| names_plugins(&t)) {
+                    found.push(f);
+                }
+            }
+        }
         if dir.join(".git").exists() {
             break;
         }
     }
     found
+}
+
+/// Does an OpenCode config document name plugins? Plain JSON: a top-level `plugin`/`plugins`
+/// that is not an empty array (or null). A document serde_json cannot parse (JSONC with
+/// comments or trailing commas, or broken JSON) counts when a `"plugin"`/`"plugins"` key
+/// appears anywhere: a false positive is only a log warning, a miss would hide code execution.
+fn names_plugins(text: &str) -> bool {
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(map)) => ["plugin", "plugins"].iter().any(|k| match map.get(*k) {
+            None | Some(Value::Null) => false,
+            Some(Value::Array(a)) => !a.is_empty(),
+            Some(_) => true,
+        }),
+        Ok(_) => false,
+        Err(_) => {
+            let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            compact.contains("\"plugin\":") || compact.contains("\"plugins\":")
+        }
+    }
 }
 
 /// Characters a model name may contain when the program is a `.cmd`/`.bat` wrapper
@@ -635,6 +706,15 @@ impl Harness for OpencodeHarness {
         };
 
         let mut env = child_env(backend, base, global_pass_env, credential);
+        if cfg!(windows) {
+            // The real profile must not stay reachable through these (replaced below when the
+            // isolated home has a drive or UNC prefix).
+            env.retain(|(k, _)| {
+                !["HOMEDRIVE", "HOMEPATH", "HOMESHARE"]
+                    .iter()
+                    .any(|n| eq_name(k, n))
+            });
+        }
         for (k, v) in dirs.env_vars() {
             set_var(&mut env, k, v);
         }
@@ -693,17 +773,18 @@ impl Harness for OpencodeHarness {
                 "note: allowed_tools ignored by the opencode harness (use read_only)".to_owned(),
             );
         }
-        let plugins = project_plugin_dirs(&req.cwd);
+        let plugins = project_plugin_sources(&req.cwd);
         if !plugins.is_empty() {
             let list: Vec<String> = plugins.iter().map(|p| p.display().to_string()).collect();
             tracing::warn!(
                 backend = %name,
-                "OpenCode will run the project plugins in {}",
+                "OpenCode will run the project plugins from {}, with {PROVIDER_KEY_ENV} in \
+                 their environment",
                 list.join(", ")
             );
             header.push(format!(
-                "warning: OpenCode runs the project plugins in {} (they are not blocked by \
-                 OPENCODE_DISABLE_PROJECT_CONFIG)",
+                "warning: OpenCode runs the project plugins from {} (not blocked by \
+                 OPENCODE_DISABLE_PROJECT_CONFIG); they see {PROVIDER_KEY_ENV}, the provider key",
                 list.join(", ")
             ));
         }

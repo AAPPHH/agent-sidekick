@@ -85,7 +85,8 @@ pub struct RunParams {
     /// ignores the model if it is a command backend.
     pub model: Option<String>,
     /// Tools the agent may use without asking, e.g. ["Read", "Edit", "Bash(git:*)"].
-    /// Default: Claude Code's defaults for headless mode. Ignored by command backends.
+    /// Default: Claude Code's defaults for headless mode. Ignored by command and opencode
+    /// backends (opencode: use the backend's read_only setting).
     pub allowed_tools: Option<Vec<String>>,
     /// Timeout in seconds (1-7200) for each attempt; the whole process tree is killed when it
     /// expires. With a fallback the request can take up to about twice this.

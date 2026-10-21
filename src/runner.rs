@@ -1024,7 +1024,7 @@ enum Ended {
 /// Spawn, collect output into `<logs_dir>/<timestamp>-<short-id>.log`, enforce the timeout.
 /// The timestamp in the file name is UTC (`YYYYmmdd-HHMMSS`).
 /// When `cancel` fires, the process tree is killed and the outcome has `cancelled = true`;
-/// if it has already fired, claude is not started at all.
+/// if it has already fired, the agent is not started at all.
 pub async fn run(
     ctx: &RunContext,
     req: RunRequest,
@@ -1146,7 +1146,7 @@ pub async fn run_launch(
     let mut killer = TreeKiller::attach(&child);
     #[cfg(target_os = "linux")]
     drop(spawn_guard);
-    tracing::info!(log = %log_path.display(), pid = ?child.id(), "started claude");
+    tracing::info!(log = %log_path.display(), pid = ?child.id(), program = %program.display(), "started agent");
 
     if let (Some(prompt), Some(mut stdin)) = (stdin_prompt, child.stdin.take()) {
         tokio::spawn(async move {
@@ -1245,7 +1245,7 @@ pub async fn run_launch(
         timed_out,
         cancelled,
         ?duration,
-        "claude finished"
+        "agent finished"
     );
     Ok(RunOutcome {
         exit_code,

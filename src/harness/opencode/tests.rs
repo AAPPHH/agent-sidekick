@@ -112,6 +112,9 @@ fn poisoned_base(real_home: &Path) -> Vec<(OsString, OsString)> {
         ("FOREIGN_KEY", "foreign-key-of-other-backend-123".to_owned()),
         ("CMD_SECRET", "secret-of-a-command-backend-123".to_owned()),
         ("KEEP_ME", "kept".to_owned()),
+        ("HOMEDRIVE", "Q:".to_owned()),
+        ("HOMEPATH", r"\Users\real".to_owned()),
+        ("HOMESHARE", r"\\fileserver\real".to_owned()),
     ]
     .into_iter()
     .map(|(k, v)| (k.into(), v.into()))
@@ -545,6 +548,16 @@ fn launch_argv_stdin_env_and_files() {
         let v = PathBuf::from(get(n).unwrap_or_else(|| panic!("{n} not set")));
         assert!(v.starts_with(&base), "{n} = {}", v.display());
         assert!(v.is_dir(), "{n} dir created: {}", v.display());
+    }
+    if cfg!(windows) {
+        // HOMEDRIVE + HOMEPATH name the isolated home too; HOMESHARE is gone.
+        let joined = PathBuf::from(format!(
+            "{}{}",
+            get("HOMEDRIVE").unwrap(),
+            get("HOMEPATH").unwrap()
+        ));
+        assert_eq!(joined, base.join("home"));
+        assert!(get("HOMESHARE").is_none());
     }
     assert_eq!(
         env.iter()
@@ -1076,32 +1089,169 @@ fn project_plugins_are_detected_up_to_the_repo_root() {
     let sub = repo.join("src").join("deep");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::create_dir_all(repo.join(".git")).unwrap();
-    assert!(project_plugin_dirs(&sub).is_empty());
+    assert!(project_plugin_sources(&sub).is_empty());
     // Above the repository root: not OpenCode's project, ignored.
     std::fs::create_dir_all(outer.join(".opencode").join("plugin")).unwrap();
     std::fs::write(outer.join(".opencode").join("plugin").join("x.js"), "").unwrap();
-    assert!(project_plugin_dirs(&sub).is_empty());
+    std::fs::write(outer.join("opencode.json"), r#"{"plugin":["evil"]}"#).unwrap();
+    assert!(project_plugin_sources(&sub).is_empty());
     // Inside: found; a directory without code files is not.
     std::fs::create_dir_all(repo.join(".opencode").join("plugins")).unwrap();
     std::fs::write(repo.join(".opencode").join("plugins").join("readme.md"), "").unwrap();
-    assert!(project_plugin_dirs(&sub).is_empty());
+    assert!(project_plugin_sources(&sub).is_empty());
     std::fs::write(repo.join(".opencode").join("plugins").join("p.TS"), "").unwrap();
     assert_eq!(
-        project_plugin_dirs(&sub),
+        project_plugin_sources(&sub),
         vec![repo.join(".opencode").join("plugins")]
     );
+    std::fs::remove_file(repo.join(".opencode").join("plugins").join("p.TS")).unwrap();
+
+    // Config documents: no or an empty plugin list does not count.
+    let root_doc = repo.join("opencode.json");
+    std::fs::write(&root_doc, r#"{"model":"evil/evil","plugin":[]}"#).unwrap();
+    std::fs::write(sub.join("opencode.json"), r#"{"plugins":null}"#).unwrap();
+    assert!(project_plugin_sources(&sub).is_empty());
+    // A plugin named in the root config (file URL or npm package) counts.
+    std::fs::write(
+        &root_doc,
+        r#"{"plugin": ["file:///abs/.opencode/x/p.js", "some-npm-plugin"]}"#,
+    )
+    .unwrap();
+    assert_eq!(project_plugin_sources(&sub), vec![root_doc.clone()]);
+    // JSONC (comments, trailing comma) in .opencode/ of a subdirectory: textual match.
+    let jsonc = sub.join(".opencode").join("opencode.jsonc");
+    std::fs::create_dir_all(jsonc.parent().unwrap()).unwrap();
+    std::fs::write(
+        &jsonc,
+        "{\n  // plugins of this package\n  \"plugins\" : [\"x\"],\n}\n",
+    )
+    .unwrap();
+    assert_eq!(project_plugin_sources(&sub), vec![jsonc, root_doc]);
+    assert!(!names_plugins(r#"["plugin"]"#));
+    assert!(names_plugins(r#"{"plugin": "single"}"#));
+
     let f = fixture();
     let b = kiconnect(&f.config_dir);
     let mut rq = req(&sub);
     rq.cwd = sub.clone();
     let l = launch_for(&f, &b, &Credential::ProviderKey(Token::new(KEY)), &rq);
-    assert!(
-        l.header
-            .iter()
-            .any(|h| h.starts_with("warning: OpenCode runs the project plugins")),
-        "{:?}",
-        l.header
+    let warning = l
+        .header
+        .iter()
+        .find(|h| h.starts_with("warning: OpenCode runs the project plugins"))
+        .unwrap_or_else(|| panic!("{:?}", l.header));
+    assert!(warning.contains("opencode.jsonc"), "{warning}");
+    assert!(warning.contains(PROVIDER_KEY_ENV), "{warning}");
+    assert!(!warning.contains(KEY));
+}
+
+/// Two opencode backends never share state: own directories, generated configs, keys and
+/// isolation variables, and a run of one leaves the other's directory untouched.
+#[test]
+fn two_opencode_backends_are_isolated_from_each_other() {
+    let f = fixture();
+    let cfg = r#"
+[backends.alpha]
+harness = "opencode"
+provider = "openai-compatible"
+base_url = "https://alpha.example/v1"
+models = ["alpha-model"]
+description = "a"
+default = true
+
+[backends.beta]
+harness = "opencode"
+provider = "openai-compatible"
+base_url = "https://beta.example/v1"
+models = ["beta-model"]
+api_key_env = "BETA_KEY_VAR"
+description = "b"
+"#;
+    let backends = resolve_in(cfg, &f.config_dir).unwrap();
+    let a = backends.get("alpha").unwrap().clone();
+    let b = backends.get("beta").unwrap().clone();
+    let base_of = |be: &Backend| match &be.kind {
+        BackendKind::OpenCode { base_dir, .. } => base_dir.clone(),
+        other => panic!("{other:?}"),
+    };
+    let (base_a, base_b) = (base_of(&a), base_of(&b));
+    assert_ne!(base_a, base_b);
+    assert!(!base_a.starts_with(&base_b) && !base_b.starts_with(&base_a));
+    assert!(a.foreign_secret_env.iter().any(|v| v == "BETA_KEY_VAR"));
+
+    const KEY_A: &str = "alpha-provider-key-0123456789";
+    const KEY_B: &str = "beta-provider-key-0123456789";
+    let launch = |be: &Backend, key: &str| {
+        let mut base = poisoned_base(&f.real_home);
+        base.push(("BETA_KEY_VAR".into(), KEY_B.into()));
+        crate::backends::build_launch(
+            be,
+            &req(&f.cwd),
+            &Credential::ProviderKey(Token::new(key)),
+            &f.program,
+            base,
+            &[],
+        )
+        .unwrap()
+    };
+    let snapshot = |dir: &Path| -> Vec<(PathBuf, Vec<u8>)> {
+        files_below(dir)
+            .into_iter()
+            .map(|p| {
+                let bytes = std::fs::read(dir.join(&p)).unwrap();
+                (p, bytes)
+            })
+            .collect()
+    };
+
+    let la = launch(&a, KEY_A);
+    let snap_a = snapshot(&base_a);
+    assert!(!snap_a.is_empty());
+    assert!(!base_b.exists(), "launching alpha created beta's directory");
+    let lb = launch(&b, KEY_B);
+    assert_eq!(
+        snapshot(&base_a),
+        snap_a,
+        "launching beta changed alpha's files"
     );
+    let snap_b = snapshot(&base_b);
+    launch(&a, KEY_A);
+    assert_eq!(
+        snapshot(&base_b),
+        snap_b,
+        "launching alpha changed beta's files"
+    );
+
+    for (l, own_base, own_key, other_key, own_url, other_url) in [
+        (&la, &base_a, KEY_A, KEY_B, "alpha.example", "beta.example"),
+        (&lb, &base_b, KEY_B, KEY_A, "beta.example", "alpha.example"),
+    ] {
+        let get = |n: &str| env_get(&l.env, n).map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(get(PROVIDER_KEY_ENV).as_deref(), Some(own_key));
+        for (_, v) in &l.env {
+            assert!(!v.to_string_lossy().contains(other_key), "other key leaked");
+        }
+        assert!(
+            get("BETA_KEY_VAR").is_none(),
+            "api_key_env variable must not reach opencode"
+        );
+        for n in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "TEMP",
+        ] {
+            let v = PathBuf::from(get(n).unwrap());
+            assert!(v.starts_with(own_base), "{n} = {}", v.display());
+        }
+        let text = std::fs::read_to_string(Dirs::new(own_base).config_file()).unwrap();
+        assert!(
+            text.contains(own_url) && !text.contains(other_url),
+            "{text}"
+        );
+        assert!(!text.contains(own_key) && !text.contains(other_key));
+    }
 }
 
 /// The opencode examples in the README and (commented out) in examples/config.toml resolve.
@@ -1134,4 +1284,34 @@ fn documented_examples_are_valid() {
         base_url.as_deref(),
         Some("https://chat.kiconnect.nrw/api/v1")
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn split_drive_for_homedrive_and_homepath() {
+    let s = |p: &str| {
+        split_drive(Path::new(p)).map(|(d, r)| {
+            (
+                d.to_string_lossy().into_owned(),
+                r.to_string_lossy().into_owned(),
+            )
+        })
+    };
+    assert_eq!(
+        s(r"C:\Users\me\AppData\Roaming\agent-sidekick\opencode\x\home"),
+        Some((
+            "C:".into(),
+            r"\Users\me\AppData\Roaming\agent-sidekick\opencode\x\home".into()
+        ))
+    );
+    assert_eq!(
+        s(r"\\?\D:\cfg\home"),
+        Some(("D:".into(), r"\cfg\home".into()))
+    );
+    assert_eq!(
+        s(r"\\srv\share\cfg\home"),
+        Some((r"\\srv\share".into(), r"\cfg\home".into()))
+    );
+    assert_eq!(s(r"C:\"), Some(("C:".into(), r"\".into())));
+    assert_eq!(s(r"relative\home"), None);
 }

@@ -124,7 +124,8 @@ max_concurrent = 1
 #    sessions, caches); your own ~/.config/opencode and ~/.opencode are not used.
 #    max_turns is only a soft limit for OpenCode; timeout_s is the hard one.
 #    OpenCode still executes project plugins (.opencode/plugin/*.js|ts in cwd or above, up
-#    to the repository root); only run it in projects you trust (README, OpenCode backends).
+#    to the repository root, or named under "plugin" in the project's opencode.json), and
+#    they see the provider key; only run it in projects you trust (README, OpenCode backends).
 #    Rename it to `kiconnect` if you do not keep section 4.
 # [backends.kiconnect-oc]
 # harness = "opencode"
