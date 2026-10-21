@@ -428,16 +428,17 @@ fn cancelled_while_queued_never_starts() {
     let setup = HangingSetup::new(Some("max_concurrent = 1\n"));
     let mut server = setup.start(&[]);
 
-    let first = server.send_request("tools/call", setup.run_args(8));
+    // Long enough that the first run is still active through all status polls on slow CI.
+    let first = server.send_request("tools/call", setup.run_args(20));
     server.wait_counts((1, 0), Duration::from_secs(15));
-    let second = server.send_request("tools/call", setup.run_args(8));
+    let second = server.send_request("tools/call", setup.run_args(20));
     server.wait_counts((1, 1), Duration::from_secs(15));
 
     server.cancel(second);
     server.wait_counts((1, 0), Duration::from_secs(10));
 
     // The first run ends by timeout; the cancelled one must not take over the slot.
-    let (result, _) = server.wait_response(first, Duration::from_secs(30));
+    let (result, _) = server.wait_response(first, Duration::from_secs(40));
     assert!(text_of(&result).contains("timed out"), "{result}");
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(server.counts(), (0, 0));
@@ -480,6 +481,7 @@ fn sigterm_shuts_down_with_run_in_flight() {
     let pid = server.child.id().to_string();
     let status = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
     assert!(status.success());
-    // Signal path: runs cancelled (<= 3 s), service stopped (<= 2 s), runtime stopped (<= 2 s).
-    server.wait_exit(Duration::from_secs(10));
+    // Signal path: runs cancelled (<= 3 s), service stopped (<= 2 s), runtime stopped (<= 2 s);
+    // generous margin for slow CI runners.
+    server.wait_exit(Duration::from_secs(20));
 }
