@@ -293,3 +293,19 @@ nothing runs) and a 404 for `VERSION=v0.3.0` (no release yet).
 Not verified: the HKCU PATH write (it would touch the real registry), the interactive `setup` hand-off, the
 aarch64 musl build, and the workflows on GitHub (no remote yet). `ubuntu-24.04-arm` is free only for public
 repositories.
+
+Verifier follow-up (2026-10-21):
+- Fixed (blocking): `lint-powershell` passed two paths to `Invoke-ScriptAnalyzer -Path`, which takes a single string
+  in PSSA 1.25 (ParameterBindingException before any analysis). It now calls it once per file in a `foreach`. The
+  earlier "0 findings" claim was per file only; the exact CI loop now gives 0 findings in Windows PowerShell 5.1
+  with PSSA 1.25.
+- Fixed: on Windows the installers are rendered in a separate `shell: bash` step (Git Bash, path via `cygpath -u`)
+  instead of `bash ...` from pwsh, whose resolution depends on PATH order (could be the WSL launcher).
+- Hardening: `install.sh` passes `--proto =https --tlsv1.2` to curl whenever the base URL is https (the default), so
+  a redirect cannot downgrade to http. An explicit http `AGENT_SIDEKICK_INSTALL_BASE_URL` (local test server) still
+  works. wget gets no https-only flag: `--https-only` is GNU wget >= 1.17 only and busybox wget rejects it; the
+  default URLs are https anyway. SHA256SUMS comes from the same release: it detects corruption, not a compromised
+  release (as the spec intends; signing is out of scope).
+- Not changed: the README install URLs keep AAPPHH literally. Docs cannot be rendered from Cargo.toml without a
+  build step, and a placeholder URL would not be copy-pasteable. Changing the owner means `Cargo.toml` plus the
+  README URLs; scripts, release and CI derive it from Cargo.toml.

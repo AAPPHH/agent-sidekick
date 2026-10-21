@@ -67,7 +67,14 @@ fetch() {
         [ -f "$BASE/$1" ] || err "$1 not found in $BASE"
         cp "$BASE/$1" "$2"
     elif command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 -o "$2" "$BASE/$1" ||
+        # With an https base (the default) every hop, redirects included, must be https with TLS >= 1.2.
+        # Plain http only happens through an explicit AGENT_SIDEKICK_INSTALL_BASE_URL override.
+        case "$BASE" in
+            https://*) curl_tls="--proto =https --tlsv1.2" ;;
+            *) curl_tls="" ;;
+        esac
+        # shellcheck disable=SC2086 # curl_tls is a fixed list of flags, split on purpose
+        curl -fsSL --retry 3 $curl_tls -o "$2" "$BASE/$1" ||
             err "download failed: $BASE/$1 (check VERSION and your network; releases: https://github.com/$REPO/releases)"
     elif command -v wget >/dev/null 2>&1; then
         wget -q -O "$2" "$BASE/$1" ||

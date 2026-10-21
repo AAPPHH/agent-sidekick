@@ -72,7 +72,11 @@ jobs:
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
           Import-Module PSScriptAnalyzer
           # Suppressions must be in the scripts themselves, each with a Justification.
-          $findings = @(Invoke-ScriptAnalyzer -Path install.ps1, scripts/package.ps1 -Severity Error, Warning)
+          # -Path takes a single string in PSSA 1.25 (an array fails parameter binding): one call per file.
+          $findings = @()
+          foreach ($p in 'install.ps1', 'scripts/package.ps1') {
+            $findings += @(Invoke-ScriptAnalyzer -Path $p -Severity Error, Warning)
+          }
           $findings | Format-Table -AutoSize -Wrap ScriptName, Line, Severity, RuleName, Message
           if ($findings.Count -gt 0) { throw "PSScriptAnalyzer reported $($findings.Count) finding(s)" }
 
@@ -149,10 +153,17 @@ jobs:
           cargo build --release --locked --target $env:TARGET
           if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
           ./scripts/package.ps1 $env:TARGET "target/$env:TARGET/release/agent-sidekick.exe" "$env:RUNNER_TEMP/dist"
-          # Forward slashes for Git Bash.
-          bash scripts/render-installers.sh "$($env:RUNNER_TEMP -replace '\\', '/')/dist"
-          if ($LASTEXITCODE -ne 0) { throw 'render-installers failed' }
-          Get-ChildItem "$env:RUNNER_TEMP/dist"; Get-Content "$env:RUNNER_TEMP/dist/SHA256SUMS"
+
+      # Own step with `shell: bash` (Git Bash on the Windows runners): a plain `bash` call from pwsh
+      # depends on PATH order and could pick another bash (e.g. the WSL launcher).
+      - name: Render installers (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="$(cygpath -u "$RUNNER_TEMP")/dist"
+          scripts/render-installers.sh "$dist"
+          ls -l "$dist"; cat "$dist/SHA256SUMS"
 
       # Windows PowerShell 5.1, the way `irm ... | iex` runs it on a fresh machine.
       - name: Install from the local artifact dir (windows)
