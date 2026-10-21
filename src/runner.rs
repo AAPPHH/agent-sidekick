@@ -63,9 +63,11 @@ pub struct RunContext {
 
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
-    /// `None` if the process was killed (timeout) or ended by a signal.
+    /// `None` if the process was killed (timeout, cancellation) or ended by a signal.
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    /// The caller cancelled the run (MCP `notifications/cancelled`); the tree was killed.
+    pub cancelled: bool,
     pub log_path: PathBuf,
     /// Last [`TAIL_CHARS`] characters of combined stdout+stderr, token redacted.
     pub tail: String,
@@ -392,7 +394,13 @@ fn header(ctx: &RunContext, req: &RunRequest, started: &str, batch: bool) -> Str
 
 /// Spawn, collect output into `<logs_dir>/<timestamp>-<short-id>.log`, enforce the timeout.
 /// The timestamp in the file name is UTC (`YYYYmmdd-HHMMSS`).
-pub async fn run(ctx: &RunContext, req: RunRequest) -> Result<RunOutcome, RunError> {
+/// When `cancel` fires, the process tree is killed and the outcome has `cancelled = true`.
+pub async fn run(
+    ctx: &RunContext,
+    req: RunRequest,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<RunOutcome, RunError> {
+    let _ = &cancel; // TODO(review-fix): honour cancellation (see runner fix task)
     if !req.cwd.is_dir() {
         return Err(RunError::CwdMissing(req.cwd));
     }
@@ -520,6 +528,7 @@ pub async fn run(ctx: &RunContext, req: RunRequest) -> Result<RunOutcome, RunErr
     Ok(RunOutcome {
         exit_code,
         timed_out,
+        cancelled: false,
         log_path,
         tail,
         duration,

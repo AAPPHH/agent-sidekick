@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use agent_sidekick::runner::{run, RunContext, RunError, RunRequest, READERS_ABORTED_MSG};
 use agent_sidekick::token::Token;
+use tokio_util::sync::CancellationToken;
 
 const TOKEN: &str = "plainsecretvalue_0123456789";
 
@@ -87,9 +88,13 @@ exit /b 3
 async fn propagates_args_env_exit_code_and_redacts() {
     let f = fake(ECHO_SCRIPT);
     let prompt = "-starts with a dash and has spaces";
-    let out = run(&f.ctx, request(&f, prompt, Duration::from_secs(30)))
-        .await
-        .unwrap();
+    let out = run(
+        &f.ctx,
+        request(&f, prompt, Duration::from_secs(30)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let t = &out.tail;
 
     assert_eq!(out.exit_code, Some(3), "tail:\n{t}");
@@ -163,9 +168,13 @@ async fn redacts_oauth_shaped_tokens_too() {
     #[cfg(windows)]
     let body = "echo leaked sk-ant-oat01-SomeOther_Token-1\nexit /b 0\n";
     let f = fake(body);
-    let out = run(&f.ctx, request(&f, "hi", Duration::from_secs(30)))
-        .await
-        .unwrap();
+    let out = run(
+        &f.ctx,
+        request(&f, "hi", Duration::from_secs(30)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(out.exit_code, Some(0));
     assert!(out.tail.contains("leaked [REDACTED]"), "{}", out.tail);
     assert!(!out.tail.contains("SomeOther_Token"));
@@ -179,9 +188,13 @@ async fn long_output_is_truncated_but_logged_completely() {
     let body =
         "for /L %%i in (1,1,300) do @echo line %%i xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n";
     let f = fake(body);
-    let out = run(&f.ctx, request(&f, "hi", Duration::from_secs(30)))
-        .await
-        .unwrap();
+    let out = run(
+        &f.ctx,
+        request(&f, "hi", Duration::from_secs(30)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(out.exit_code, Some(0));
     assert!(out.tail.starts_with("[... "), "{}", &out.tail[..80]);
     assert!(out
@@ -208,7 +221,7 @@ async fn missing_cwd_is_an_error() {
     let f = fake("exit 0\n");
     let mut req = request(&f, "hi", Duration::from_secs(5));
     req.cwd = f.dir.path().join("does-not-exist");
-    match run(&f.ctx, req).await {
+    match run(&f.ctx, req, CancellationToken::new()).await {
         Err(RunError::CwdMissing(p)) => assert!(p.ends_with("does-not-exist")),
         other => panic!("unexpected: {other:?}"),
     }
@@ -218,9 +231,13 @@ async fn missing_cwd_is_an_error() {
 async fn missing_executable_is_a_spawn_error() {
     let mut f = fake("exit 0\n");
     f.ctx.claude = f.dir.path().join("no-such-claude.exe");
-    let err = run(&f.ctx, request(&f, "hi", Duration::from_secs(5)))
-        .await
-        .unwrap_err();
+    let err = run(
+        &f.ctx,
+        request(&f, "hi", Duration::from_secs(5)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, RunError::Spawn { .. }), "{err:?}");
     assert!(!err.to_string().contains(TOKEN));
 }
@@ -241,7 +258,13 @@ async fn timeout_kills_process_tree() {
     let f = fake("echo started\nping -n 300 127.0.0.1\n");
 
     let begin = Instant::now();
-    let out = run(&f.ctx, request(&f, "hang", timeout)).await.unwrap();
+    let out = run(
+        &f.ctx,
+        request(&f, "hang", timeout),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let elapsed = begin.elapsed();
 
     assert!(out.timed_out);

@@ -359,7 +359,8 @@ impl SidekickServer {
             prompt_chars = req.prompt.chars().count(),
             "sidekick_run started"
         );
-        let result = runner::run(&ctx, req).await;
+        // TODO(review-fix): pass the request's CancellationToken (RequestContext::ct).
+        let result = runner::run(&ctx, req, tokio_util::sync::CancellationToken::new()).await;
         drop(permit);
 
         match result {
@@ -650,6 +651,7 @@ mod tests {
         RunOutcome {
             exit_code,
             timed_out,
+            cancelled: false,
             log_path: PathBuf::from("run.log"),
             tail: "done".into(),
             duration: Duration::from_millis(12_340),
