@@ -149,7 +149,8 @@ jobs:
           cargo build --release --locked --target $env:TARGET
           if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
           ./scripts/package.ps1 $env:TARGET "target/$env:TARGET/release/agent-sidekick.exe" "$env:RUNNER_TEMP/dist"
-          bash scripts/render-installers.sh "$env:RUNNER_TEMP/dist"
+          # Forward slashes for Git Bash.
+          bash scripts/render-installers.sh "$($env:RUNNER_TEMP -replace '\\', '/')/dist"
           if ($LASTEXITCODE -ne 0) { throw 'render-installers failed' }
           Get-ChildItem "$env:RUNNER_TEMP/dist"; Get-Content "$env:RUNNER_TEMP/dist/SHA256SUMS"
 
