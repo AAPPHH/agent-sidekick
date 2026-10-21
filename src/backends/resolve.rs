@@ -20,6 +20,7 @@ use super::{
     IMPLICIT_BACKEND,
 };
 use crate::config::Config;
+use crate::harness::HarnessKind;
 
 /// Inputs that come from the environment, injected for testability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,9 +257,17 @@ fn resolve_one(
         }
     }
 
-    let Some(kind) = raw.kind else {
-        errs.push("`type` is required (one of: claude-oauth, claude-endpoint, command)".to_owned());
-        return Err(errs);
+    let kind = match backend_type_of(raw) {
+        Ok(k) => k,
+        Err(e) => {
+            errs.push(e);
+            return Err(errs);
+        }
+    };
+    // How the backend's kind was written, for error messages.
+    let written_as = match raw.kind {
+        Some(t) => format!("type `{t}`"),
+        None => harness_mode_label(kind).to_owned(),
     };
 
     let pass_env = raw.pass_env.clone().unwrap_or_default();
@@ -302,7 +311,7 @@ fn resolve_one(
     ];
     for (field, is_set, allowed) in set_fields {
         if is_set && !allowed.contains(&kind) {
-            errs.push(format!("field `{field}` is not allowed for type `{kind}`"));
+            errs.push(format!("field `{field}` is not allowed for {written_as}"));
         }
     }
 
@@ -455,6 +464,45 @@ fn resolve_one(
         kind: kind_val,
         foreign_secret_env: Vec::new(),
     })
+}
+
+/// The internal [`BackendType`] of a backend from `harness` and/or the legacy `type`:
+/// - only `type`: as before (`claude-oauth`, `claude-endpoint`, `command`);
+/// - only `harness`: `claude` without `base_url` is claude-oauth, with `base_url`
+///   claude-endpoint; `command` is command;
+/// - both: they must agree (`type` maps onto its harness, and for `claude` the mode implied
+///   by `base_url` is checked by the field rules of the type); otherwise a config error.
+fn backend_type_of(raw: &RawBackend) -> Result<BackendType, String> {
+    match (raw.kind, raw.harness) {
+        (Some(ty), None) => Ok(ty),
+        (None, Some(HarnessKind::Claude)) => Ok(if raw.base_url.is_some() {
+            BackendType::ClaudeEndpoint
+        } else {
+            BackendType::ClaudeOauth
+        }),
+        (None, Some(HarnessKind::Command)) => Ok(BackendType::Command),
+        (Some(ty), Some(h)) if HarnessKind::of_type(ty) == h => Ok(ty),
+        (Some(ty), Some(h)) => Err(format!(
+            "`type = \"{ty}\"` and `harness = \"{h}\"` disagree (type `{ty}` means \
+             harness `{}`); set only `harness`",
+            HarnessKind::of_type(ty)
+        )),
+        // Starts with the v0.3 wording, which tests and users may rely on.
+        (None, None) => Err(
+            "`type` is required (one of: claude-oauth, claude-endpoint, \
+             command), or `harness` (one of: claude, command)"
+                .to_owned(),
+        ),
+    }
+}
+
+/// How a backend configured with `harness` (no `type`) is named in error messages.
+fn harness_mode_label(kind: BackendType) -> &'static str {
+    match kind {
+        BackendType::ClaudeOauth => "harness `claude` without `base_url` (claude-oauth mode)",
+        BackendType::ClaudeEndpoint => "harness `claude` with `base_url` (claude-endpoint mode)",
+        BackendType::Command => "harness `command`",
+    }
 }
 
 /// Placeholders of a command template (never allowed in `command[0]`).

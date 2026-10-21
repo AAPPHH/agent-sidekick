@@ -1122,7 +1122,9 @@ impl SidekickServer {
         drop(backend_permit);
 
         match result {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                // Identity for the claude and command harnesses.
+                outcome.tail = backend.harness().normalize_output(&outcome.tail);
                 tracing::info!(
                     backend = %backend.name,
                     exit_code = ?outcome.exit_code,

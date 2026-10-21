@@ -1,5 +1,9 @@
 //! Configurable backends: where a `sidekick_run` is executed.
 //!
+//! Each backend runs one harness (agent CLI, see [`crate::harness`]), configured with
+//! `harness = "claude" | "command"` or the legacy `type`. Internally a backend keeps its
+//! [`BackendType`] (shown in results and logs as before):
+//!
 //! - `claude-oauth`: the official `claude` CLI with a Claude account's OAuth token
 //!   (the v0.1 behaviour; implicit backend `sidekick` when config.toml has no `[backends]`).
 //! - `claude-endpoint`: the `claude` CLI against an Anthropic-compatible endpoint
@@ -96,10 +100,15 @@ impl EndpointAuth {
 }
 
 /// One `[backends.<name>]` table exactly as written in config.toml. Every field is optional
-/// here; [`resolve`] checks which ones are required/allowed for the `type`.
+/// here; [`resolve`] checks which ones are required/allowed for the harness/type.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawBackend {
+    /// The agent CLI that runs the backend (`claude` or `command`). `claude` without
+    /// `base_url` is the claude-oauth mode, with `base_url` the claude-endpoint mode.
+    pub harness: Option<crate::harness::HarnessKind>,
+    /// Legacy (v0.2/v0.3) form of `harness`: `claude-oauth`, `claude-endpoint` or `command`.
+    /// Still accepted; together with `harness` both must agree.
     #[serde(rename = "type")]
     pub kind: Option<BackendType>,
     pub description: Option<String>,

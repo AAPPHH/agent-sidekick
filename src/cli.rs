@@ -27,6 +27,8 @@ pub enum Command {
     Doctor,
     /// List or test the configured backends.
     Backends(commands::backends::BackendsArgs),
+    /// List the known harnesses (agent CLIs) or print a harness's official install command.
+    Harness(commands::harness::HarnessArgs),
     /// Remove the stored tokens/API keys of all backends and the MCP registration.
     Uninstall(commands::uninstall::UninstallArgs),
 }
@@ -49,6 +51,10 @@ pub fn main() -> ExitCode {
         Command::Backends(args) => {
             let _guard = logging::init(logging::Mode::Cli);
             commands::backends::run(args)
+        }
+        Command::Harness(args) => {
+            let _guard = logging::init(logging::Mode::Cli);
+            commands::harness::run(args)
         }
         Command::Uninstall(args) => {
             let _guard = logging::init(logging::Mode::Cli);

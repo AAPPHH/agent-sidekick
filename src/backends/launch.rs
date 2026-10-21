@@ -1,4 +1,6 @@
-//! Child environment, credentials and [`Launch`] building per backend type.
+//! Child environment (common session isolation), credentials and [`Launch`] building.
+//! The harness-specific parts live in the adapters under [`crate::harness`]; the functions
+//! here dispatch to them.
 //!
 //! Session isolation: the MCP server is usually started by a Claude Code session and
 //! inherits its variables (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, the messaging socket and
@@ -11,9 +13,9 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use super::{Backend, BackendKind, BackendType};
-use crate::redact::Secrets;
+use crate::harness::{LaunchInput, SecretLoader};
 use crate::runner::{Launch, RunRequest};
-use crate::token::{SecretId, Token, TokenError, TokenSource};
+use crate::token::Token;
 
 /// The credential a backend needs for one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,10 +91,10 @@ const CLAUDE_CREDENTIAL_VARS: &[&str] =
 
 const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
-const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+pub(crate) const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 
 /// Same text as the v0.1 runner warning.
-const BASE_URL_WARNING: &str = "warning: ANTHROPIC_BASE_URL is inherited from the server environment; claude sends its requests (with the agent token) to that endpoint";
+pub(crate) const BASE_URL_WARNING: &str = "warning: ANTHROPIC_BASE_URL is inherited from the server environment; claude sends its requests (with the agent token) to that endpoint";
 
 /// Which request parameters a command backend ignores: `allowed_tools` always, `model` when
 /// its command has no `{model}`. `None` for claude-* backends or when none of them was set.
@@ -129,111 +131,16 @@ pub fn load_credential(backend: &Backend) -> Result<(Credential, String), String
     )
 }
 
-type SecretLoader<'a> = &'a dyn Fn(&SecretId) -> Result<(Token, TokenSource), TokenError>;
-
 /// Testable core of [`load_credential`]: environment and secret store are injected.
+/// Dispatches to the adapter of the backend's harness.
 fn load_credential_with(
     backend: &Backend,
     env_lookup: &dyn Fn(&str) -> Option<String>,
     secret_loader: SecretLoader<'_>,
 ) -> Result<(Credential, String), String> {
-    let name = &backend.name;
-    match &backend.kind {
-        BackendKind::ClaudeOauth { .. } => {
-            let id = SecretId::Oauth(name.clone());
-            match secret_loader(&id) {
-                Ok((token, source)) => Ok((Credential::OauthToken(token), source.to_string())),
-                Err(TokenError::Missing) | Err(TokenError::Empty) => {
-                    Err(missing_oauth_message(name))
-                }
-                Err(TokenError::Invalid) => Err(format!(
-                    "The stored {id} is invalid (it contains line breaks or control \
-                     characters). Run 'agent-sidekick setup --backend {name}' to store it again."
-                )),
-                Err(TokenError::Storage(e)) => Err(format!(
-                    "Cannot read the {id}: {e}. Run 'agent-sidekick doctor' or \
-                     'agent-sidekick setup --backend {name}' in a terminal."
-                )),
-            }
-        }
-        BackendKind::ClaudeEndpoint {
-            api_key_env: Some(var),
-            ..
-        } => {
-            let value = env_lookup(var).map(Token::new);
-            match value {
-                Some(t) if !t.expose().is_empty() => {
-                    Ok((Credential::ApiKey(t), format!("environment variable {var}")))
-                }
-                _ => Err(format!(
-                    "Environment variable {var} (api_key_env of backend '{name}') is not set in \
-                     the MCP server's environment; set it in the registration \
-                     (claude mcp add ... -e) or store a key with \
-                     'agent-sidekick setup --backend {name}'"
-                )),
-            }
-        }
-        BackendKind::ClaudeEndpoint {
-            api_key_env: None, ..
-        } => {
-            let id = SecretId::Endpoint(name.clone());
-            match secret_loader(&id) {
-                Ok((key, source)) => Ok((Credential::ApiKey(key), source.to_string())),
-                Err(TokenError::Missing) | Err(TokenError::Empty) => Err(format!(
-                    "No API key stored for backend '{name}'. Run \
-                     'agent-sidekick setup --backend {name}' in a terminal (local servers that \
-                     ignore keys accept any value such as 'ollama'), or set api_key_env in \
-                     config.toml."
-                )),
-                Err(TokenError::Invalid) => Err(format!(
-                    "The stored {id} is invalid (it contains line breaks or control \
-                     characters). Run 'agent-sidekick setup --backend {name}' to store it again."
-                )),
-                Err(TokenError::Storage(e)) => Err(format!(
-                    "Cannot read the {id}: {e}. Run 'agent-sidekick doctor' or \
-                     'agent-sidekick setup --backend {name}' in a terminal."
-                )),
-            }
-        }
-        BackendKind::Command {
-            secret_env: Some(var),
-            ..
-        } => {
-            let id = SecretId::Command(name.clone());
-            match secret_loader(&id) {
-                Ok((secret, source)) => Ok((Credential::CommandSecret(secret), source.to_string())),
-                Err(TokenError::Missing) | Err(TokenError::Empty) => Err(format!(
-                    "No secret stored for backend '{name}' (secret_env {var}). Run \
-                     'agent-sidekick setup --backend {name}' in a terminal."
-                )),
-                Err(TokenError::Invalid) => Err(format!(
-                    "The stored {id} is invalid (it contains line breaks or control \
-                     characters). Run 'agent-sidekick setup --backend {name}' to store it again."
-                )),
-                Err(TokenError::Storage(e)) => Err(format!(
-                    "Cannot read the {id}: {e}. Run 'agent-sidekick doctor' or \
-                     'agent-sidekick setup --backend {name}' in a terminal."
-                )),
-            }
-        }
-        BackendKind::Command {
-            secret_env: None, ..
-        } => Ok((Credential::None, "none needed".to_owned())),
-    }
-}
-
-fn missing_oauth_message(name: &str) -> String {
-    if name == super::IMPLICIT_BACKEND {
-        format!(
-            "No token stored for backend '{name}'. Run 'agent-sidekick setup' (or \
-             'agent-sidekick setup --backend {name}') in a terminal."
-        )
-    } else {
-        format!(
-            "No token stored for backend '{name}'. Run 'agent-sidekick setup --backend {name}' \
-             in a terminal."
-        )
-    }
+    backend
+        .harness()
+        .load_credential(backend, env_lookup, secret_loader)
 }
 
 // ---------------------------------------------------------------------------
@@ -242,23 +149,9 @@ fn missing_oauth_message(name: &str) -> String {
 
 /// The executable for `backend`: claude (via `locate::find_claude(claude_path)`) for
 /// claude-* types, `command[0]` resolved via PATH (or as given if absolute) for `command`.
+/// Dispatches to the harness adapter ([`crate::harness::Harness::locate`]).
 pub fn resolve_program(backend: &Backend, claude_path: Option<&Path>) -> Result<PathBuf, String> {
-    match &backend.kind {
-        BackendKind::ClaudeOauth { .. } | BackendKind::ClaudeEndpoint { .. } => {
-            crate::locate::find_claude(claude_path)
-                .map(|l| l.path)
-                .map_err(|e| e.to_string())
-        }
-        BackendKind::Command { command, .. } => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            resolve_command_program(
-                &backend.name,
-                command.first().map(String::as_str).unwrap_or(""),
-                std::env::var_os("PATH"),
-                &cwd,
-            )
-        }
-    }
+    backend.harness().locate(backend, claude_path)
 }
 
 /// `program` absolute -> must be an existing file; relative with a separator -> error
@@ -334,7 +227,7 @@ fn is_executable(_p: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Environment variable names are case-insensitive on Windows.
-fn eq_name(a: &OsStr, b: &str) -> bool {
+pub(crate) fn eq_name(a: &OsStr, b: &str) -> bool {
     if cfg!(windows) {
         a.to_string_lossy().eq_ignore_ascii_case(b)
     } else {
@@ -528,6 +421,11 @@ pub fn substitute(
 // ---------------------------------------------------------------------------
 
 /// Build the [`Launch`] for one run of `backend` with the inherited environment `base`.
+///
+/// Common part: the credential must match the backend (an OAuth token is only ever accepted
+/// for a claude-oauth backend, so it can never reach another harness), the model is checked
+/// against the allowlist and the first header line is written. The rest (argv, environment,
+/// stdin, further header lines) comes from the backend's harness adapter.
 pub fn build_launch(
     backend: &Backend,
     req: &RunRequest,
@@ -559,89 +457,20 @@ pub fn build_launch(
         .effective_model(req.model.as_deref())
         .map_err(|e| format!("backend {name}: {e}"))?;
     // Same form as the first line of the sidekick_run result.
-    let mut header = vec![match &model {
+    let header = vec![match &model {
         Some(m) => format!("backend: {name} ({ty}), model {m}"),
         None => format!("backend: {name} ({ty})"),
     }];
-
-    match &backend.kind {
-        BackendKind::ClaudeOauth { .. } | BackendKind::ClaudeEndpoint { .. } => {
-            let env = child_env(backend, base, global_pass_env, credential);
-            match &backend.kind {
-                BackendKind::ClaudeEndpoint { base_url, .. } => {
-                    header.push(format!("endpoint: {base_url}"));
-                }
-                _ => {
-                    if env.iter().any(|(k, _)| eq_name(k, BASE_URL_ENV)) {
-                        tracing::warn!(
-                            "{BASE_URL_ENV} is inherited from the server environment; the agent's requests go to that endpoint"
-                        );
-                        header.push(BASE_URL_WARNING.to_owned());
-                    }
-                }
-            }
-            let req2 = RunRequest {
-                model: model.clone(),
-                ..req.clone()
-            };
-            let secrets = match credential.secret() {
-                Some(t) => Secrets::new([t.expose()]),
-                None => Secrets::none(),
-            };
-            Ok(crate::runner::claude_launch(
-                program, &req2, env, secrets, header,
-            ))
-        }
-        BackendKind::Command {
-            command,
-            prompt_via_stdin,
-            secret_env,
-        } => {
-            if let Some(e) = batch_argument_error(name, program, *prompt_via_stdin) {
-                return Err(e);
-            }
-            let env = child_env(backend, base, global_pass_env, credential);
-            let args: Vec<OsString> = command
-                .iter()
-                .skip(1)
-                .map(|a| {
-                    substitute(a, &req.prompt, &req.cwd, req.max_turns, model.as_deref()).into()
-                })
-                .collect();
-            let stdin = prompt_via_stdin.then(|| req.prompt.clone());
-            header.push(format!("program: {}", program.display()));
-            header.push(format!(
-                "prompt delivery: {}",
-                if *prompt_via_stdin {
-                    "stdin"
-                } else {
-                    "argument"
-                }
-            ));
-            if let Some(what) = command_ignored(backend, req) {
-                header.push(format!("note: {what} ignored by this command backend"));
-            }
-            if let Some(var) = secret_env {
-                // The name only; the value never goes into the header.
-                header.push(format!(
-                    "secret_env: {var} (stored secret, value not shown)"
-                ));
-            }
-            // Secrets shorter than MIN_SECRET_LEN are dropped here (not redacted).
-            let secrets = match credential.secret() {
-                Some(t) => Secrets::new([t.expose()]),
-                None => Secrets::none(),
-            };
-            Ok(Launch {
-                program: program.to_path_buf(),
-                args,
-                env,
-                stdin,
-                secrets,
-                header,
-            })
-        }
-    }
+    backend.harness().build_launch(LaunchInput {
+        backend,
+        req,
+        credential,
+        program,
+        base: base.into_iter().collect(),
+        global_pass_env,
+        model,
+        header,
+    })
 }
 
 /// A command backend whose program is a `.cmd`/`.bat` script cannot take the prompt as an
@@ -668,6 +497,7 @@ fn non_blank(s: Option<&str>) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::backends::{Cost, EndpointAuth};
+    use crate::token::{SecretId, TokenError, TokenSource};
     use std::collections::BTreeMap;
     use std::time::Duration;
 
