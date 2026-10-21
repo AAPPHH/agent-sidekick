@@ -226,8 +226,9 @@ State as of 2026-10-21, version 0.2.0.
 - `/releases/latest` ignores drafts and pre-releases, so a published pre-release is never offered.
 - doctor: `[INFO]` lines after the report, never counted as warning/failure and never changing the exit code.
   Remembered in `<config-dir>/update-check.json` (`checked_at` Unix seconds, `current`, `result`, `latest`):
-  - successful results are reused for 24 h, so an "update available" hint is repeated from the record (no
-    network) on each doctor run of that day; a failed check is shown once and retried after 1 h (silent meanwhile);
+  - the spec's "hint at most once per day" is read literally: the result is shown when it is fetched, and later
+    doctor runs within 24 h print nothing about updates (no network, no repeated hint; `agent-sidekick update`
+    checks on demand); a failed check is shown once and retried after 1 h (silent meanwhile);
   - the record is ignored if the installed version changed, the clock went backwards, or the file is unreadable;
   - like `logging::Mode::Cli`, doctor never creates the config directory: if it does not exist, the check is skipped
     (info line pointing to `agent-sidekick update`), since "once per day" could not be enforced without the record;
@@ -235,3 +236,33 @@ State as of 2026-10-21, version 0.2.0.
 - `update` itself does not read or write `update-check.json` (kept simple; doctor checks again within a day at most).
 - Changes outside the new module are kept small for merging with feat/harness: `DoctorArgs { offline }` and three
   lines in `doctor::run`, the `Update` subcommand in `cli.rs`, `pub mod update` in `commands/mod.rs`.
+- Error texts: ureq hands resolver, connect and TLS failures through as `io::Error`, so `update.rs` classifies them
+  itself: DNS (Winsock 11001/11002/11004 on Windows, std's non-localized "failed to lookup address information"
+  prefix elsewhere) -> "host not found (offline or DNS problem?)"; `InvalidData` during the request -> "TLS handshake
+  failed: <rustls reason>" (during the body read it is a bad, non-UTF-8 answer instead); connection refused/reset and
+  timeouts get a note "via the proxy from HTTPS_PROXY/ALL_PROXY/HTTP_PROXY" when such a variable is set and the host
+  is not loopback (variable names only, never the value). An `AGENT_SIDEKICK_UPDATE_URL` that is not an http(s) URL
+  with a host is rejected before any request ("not a valid http(s) URL", next step "fix or unset", value not echoed);
+  network errors name the variable in the next step when it is set.
+- Redirects: ureq follows them; `https_only` is set for https bases, so a redirect to plain http is refused. http
+  bases (loopback test servers, an internal http mirror) keep working.
+
+### Merge notes (feat/dist-update, measured with `git merge-tree --write-tree`)
+
+- Cargo.toml `repository`: feat/dist-update and feat/dist-install add the identical line before `readme`;
+  feat/dist-plugin adds it after `readme`. Git merges that without conflict but leaves the key twice, and Cargo then
+  refuses the manifest (`cargo metadata` fails with a duplicate-key error). Not moved here, since moving it would
+  only shift the duplicate to the dist-install merge: whoever merges feat/dist-plugin after one of the others must
+  delete one of the two `repository` lines (or move it before `readme` on feat/dist-plugin first).
+- With feat/harness: `src/cli.rs` and `src/commands/doctor.rs` merge cleanly (an earlier prediction of conflicts in
+  `run(DoctorArgs)` / `Command::Doctor(DoctorArgs)` was wrong). Real conflicts: `src/commands/mod.rs` (only the
+  doc-comment line), README.md, NOTES.md, CHANGELOG.md.
+- With feat/dist-install and feat/dist-plugin: only NOTES.md conflicts (README.md auto-merges).
+- The install one-liner printed by `update` targets AAPPHH/agent-sidekick; until feat/dist-install fills in the
+  repository in released install scripts (its source copy still defaults to `OWNER/agent-sidekick` and refuses to run
+  with that placeholder unless `AGENT_SIDEKICK_REPO` is set), it only works once a release exists. No release exists
+  yet: the real API answers 404 -> "no release published yet", exit 0.
+- Known, pre-existing, not changed here (doctor belongs to feat/harness): with a real `claude` on PATH, `doctor`
+  runs `claude mcp list`, which starts the registered server; that inherits `AGENT_SIDEKICK_CONFIG_DIR` and creates
+  `<config-dir>/logs/`. So the "config dir missing -> update check skipped" path rarely applies in real use; the update
+  hint itself never creates the directory (integration test).

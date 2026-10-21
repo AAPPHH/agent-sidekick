@@ -157,6 +157,18 @@ fn update_garbage_and_offline_fail() {
 }
 
 #[test]
+fn update_with_an_invalid_update_url_names_the_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&["update"], dir.path(), "not a url user:secret");
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("AGENT_SIDEKICK_UPDATE_URL"), "{err}");
+    assert!(!err.contains("could not reach"), "{err}");
+    assert!(!err.contains("secret"), "{err}");
+    assert!(err.contains("next step:"), "{err}");
+}
+
+#[test]
 fn doctor_offline_makes_no_request() {
     let api = FakeReleases::start("200 OK", r#"{"tag_name":"v999.0.0"}"#);
     let dir = tempfile::tempdir().unwrap();
@@ -180,8 +192,13 @@ fn doctor_checks_once_and_remembers_the_result() {
     assert_eq!(api.request_count(), 1);
     assert!(dir.path().join("update-check.json").is_file());
 
+    // Same day: no request and the hint is not repeated (shown at most once per day).
     let second = run(&["doctor"], dir.path(), &api.base_url);
-    assert!(stdout(&second).contains("999.0.0 is available"));
+    assert!(
+        !stdout(&second).contains("[INFO] update"),
+        "{}",
+        stdout(&second)
+    );
     assert_eq!(
         api.request_count(),
         1,

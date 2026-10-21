@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `agent-sidekick update`: checks the latest GitHub release and prints the platform's install one-liner (no download, no self-install). `AGENT_SIDEKICK_UPDATE_URL` overrides the API base.
-- `doctor` shows an update hint, checked at most once a day (`<config-dir>/update-check.json`); `doctor --offline` skips it.
+- `doctor` shows an update hint at most once a day (checked and shown once, result kept in `<config-dir>/update-check.json`); `doctor --offline` skips it.
 - Cargo.toml `repository` (https://github.com/AAPPHH/agent-sidekick).
 
 ## [0.3.0] - 2026-10-21

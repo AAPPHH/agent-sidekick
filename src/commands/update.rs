@@ -12,8 +12,9 @@
 //! - Proxies: ureq honours `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY` (and `NO_PROXY`);
 //!   loopback hosts are always contacted directly.
 //! - No credentials are sent (unauthenticated API: 60 requests per hour per IP).
-//! - `doctor` checks at most once per 24 h and remembers the result in
-//!   `<config-dir>/update-check.json`; it never creates the config directory for that.
+//! - `doctor` checks (and shows the result) at most once per 24 h and remembers the result
+//!   in `<config-dir>/update-check.json`; it never creates the config directory for that.
+//! - Redirects are followed, but an https request never follows a redirect to plain http.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -250,6 +251,8 @@ pub enum CheckError {
     BadResponse(String),
     /// The build itself cannot be checked (no repository configured).
     Config(String),
+    /// The API base (from [`ENV_UPDATE_URL`]) is not an http(s) URL; the value is not echoed.
+    BadUrl,
 }
 
 impl fmt::Display for CheckError {
@@ -263,6 +266,10 @@ impl fmt::Display for CheckError {
             CheckError::Http(status) => write!(f, "unexpected answer from the release server (HTTP {status})"),
             CheckError::BadResponse(why) => write!(f, "unexpected answer from the release server: {why}"),
             CheckError::Config(why) => f.write_str(why),
+            CheckError::BadUrl => write!(
+                f,
+                "{ENV_UPDATE_URL} is not a valid http(s) URL (expected e.g. https://api.github.com)"
+            ),
         }
     }
 }
@@ -274,8 +281,14 @@ impl CheckError {
             None => "the project's releases page".to_owned(),
         };
         match self {
+            CheckError::Network(_) if update_url_overridden() => format!(
+                "check {ENV_UPDATE_URL} (it replaces the GitHub API), the internet connection and HTTPS_PROXY if you need a proxy, then run `{APP_NAME} update` again"
+            ),
             CheckError::Network(_) => format!(
                 "check the internet connection (and HTTPS_PROXY if you need a proxy), then run `{APP_NAME} update` again"
+            ),
+            CheckError::BadUrl => format!(
+                "fix or unset {ENV_UPDATE_URL}, then run `{APP_NAME} update` again"
             ),
             CheckError::RateLimited(_) => {
                 format!("wait up to an hour and run `{APP_NAME} update` again, or look at {releases}")
@@ -286,6 +299,33 @@ impl CheckError {
             CheckError::Config(_) => format!("look at {releases}"),
         }
     }
+}
+
+/// Whether [`ENV_UPDATE_URL`] replaces the default API base.
+fn update_url_overridden() -> bool {
+    std::env::var_os(ENV_UPDATE_URL).is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+}
+
+/// Whether a proxy variable that ureq reads is set (names only, values are never shown).
+fn proxy_configured() -> bool {
+    [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .iter()
+    .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+}
+
+/// `http://` or `https://` (any case), a non-empty host and no whitespace.
+fn is_http_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://"))
+        && !url.chars().any(char::is_whitespace)
+        && url_host(url).is_some_and(|h| !h.is_empty())
 }
 
 /// API base: [`ENV_UPDATE_URL`] if set and non-empty, else [`DEFAULT_API_BASE`].
@@ -311,6 +351,9 @@ pub fn check(api_base: &str, current: &str, timeout: Duration) -> Result<Outcome
         "{}/repos/{owner}/{repo}/releases/latest",
         api_base.trim_end_matches('/')
     );
+    if !is_http_url(&url) {
+        return Err(CheckError::BadUrl);
+    }
     let Some(tag) = fetch_latest_tag(&url, timeout)? else {
         return Ok(Outcome::NoRelease);
     };
@@ -334,17 +377,21 @@ fn fetch_latest_tag(url: &str, timeout: Duration) -> Result<Option<String>, Chec
     let mut config = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(timeout))
-        .user_agent(format!("{APP_NAME}/{CURRENT_VERSION}"));
-    if url_host(url).is_some_and(is_loopback_host) {
+        .user_agent(format!("{APP_NAME}/{CURRENT_VERSION}"))
+        // An https request never follows a redirect to plain http.
+        .https_only(url.to_ascii_lowercase().starts_with("https://"));
+    let loopback = url_host(url).is_some_and(is_loopback_host);
+    if loopback {
         config = config.proxy(None);
     }
+    let via_proxy = !loopback && proxy_configured();
     let agent: ureq::Agent = config.build().into();
     let mut resp = agent
         .get(url)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .call()
-        .map_err(|e| CheckError::Network(error_text(&e)))?;
+        .map_err(|e| CheckError::Network(error_text(&e, via_proxy)))?;
     match resp.status().as_u16() {
         200 => {}
         404 => return Ok(None),
@@ -356,7 +403,13 @@ fn fetch_latest_tag(url: &str, timeout: Duration) -> Result<Option<String>, Chec
         .with_config()
         .limit(1024 * 1024)
         .read_to_string()
-        .map_err(|e| CheckError::Network(error_text(&e)))?;
+        .map_err(|e| match e {
+            // After a complete TLS handshake, invalid data means a non-UTF-8 body.
+            ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidData => {
+                CheckError::BadResponse("the answer is not UTF-8 text".to_owned())
+            }
+            e => CheckError::Network(error_text(&e, via_proxy)),
+        })?;
     let release: Release = serde_json::from_str(&body)
         .map_err(|_| CheckError::BadResponse("no JSON object with a tag_name".to_owned()))?;
     Ok(Some(release.tag_name))
@@ -379,16 +432,24 @@ fn is_loopback_host(host: &str) -> bool {
         || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-fn error_text(e: &ureq::Error) -> String {
+/// Short cause of a failed request. Never contains the URL or a proxy value.
+/// `via_proxy`: a proxy from the environment was used for this request.
+fn error_text(e: &ureq::Error, via_proxy: bool) -> String {
     use ureq::Error as E;
+    let proxy_note = if via_proxy {
+        " (via the proxy from HTTPS_PROXY/ALL_PROXY/HTTP_PROXY: is it reachable?)"
+    } else {
+        ""
+    };
     match e {
-        E::Timeout(_) => "timed out".to_owned(),
-        E::HostNotFound => "host not found (offline?)".to_owned(),
-        E::ConnectionFailed => "connection failed".to_owned(),
-        E::Io(io) => format!("I/O error ({})", io.kind()),
+        E::Timeout(_) => format!("timed out{proxy_note}"),
+        E::HostNotFound => format!("host not found (offline?){proxy_note}"),
+        E::ConnectionFailed => format!("connection failed{proxy_note}"),
+        E::Io(io) => io_error_text(io, proxy_note),
         E::BadUri(_) | E::Http(_) => {
             format!("invalid URL (check {ENV_UPDATE_URL} if it is set)")
         }
+        E::RequireHttpsOnly(_) => "the server redirected to a plain http URL (refused)".to_owned(),
         E::Protocol(_) => "no valid HTTP response".to_owned(),
         E::Tls(msg) => format!("TLS error: {msg}"),
         E::Rustls(err) => format!("TLS error: {err}"),
@@ -396,6 +457,40 @@ fn error_text(e: &ureq::Error) -> String {
         E::ConnectProxyFailed(_) => "proxy connection failed".to_owned(),
         E::BodyExceedsLimit(_) => "response too large".to_owned(),
         _ => "request failed".to_owned(),
+    }
+}
+
+/// ureq passes resolver, connect and TLS failures through as `io::Error`, so the
+/// classification happens here. DNS: Winsock codes on Windows, std's own (non-localized)
+/// prefix for `getaddrinfo` failures elsewhere. TLS: rustls reports as `InvalidData`.
+fn io_error_text(io: &std::io::Error, proxy_note: &str) -> String {
+    use std::io::ErrorKind as K;
+    const WSAHOST_NOT_FOUND: i32 = 11001;
+    const WSATRY_AGAIN: i32 = 11002;
+    const WSANO_DATA: i32 = 11004;
+    let dns = (cfg!(windows)
+        && matches!(
+            io.raw_os_error(),
+            Some(WSAHOST_NOT_FOUND | WSATRY_AGAIN | WSANO_DATA)
+        ))
+        || io
+            .to_string()
+            .starts_with("failed to lookup address information");
+    if dns {
+        return if proxy_note.is_empty() {
+            "host not found (offline or DNS problem?)".to_owned()
+        } else {
+            format!("host not found{proxy_note}")
+        };
+    }
+    match io.kind() {
+        K::InvalidData => format!("TLS handshake failed: {io}"),
+        K::TimedOut => format!("timed out{proxy_note}"),
+        K::ConnectionRefused => format!("connection refused{proxy_note}"),
+        K::ConnectionReset | K::ConnectionAborted => {
+            format!("connection closed by the other side{proxy_note}")
+        }
+        kind => format!("I/O error ({kind}){proxy_note}"),
     }
 }
 
@@ -547,10 +642,9 @@ pub fn doctor_hint_at(
         .ok()
         .and_then(|b| serde_json::from_slice::<CheckRecord>(&b).ok());
     if let Some(rec) = &record {
-        if let Some(outcome) = rec.fresh_outcome(now, current) {
-            return hint_text(&Ok(outcome), current, windows);
-        }
-        if rec.recent_error(now, current) {
+        // A result from the last 24 h was already shown when it was fetched: the hint
+        // appears at most once per day, later runs that day stay quiet.
+        if rec.fresh_outcome(now, current).is_some() || rec.recent_error(now, current) {
             return String::new();
         }
     }
@@ -890,6 +984,49 @@ mod tests {
         assert!(matches!(res, Err(CheckError::Network(_))), "{res:?}");
     }
 
+    #[test]
+    fn invalid_update_url_is_reported_without_echoing_it() {
+        for base in [
+            "not a url",
+            "ftp://example.com",
+            "https://",
+            "api.github.com",
+            "https://user:secret@ex ample.com",
+        ] {
+            let res = check(base, "0.3.0", Duration::from_secs(1));
+            assert_eq!(res, Err(CheckError::BadUrl), "{base}");
+        }
+        let e = CheckError::BadUrl;
+        assert!(e.to_string().contains(ENV_UPDATE_URL));
+        assert!(e.next_step(None).contains(ENV_UPDATE_URL));
+        assert!(is_http_url("HTTPS://api.github.com/repos/a/b"));
+        assert!(is_http_url("http://[::1]:8080/x"));
+    }
+
+    #[test]
+    fn io_errors_are_classified() {
+        use std::io::{Error, ErrorKind};
+        let text = |e: Error, note: &str| io_error_text(&e, note);
+        // std's own prefix for getaddrinfo failures (Unix).
+        let dns = Error::other("failed to lookup address information: Name or service not known");
+        assert!(text(dns, "").starts_with("host not found"));
+        #[cfg(windows)]
+        assert!(text(Error::from_raw_os_error(11001), "").starts_with("host not found"));
+        let tls = Error::new(
+            ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        );
+        assert_eq!(
+            text(tls, ""),
+            "TLS handshake failed: invalid peer certificate: UnknownIssuer"
+        );
+        let refused = Error::from(ErrorKind::ConnectionRefused);
+        assert_eq!(text(refused, ""), "connection refused");
+        let refused = Error::from(ErrorKind::ConnectionRefused);
+        assert!(text(refused, " (via the proxy)").ends_with("(via the proxy)"));
+        assert!(text(Error::from(ErrorKind::TimedOut), "").starts_with("timed out"));
+    }
+
     // ----- once per day -----
 
     const DAY: u64 = 24 * 60 * 60;
@@ -931,13 +1068,14 @@ mod tests {
         assert_eq!(f.calls.get(), 1);
         assert!(dir.path().join(CHECK_FILE).is_file());
 
-        // Within 24 h: the remembered result, no network.
+        // Within 24 h: no network and the hint is not repeated (at most once per day).
         let again = f.hint(dir.path(), T0 + DAY - 1, "0.3.0");
-        assert_eq!(again, first);
+        assert_eq!(again, "");
         assert_eq!(f.calls.get(), 1);
 
-        // After 24 h: checks again.
-        f.hint(dir.path(), T0 + DAY, "0.3.0");
+        // After 24 h: checks again and shows the hint again.
+        let next_day = f.hint(dir.path(), T0 + DAY, "0.3.0");
+        assert_eq!(next_day, first);
         assert_eq!(f.calls.get(), 2);
     }
 
