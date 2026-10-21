@@ -417,6 +417,7 @@ fn chatgpt_run_is_isolated_normalized_and_leaks_nothing() {
     let log = std::fs::read_to_string(log_path_of(&text).expect("log path")).unwrap();
     assert!(log.contains("# auth: chatgpt"), "{log}");
     assert!(log.contains("# max_turns: 9 ignored"), "{log}");
+    assert_eq!(log.matches("# max_turns:").count(), 1, "{log}");
     assert!(!log.contains(OAUTH_SUFFIX));
 }
 
@@ -436,6 +437,7 @@ fn api_key_run_with_a_responses_provider() {
     let log = std::fs::read_to_string(log_path_of(&text).unwrap()).unwrap();
     assert!(!log.contains(KEY));
     assert!(log.contains("# model: codex default"), "{log}");
+    assert_eq!(log.matches("# model:").count(), 1, "{log}");
 
     // The custom provider reads AGENT_SIDEKICK_PROVIDER_KEY; CODEX_API_KEY stays unset.
     assert_eq!(f.rec_file("provider-key.txt").trim(), "yes");
