@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmcp::{
@@ -83,13 +83,16 @@ pub struct RunParams {
     /// Tools the agent may use without asking, e.g. ["Read", "Edit", "Bash(git:*)"].
     /// Default: Claude Code's defaults for headless mode. Ignored by command backends.
     pub allowed_tools: Option<Vec<String>>,
-    /// Timeout in seconds (1-7200); the whole process tree is killed when it expires.
+    /// Timeout in seconds (1-7200) for each attempt; the whole process tree is killed when it
+    /// expires. With a fallback the request can take up to about twice this.
     /// Default: from config.toml (1800 unless configured).
     pub timeout_s: Option<u64>,
     /// Backend to run on; see sidekick_backends. Default: the configured default backend.
     pub backend: Option<String>,
     /// Backend to use if the chosen one is unreachable, lacks credentials, fails to start, or
-    /// exits with an error. Not used after a timeout or cancellation.
+    /// exits with an error. Not used after a timeout or cancellation. The fallback gets its
+    /// own full `timeout_s` (and may wait in its own queue), so a request with a fallback can
+    /// take up to about 2x timeout_s plus queue time.
     pub fallback: Option<String>,
 }
 
@@ -363,6 +366,22 @@ fn backend_label(b: &Backend) -> String {
     format!("{} ({})", b.name, b.backend_type())
 }
 
+/// Result text of an attempt on `backend` that ended as [`Attempt::Stopped`] (cancelled while
+/// queued, server shutdown, working directory gone, wait error): the backend line, the reason
+/// and, if a fallback was requested, why it was not used.
+fn stopped_text(backend: &Backend, reason: &str, fallback: Option<&Backend>) -> String {
+    let mut s = format!("backend: {}\n{}", backend_label(backend), reason.trim_end());
+    if let Some(fb) = fallback {
+        let _ = write!(
+            s,
+            "\nfallback '{}' ({}) not attempted: the run had already started or was stopped",
+            fb.name,
+            fb.backend_type()
+        );
+    }
+    s
+}
+
 /// Text (and error flag) of a `sidekick_run` result. `ran` is the backend whose outcome is
 /// shown; `fallback_from` is `(primary, primary attempt)` when the fallback ran.
 fn format_run_result(
@@ -526,34 +545,101 @@ fn progress_interval() -> Duration {
         .map_or(PROGRESS_INTERVAL, Duration::from_secs)
 }
 
+/// Phase of a `sidekick_run` request, shared between the attempts and the progress ticker.
+/// Reset when the fallback attempt begins, so the fallback's queue wait is reported as queued
+/// and its own timeout is added to `total`.
+#[derive(Debug, Clone)]
+struct RunPhase {
+    /// Name of the fallback backend once the fallback attempt has begun; `None` for the
+    /// primary attempt.
+    fallback: Option<String>,
+    /// When the current attempt began (preparation and queue).
+    attempt_began: Instant,
+    /// When the current attempt's agent started (left the queue).
+    started: Option<Instant>,
+}
+
+impl RunPhase {
+    fn primary() -> Self {
+        Self {
+            fallback: None,
+            attempt_began: Instant::now(),
+            started: None,
+        }
+    }
+
+    fn fallback(name: &str) -> Self {
+        Self {
+            fallback: Some(name.to_owned()),
+            attempt_began: Instant::now(),
+            started: None,
+        }
+    }
+}
+
+type SharedPhase = Arc<std::sync::Mutex<RunPhase>>;
+
+/// Run `f` on the phase; a poisoned lock is still usable (the data is plain timestamps).
+fn with_phase<T>(phase: &std::sync::Mutex<RunPhase>, f: impl FnOnce(&mut RunPhase) -> T) -> T {
+    let mut guard = phase
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(&mut guard)
+}
+
+/// What the progress ticker knows about the current attempt, as offsets from the arrival of
+/// the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhaseView<'a> {
+    /// Fallback backend name if the current attempt is the fallback.
+    fallback: Option<&'a str>,
+    /// When the current attempt began.
+    attempt_began: Duration,
+    /// When the current attempt's agent started, if it has.
+    started: Option<Duration>,
+}
+
 /// One progress notification. `progress` is the number of whole seconds since the request
-/// arrived (it only grows); `total` is known once the run has started (queue time + timeout).
-/// The message never contains agent output.
+/// arrived (it only grows); `total` is known while an agent runs: the time up to its start
+/// plus its timeout (never less than `progress`, e.g. while a timed-out process tree is being
+/// killed). While an attempt is queued there is no `total`. The message never contains agent
+/// output.
 fn progress_param(
     token: ProgressToken,
     since_request: Duration,
-    queued_for: Option<Duration>,
+    phase: &PhaseView<'_>,
     timeout: Duration,
 ) -> ProgressNotificationParam {
     let elapsed = since_request.as_secs();
     let param = ProgressNotificationParam::new(token, elapsed as f64);
-    match queued_for {
-        None => param.with_message(format!("queued for {elapsed}s, waiting for a free slot")),
-        Some(q) => param
-            .with_total((q.as_secs() + timeout.as_secs()) as f64)
-            .with_message(format!(
-                "agent running for {}s",
+    let who = match phase.fallback {
+        None => String::new(),
+        Some(name) => format!("fallback '{name}' "),
+    };
+    match phase.started {
+        None => {
+            let queued = since_request.saturating_sub(phase.attempt_began).as_secs();
+            param.with_message(format!(
+                "{who}queued for {queued}s, waiting for a free slot"
+            ))
+        }
+        Some(q) => {
+            let total = (q.as_secs() + timeout.as_secs()).max(elapsed);
+            let agent = if who.is_empty() { "agent " } else { "" };
+            param.with_total(total as f64).with_message(format!(
+                "{who}{agent}running for {}s",
                 since_request.saturating_sub(q).as_secs()
-            )),
+            ))
+        }
     }
 }
 
-/// Sends `notifications/progress` every `interval` until dropped. `run_started` is set once the
-/// run leaves the queue.
+/// Sends `notifications/progress` every `interval` until dropped. `phase` is updated by the
+/// attempts (start of the fallback, agent started).
 fn spawn_progress_ticker(
     peer: Peer<RoleServer>,
     token: ProgressToken,
-    run_started: Arc<OnceLock<Instant>>,
+    phase: SharedPhase,
     timeout: Duration,
     interval: Duration,
 ) -> AbortOnDrop {
@@ -563,10 +649,15 @@ fn spawn_progress_ticker(
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticks.tick().await;
-            let queued_for = run_started
-                .get()
-                .map(|s| s.saturating_duration_since(entered));
-            let param = progress_param(token.clone(), entered.elapsed(), queued_for, timeout);
+            let snapshot = with_phase(&phase, |p| p.clone());
+            let view = PhaseView {
+                fallback: snapshot.fallback.as_deref(),
+                attempt_began: snapshot.attempt_began.saturating_duration_since(entered),
+                started: snapshot
+                    .started
+                    .map(|s| s.saturating_duration_since(entered)),
+            };
+            let param = progress_param(token.clone(), entered.elapsed(), &view, timeout);
             if let Err(e) = peer.notify_progress(param).await {
                 tracing::debug!("progress notification failed, stopping ticker: {e}");
                 break;
@@ -667,7 +758,8 @@ impl SidekickServer {
     /// headless Claude Code instance that runs with its own account (not the caller's);
     /// `backend` selects another configured backend (see sidekick_backends: choose by
     /// description and cost), `fallback` names a backend to use if the chosen one is unreachable, lacks credentials,
-    /// fails to start or exits with an error (not after a timeout). The agent runs in `cwd`
+    /// fails to start or exits with an error (not after a timeout; the fallback gets its own
+    /// timeout_s, so the request can take up to about 2x timeout_s). The agent runs in `cwd`
     /// with the given limits and cannot see this conversation, so the prompt must be
     /// self-contained. Runs beyond the concurrency limits wait in a queue. Returns which
     /// backend ran, the exit code, the path of the full log file, the duration and the last
@@ -713,13 +805,13 @@ impl SidekickServer {
         let timeout = req.timeout;
 
         let (cancel, _forward) = run_cancel_token(&ctx.ct, &state.shutdown);
-        let run_started = Arc::new(OnceLock::new());
+        let phase: SharedPhase = Arc::new(std::sync::Mutex::new(RunPhase::primary()));
         // Keeps Claude Code's MCP idle timeout from aborting long runs (and queue waits).
         let ticker = ctx.meta.get_progress_token().map(|token| {
             spawn_progress_ticker(
                 ctx.peer.clone(),
                 token,
-                run_started.clone(),
+                phase.clone(),
                 timeout,
                 progress_interval(),
             )
@@ -727,7 +819,7 @@ impl SidekickServer {
 
         let mut secrets = Vec::new();
         let first = self
-            .attempt(primary, &req, &cancel, &ctx.ct, &run_started, &mut secrets)
+            .attempt(primary, &req, &cancel, &ctx.ct, &phase, &mut secrets)
             .await;
         let (text, is_error) = match (first, fallback) {
             (first, Some(fb)) if fallback_eligible(&first) => {
@@ -741,8 +833,10 @@ impl SidekickServer {
                     "primary backend failed ({}); trying the fallback",
                     redact_with(&secrets, &why)
                 );
+                // The fallback gets its own queue wait and its own full timeout.
+                with_phase(&phase, |p| *p = RunPhase::fallback(&fb.name));
                 let second = self
-                    .attempt(fb, &req, &cancel, &ctx.ct, &run_started, &mut secrets)
+                    .attempt(fb, &req, &cancel, &ctx.ct, &phase, &mut secrets)
                     .await;
                 match (second, &first) {
                     (Attempt::Ran(o), _) => (
@@ -785,7 +879,7 @@ impl SidekickServer {
                 ),
                 true,
             ),
-            (Attempt::Stopped(r), _) => (r, true),
+            (Attempt::Stopped(r), fb) => (stopped_text(primary, &r, fb), true),
         };
         drop(ticker);
         Ok(text_result(redact_with(&secrets, &text), is_error))
@@ -855,7 +949,7 @@ impl SidekickServer {
         req: &RunRequest,
         cancel: &CancellationToken,
         request_ct: &CancellationToken,
-        run_started: &OnceLock<Instant>,
+        phase: &std::sync::Mutex<RunPhase>,
         secrets: &mut Vec<Secrets>,
     ) -> Attempt {
         let st = &self.state;
@@ -950,7 +1044,7 @@ impl SidekickServer {
         let _running = CountGuard::all(
             std::iter::once(&st.counters.running).chain(slot.map(|s| &s.counters.running)),
         );
-        let _ = run_started.set(Instant::now());
+        with_phase(phase, |p| p.started = Some(Instant::now()));
         tracing::info!(
             backend = %backend.name,
             backend_type = %ty,
@@ -1066,11 +1160,16 @@ impl SidekickServer {
         let _ = writeln!(s, "max_concurrent: {}", cfg.max_concurrent);
         let _ = writeln!(s, "default max_turns: {}", cfg.default_max_turns);
         let _ = writeln!(s, "default timeout_s: {}", cfg.default_timeout_s);
-        let _ = writeln!(
-            s,
-            "default model: {}",
-            cfg.default_model.as_deref().unwrap_or("(account default)")
-        );
+        // `default_model` and the legacy agent config dir apply only to the implicit backend;
+        // with `[backends]` each backend line shows its own model and config_dir instead.
+        let implicit = cfg.backends.is_none();
+        if implicit {
+            let _ = writeln!(
+                s,
+                "default model: {}",
+                cfg.default_model.as_deref().unwrap_or("(account default)")
+            );
+        }
         match located {
             Ok(Ok(l)) => {
                 let _ = writeln!(s, "claude: {} (found via {})", l.path.display(), l.source);
@@ -1082,11 +1181,13 @@ impl SidekickServer {
                 let _ = writeln!(s, "claude: unknown - {e}");
             }
         }
-        let _ = writeln!(
-            s,
-            "agent claude config dir: {}",
-            path_or_err(crate::paths::agent_claude_config_dir())
-        );
+        if implicit {
+            let _ = writeln!(
+                s,
+                "agent claude config dir: {}",
+                path_or_err(crate::paths::agent_claude_config_dir())
+            );
+        }
         let _ = writeln!(s, "config dir: {}", path_or_err(crate::paths::config_dir()));
         let _ = writeln!(s, "logs dir: {}", path_or_err(crate::paths::logs_dir()));
         let _ = writeln!(
@@ -1108,7 +1209,7 @@ impl SidekickServer {
             Ok(backends) => {
                 for b in backends.iter() {
                     let counters = st.per_backend.get(&b.name).map(|s| &s.counters);
-                    let _ = writeln!(
+                    let _ = write!(
                         s,
                         "  {} ({}{}): running {}, queued {}, max_concurrent {}",
                         b.name,
@@ -1119,6 +1220,27 @@ impl SidekickServer {
                         b.max_concurrent
                             .map_or_else(|| "-".to_owned(), |n| n.to_string())
                     );
+                    // What a run uses when the caller passes no `model` (resolved like
+                    // build_launch: the backend's model, for the implicit backend
+                    // `default_model`).
+                    let claude = match &b.kind {
+                        backends::BackendKind::ClaudeOauth { config_dir } => {
+                            Some(("(account default)", config_dir))
+                        }
+                        backends::BackendKind::ClaudeEndpoint { config_dir, .. } => {
+                            Some(("(endpoint default)", config_dir))
+                        }
+                        backends::BackendKind::Command { .. } => None,
+                    };
+                    if let Some((fallback_model, config_dir)) = claude {
+                        let _ = write!(
+                            s,
+                            ", model {}, config_dir {}",
+                            non_blank(b.model.as_deref()).unwrap_or(fallback_model),
+                            config_dir.display()
+                        );
+                    }
+                    s.push('\n');
                 }
             }
             Err(_) => s.push_str("  (none usable: config.toml is invalid)\n"),
@@ -1504,10 +1626,15 @@ mod tests {
     #[test]
     fn progress_while_queued_and_running() {
         let token = ProgressToken(rmcp::model::NumberOrString::Number(7));
+        let primary_queued = PhaseView {
+            fallback: None,
+            attempt_began: Duration::ZERO,
+            started: None,
+        };
         let p = progress_param(
             token.clone(),
             Duration::from_millis(65_400),
-            None,
+            &primary_queued,
             Duration::from_secs(600),
         );
         assert_eq!(p.progress, 65.0);
@@ -1517,16 +1644,90 @@ mod tests {
             Some("queued for 65s, waiting for a free slot")
         );
 
+        let primary_running = PhaseView {
+            started: Some(Duration::from_secs(40)),
+            ..primary_queued
+        };
         let p = progress_param(
             token.clone(),
             Duration::from_secs(100),
-            Some(Duration::from_secs(40)),
+            &primary_running,
             Duration::from_secs(600),
         );
         assert_eq!(p.progress_token, token);
         assert_eq!(p.progress, 100.0);
         assert_eq!(p.total, Some(640.0));
         assert_eq!(p.message.as_deref(), Some("agent running for 60s"));
+    }
+
+    #[test]
+    fn progress_after_fallback_is_queued_then_running_and_never_past_total() {
+        let token = ProgressToken(rmcp::model::NumberOrString::Number(8));
+        let timeout = Duration::from_secs(4);
+        // The primary ran from 0s to 3.5s; the fallback began at 3.6s and waits for a slot.
+        let fb_queued = PhaseView {
+            fallback: Some("slow"),
+            attempt_began: Duration::from_millis(3_600),
+            started: None,
+        };
+        let p = progress_param(token.clone(), Duration::from_secs(5), &fb_queued, timeout);
+        assert_eq!(p.progress, 5.0);
+        assert_eq!(p.total, None, "no total while queued");
+        assert_eq!(
+            p.message.as_deref(),
+            Some("fallback 'slow' queued for 1s, waiting for a free slot")
+        );
+
+        // The fallback started at 6s: total is 6s + its own timeout.
+        let fb_running = PhaseView {
+            started: Some(Duration::from_secs(6)),
+            ..fb_queued
+        };
+        for secs in 6..=10 {
+            let p = progress_param(
+                token.clone(),
+                Duration::from_secs(secs),
+                &fb_running,
+                timeout,
+            );
+            assert_eq!(p.total, Some(10.0), "at {secs}s");
+            assert!(p.progress <= p.total.unwrap(), "at {secs}s");
+        }
+        let p = progress_param(token.clone(), Duration::from_secs(9), &fb_running, timeout);
+        assert_eq!(p.message.as_deref(), Some("fallback 'slow' running for 3s"));
+        // While a timed-out tree is being killed, total grows with progress.
+        let p = progress_param(token, Duration::from_secs(12), &fb_running, timeout);
+        assert_eq!(p.progress, 12.0);
+        assert_eq!(p.total, Some(12.0));
+    }
+
+    #[test]
+    fn run_phase_resets_for_fallback() {
+        let phase = std::sync::Mutex::new(RunPhase::primary());
+        with_phase(&phase, |p| p.started = Some(Instant::now()));
+        with_phase(&phase, |p| *p = RunPhase::fallback("good"));
+        let p = with_phase(&phase, |p| p.clone());
+        assert_eq!(p.fallback.as_deref(), Some("good"));
+        assert!(p.started.is_none());
+    }
+
+    #[test]
+    fn stopped_result_names_backend() {
+        let primary = command("aider");
+        let text = stopped_text(&primary, "Working directory does not exist: /x.\n", None);
+        assert_eq!(
+            text,
+            "backend: aider (command)\nWorking directory does not exist: /x."
+        );
+        let fb = endpoint("local");
+        let text = stopped_text(&primary, CANCELLED_QUEUED_MSG, Some(&fb));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "backend: aider (command)");
+        assert_eq!(lines[1], CANCELLED_QUEUED_MSG);
+        assert!(
+            lines[2].starts_with("fallback 'local' (claude-endpoint) not attempted"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1790,11 +1991,76 @@ mod tests {
         );
         assert!(
             text.contains(
-                "  sidekick (claude-oauth, default): running 0, queued 0, max_concurrent -\n"
+                "  sidekick (claude-oauth, default): running 0, queued 0, max_concurrent -, \
+                 model (account default), config_dir /cfg\n"
             ),
             "{text}"
         );
         assert!(text.contains("config error: none"), "{text}");
+    }
+
+    #[test]
+    fn status_with_explicit_backends_shows_per_backend_model_and_config_dir() {
+        let cfg: Config = toml::from_str(
+            "default_model = \"opus\"\n[backends.sidekick]\ntype = \"claude-oauth\"\n\
+             description = \"main\"\ndefault = true\n",
+        )
+        .unwrap();
+        assert!(cfg.backends.is_some());
+        let mut list = sample_backends();
+        let mut local = endpoint("local");
+        local.model = Some("qwen3-coder".into());
+        list = Backends::new(
+            list.iter()
+                .filter(|b| b.name != "local")
+                .cloned()
+                .chain([local])
+                .collect(),
+        );
+        let server = SidekickServer::with_backends(cfg, None, Ok(list));
+        let text = server.status_text(Err("stub".into()), Ok(Vec::new()));
+        // The top-level default_model is not in effect with [backends]: not shown.
+        assert!(!text.contains("default model:"), "{text}");
+        assert!(!text.contains("opus"), "{text}");
+        assert!(!text.contains("agent claude config dir:"), "{text}");
+        assert!(
+            text.contains(
+                "  local (claude-endpoint): running 0, queued 0, max_concurrent -, \
+                 model qwen3-coder, config_dir /cfg-local\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(", model (account default), config_dir /cfg\n"),
+            "{text}"
+        );
+        // Command backends have neither.
+        assert!(
+            text.contains("  aider (command): running 0, queued 0, max_concurrent 1\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn status_with_implicit_backend_shows_default_model() {
+        let cfg = Config {
+            default_model: Some("sonnet".into()),
+            ..Config::default()
+        };
+        let mut b = oauth("sidekick", true);
+        b.implicit = true;
+        b.model = cfg.default_model.clone();
+        let server = SidekickServer::with_backends(cfg, None, Ok(Backends::new(vec![b])));
+        let text = server.status_text(Err("stub".into()), Ok(Vec::new()));
+        assert!(text.contains("default model: sonnet\n"), "{text}");
+        assert!(text.contains("agent claude config dir: "), "{text}");
+        assert!(
+            text.contains(
+                "  sidekick (claude-oauth, default): running 0, queued 0, max_concurrent -, \
+                 model sonnet, config_dir /cfg\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

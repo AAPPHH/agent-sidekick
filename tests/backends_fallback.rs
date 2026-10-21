@@ -385,3 +385,164 @@ fn prompt_with_shell_metacharacters_arrives_unchanged() {
         "a shell interpreted the prompt"
     );
 }
+
+/// Backends `bad` (default, exits 3), `good` and `slow` (max_concurrent 1, ~5 s), and a server
+/// sending progress every second.
+fn slow_fixture(dir: &tempfile::TempDir) -> Server {
+    let scripts = dir.path().join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    let slow = script(
+        &scripts,
+        "slow",
+        "sleep 5\necho SLOW-DONE",
+        "ping -n 6 127.0.0.1 >nul\necho SLOW-DONE",
+    );
+    let config = [
+        command_backend("bad", &bad_script(&scripts), true, ""),
+        command_backend("good", &good_script(&scripts), false, ""),
+        command_backend("slow", &slow, false, "max_concurrent = 1\n"),
+    ]
+    .concat();
+    std::fs::write(dir.path().join("config.toml"), config).unwrap();
+    let mut server = Server::start(dir.path(), &[("AGENT_SIDEKICK_PROGRESS_INTERVAL_S", "1")]);
+    server.initialize();
+    server
+}
+
+/// Starts a run on `slow` that holds its only slot; returns its request id.
+fn hold_slow_slot(server: &mut Server, cwd: &Path) -> u64 {
+    let id = server.send_request(
+        "tools/call",
+        json!({
+            "name": "sidekick_run",
+            "arguments": {"prompt": "hold", "backend": "slow", "cwd": cwd.to_string_lossy()}
+        }),
+    );
+    wait_backend_line(server, "slow", "running 1, queued 0");
+    id
+}
+
+fn wait_backend_line(server: &mut Server, name: &str, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let line = backend_line(server, name);
+        if line.contains(needle) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "never saw '{needle}': {line}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn progress_while_fallback_is_queued_says_queued_and_stays_within_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = slow_fixture(&dir);
+    let holder = hold_slow_slot(&mut server, dir.path());
+
+    let id = server.send_request(
+        "tools/call",
+        json!({
+            "name": "sidekick_run",
+            "arguments": {
+                "prompt": "hello",
+                "fallback": "slow",
+                "timeout_s": 30,
+                "cwd": dir.path().to_string_lossy()
+            },
+            "_meta": {"progressToken": "fb-1"}
+        }),
+    );
+    let (result, notifications) = server.wait_response(id, RUN_WITHIN);
+    let text = text_of(&result);
+    assert_ne!(result["isError"], json!(true), "{text}");
+    assert!(
+        text.starts_with("backend: slow (command) — fallback after 'bad' failed: exit_code 3"),
+        "{text}"
+    );
+
+    let progress: Vec<&Value> = notifications
+        .iter()
+        .filter(|n| n["method"] == "notifications/progress")
+        .map(|n| &n["params"])
+        .collect();
+    let messages: Vec<&str> = progress
+        .iter()
+        .map(|p| p["message"].as_str().unwrap_or_default())
+        .collect();
+    // The fallback's queue wait is reported as queued (not "agent running"), then it runs.
+    let fb_queued = messages
+        .iter()
+        .position(|m| m.starts_with("fallback 'slow' queued for "))
+        .unwrap_or_else(|| panic!("no queued fallback progress: {messages:?}"));
+    let fb_running = messages
+        .iter()
+        .position(|m| m.starts_with("fallback 'slow' running for "))
+        .unwrap_or_else(|| panic!("no running fallback progress: {messages:?}"));
+    assert!(fb_queued < fb_running, "{messages:?}");
+    assert!(
+        !messages[fb_queued..fb_running]
+            .iter()
+            .any(|m| m.contains("running")),
+        "{messages:?}"
+    );
+    for p in &progress {
+        let value = p["progress"].as_f64().unwrap();
+        if let Some(total) = p["total"].as_f64() {
+            assert!(value <= total, "progress beyond total: {p}");
+        }
+    }
+    let values: Vec<f64> = progress
+        .iter()
+        .map(|p| p["progress"].as_f64().unwrap())
+        .collect();
+    assert!(values.windows(2).all(|w| w[1] > w[0]), "{values:?}");
+
+    let (res, _) = server.wait_response(holder, RUN_WITHIN);
+    assert!(text_of(&res).contains("SLOW-DONE"), "{res}");
+}
+
+#[test]
+fn stopped_run_still_names_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = slow_fixture(&dir);
+    let holder = hold_slow_slot(&mut server, dir.path());
+
+    // The cwd exists when the run is validated and vanishes while it waits for a slot.
+    let gone = dir.path().join("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+    let id = server.send_request(
+        "tools/call",
+        json!({
+            "name": "sidekick_run",
+            "arguments": {
+                "prompt": "hello",
+                "backend": "slow",
+                "fallback": "good",
+                "cwd": gone.to_string_lossy()
+            }
+        }),
+    );
+    wait_backend_line(&mut server, "slow", "running 1, queued 1");
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    let (result, _) = server.wait_response(id, RUN_WITHIN);
+    let text = text_of(&result);
+    assert_eq!(result["isError"], json!(true), "{text}");
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("backend: slow (command)"), "{text}");
+    assert!(
+        lines
+            .next()
+            .is_some_and(|l| l.starts_with("Working directory does not exist")),
+        "{text}"
+    );
+    assert!(
+        text.contains("fallback 'good' (command) not attempted"),
+        "{text}"
+    );
+    assert!(!text.contains("GOOD-RAN"), "{text}");
+
+    let (res, _) = server.wait_response(holder, RUN_WITHIN);
+    assert!(text_of(&res).contains("SLOW-DONE"), "{res}");
+}
