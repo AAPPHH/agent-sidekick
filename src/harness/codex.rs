@@ -377,7 +377,9 @@ pub fn provider_probe(
 /// Characters a path argument may contain when the program is a `.cmd`/`.bat` wrapper.
 fn batch_safe_path(s: &str) -> bool {
     s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_./:@+\\ ".contains(c))
+        // `~` is plain text to cmd.exe (only `%~` is special, and `%` is not allowed); it appears
+        // in 8.3 short names such as `C:\Users\RUNNER~1\...`.
+        .all(|c| c.is_ascii_alphanumeric() || "-_./:@+\\ ~".contains(c))
 }
 
 impl Harness for CodexHarness {

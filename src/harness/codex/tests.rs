@@ -708,6 +708,26 @@ fn batch_wrapper_refuses_unsafe_model_names() {
 }
 
 #[test]
+fn batch_safe_path_accepts_short_names_and_rejects_cmd_metacharacters() {
+    assert!(batch_safe_path(
+        r"C:\Users\RUNNER~1\AppData\Local\Temp\.tmpAb12\work"
+    ));
+    assert!(batch_safe_path(r"C:\clones\my project\src"));
+    for bad in [
+        r"C:\a&b",
+        r"C:\a%PATH%",
+        r"C:\a!x!",
+        r"C:\a^b",
+        r"C:\a|b",
+        r"C:\a<b",
+        r"C:\a>b",
+        "C:\\a\"b",
+    ] {
+        assert!(!batch_safe_path(bad), "{bad}");
+    }
+}
+
+#[test]
 fn launch_refuses_another_harness() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg: crate::config::Config = toml::from_str(
