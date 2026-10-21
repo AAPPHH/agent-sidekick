@@ -145,6 +145,12 @@ pub struct Backend {
     /// True for the implicit `sidekick` backend created when `[backends]` is absent.
     pub implicit: bool,
     pub kind: BackendKind,
+    /// Names of every configured `api_key_env` (of all backends, this one included).
+    /// Removed from this backend's inherited child environment; `pass_env` cannot re-allow
+    /// them. Filled by [`Backends::new`]; the endpoint that owns a key gets it through
+    /// `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, a command backend whose `secret_env` or
+    /// `env` table names the same variable still gets that explicit value.
+    pub foreign_secret_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,8 +208,29 @@ pub struct Backends {
 
 impl Backends {
     /// `list` must be non-empty and contain exactly one default (checked by [`resolve`]).
+    /// Sets every backend's [`Backend::foreign_secret_env`] to all configured `api_key_env`
+    /// names.
     pub fn new(mut list: Vec<Backend>) -> Self {
         list.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut key_vars: Vec<String> = Vec::new();
+        for b in &list {
+            if let BackendKind::ClaudeEndpoint {
+                api_key_env: Some(var),
+                ..
+            } = &b.kind
+            {
+                if !key_vars.contains(var) {
+                    key_vars.push(var.clone());
+                }
+            }
+        }
+        for b in &mut list {
+            for v in &key_vars {
+                if !b.foreign_secret_env.contains(v) {
+                    b.foreign_secret_env.push(v.clone());
+                }
+            }
+        }
         debug_assert_eq!(list.iter().filter(|b| b.is_default).count(), 1);
         Self { list }
     }

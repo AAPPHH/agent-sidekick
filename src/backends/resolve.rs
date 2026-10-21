@@ -131,6 +131,7 @@ fn implicit_backend(cfg: &Config, defaults: &ResolveDefaults) -> Result<Backend,
         pass_env: Vec::new(),
         implicit: true,
         kind: BackendKind::ClaudeOauth { config_dir },
+        foreign_secret_env: Vec::new(),
     })
 }
 
@@ -223,8 +224,13 @@ fn resolve_one(
         }
     };
 
-    if raw.max_concurrent == Some(0) {
-        errs.push("`max_concurrent` must be at least 1".to_owned());
+    match raw.max_concurrent {
+        Some(0) => errs.push("`max_concurrent` must be at least 1".to_owned()),
+        Some(n) if n > crate::config::MAX_CONCURRENT_LIMIT => errs.push(format!(
+            "`max_concurrent` must be at most {}, got {n}",
+            crate::config::MAX_CONCURRENT_LIMIT
+        )),
+        _ => {}
     }
 
     let env = raw.env.clone().unwrap_or_default();
@@ -377,7 +383,18 @@ fn resolve_one(
                     if cmd.iter().any(|a| a.contains('\0')) {
                         errs.push("`command` contains a NUL character".to_owned());
                     }
-                    let has_prompt = cmd.iter().any(|a| a.contains("{prompt}"));
+                    // command[0] is the program and is never substituted.
+                    if ["{prompt}", "{cwd}", "{max_turns}"]
+                        .iter()
+                        .any(|p| cmd[0].contains(p))
+                    {
+                        errs.push(
+                            "`command[0]` (the program) must not contain a placeholder \
+                             ({prompt}, {cwd}, {max_turns}); only the arguments are substituted"
+                                .to_owned(),
+                        );
+                    }
+                    let has_prompt = cmd[1..].iter().any(|a| a.contains("{prompt}"));
                     if prompt_via_stdin && has_prompt {
                         errs.push(
                             "`command` must not contain `{prompt}` when `prompt_via_stdin = true`"
@@ -421,6 +438,7 @@ fn resolve_one(
         pass_env,
         implicit: false,
         kind: kind_val,
+        foreign_secret_env: Vec::new(),
     })
 }
 
@@ -598,6 +616,41 @@ fn normalize_base_url(url: &str) -> Result<String, String> {
     }
     if authority.is_empty() || authority.starts_with(':') {
         return Err(format!("`base_url` has no host, got {shown}"));
+    }
+    if !authority.is_ascii() {
+        return Err(format!(
+            "`base_url` host must be ASCII; write an internationalized domain name in its \
+             punycode form (xn--...), got {shown}"
+        ));
+    }
+    // Host and optional port; an IPv6 literal is bracketed (`[::1]:8080`).
+    let port = if let Some(v6) = authority.strip_prefix('[') {
+        match v6.split_once(']') {
+            Some((_, "")) => None,
+            Some((_, rest)) => match rest.strip_prefix(':') {
+                Some(p) => Some(p),
+                None => return Err(format!("`base_url` has an invalid host, got {shown}")),
+            },
+            None => return Err(format!("`base_url` has an invalid host, got {shown}")),
+        }
+    } else {
+        authority.split_once(':').map(|(_, p)| p)
+    };
+    if let Some(p) = port {
+        let valid = !p.is_empty()
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u16>().is_ok_and(|n| n >= 1);
+        if !valid {
+            return Err(format!(
+                "`base_url` port must be a number from 1 to 65535, got {shown}"
+            ));
+        }
+    }
+    // The reachability probe parses the URL with the same parser; reject what it rejects.
+    if u.parse::<ureq::http::Uri>().is_err() {
+        return Err(format!(
+            "`base_url` is not a valid URL (expected http://host[:port][/path]), got {shown}"
+        ));
     }
     Ok(u.trim_end_matches('/').to_owned())
 }
@@ -1019,6 +1072,44 @@ prompt_via_stdin = true
     }
 
     #[test]
+    fn base_url_port_and_host_must_be_valid() {
+        for bad in [
+            "http://h:abc",
+            "http://h:99999",
+            "http://h:0",
+            "http://h:",
+            "http://h:-1",
+        ] {
+            let e = normalize_base_url(bad).expect_err(bad);
+            assert!(
+                e.contains("port must be a number from 1 to 65535"),
+                "{bad}: {e}"
+            );
+        }
+        let e = normalize_base_url("https://b\u{fc}cher.example/v1").unwrap_err();
+        assert!(e.contains("must be ASCII") && e.contains("xn--"), "{e}");
+        assert!(normalize_base_url("http://[::1").is_err());
+        assert!(normalize_base_url("http://[::1]x").is_err());
+        assert!(normalize_base_url("http://[::1]:99999").is_err());
+        // Accepted forms, also by the probe's parser.
+        for good in [
+            "http://h:65535",
+            "http://h:1/v1",
+            "https://xn--bcher-kva.example/v1",
+            "http://[::1]:8080/v1",
+            "http://[::1]",
+            "http://127.0.0.1:11434",
+        ] {
+            assert!(normalize_base_url(good).is_ok(), "{good}");
+        }
+        // Reported as a config error of the backend.
+        let e = err_of(&one(
+            "type = \"claude-endpoint\"\ndescription = \"d\"\nbase_url = \"http://h:99999\"\n",
+        ));
+        assert!(e.starts_with("backends.x: `base_url` port"), "{e}");
+    }
+
+    #[test]
     fn base_url_with_credentials_is_rejected_without_echoing_them() {
         for url in [
             "https://user:s3cretpw@proxy.example/v1",
@@ -1173,6 +1264,31 @@ prompt_via_stdin = true
         assert!(e.contains("`command[0]`"), "{e}");
         let e = err_of(&one("type = \"command\"\ndescription = \"d\"\n"));
         assert!(e.contains("`command` is required"), "{e}");
+        // {prompt} only in command[0] does not count (command[0] is never substituted).
+        for cmd in ["[\"x{prompt}\"]", "[\"{prompt}\"]"] {
+            let e = err_of(&one(&format!(
+                "type = \"command\"\ndescription = \"d\"\ncommand = {cmd}\n"
+            )));
+            assert!(e.contains("must contain `{prompt}`"), "{cmd}: {e}");
+            assert!(
+                e.contains("`command[0]` (the program) must not contain a placeholder"),
+                "{e}"
+            );
+        }
+        for cmd in [
+            "[\"{cwd}/x\", \"{prompt}\"]",
+            "[\"x{max_turns}\", \"{prompt}\"]",
+        ] {
+            let e = err_of(&one(&format!(
+                "type = \"command\"\ndescription = \"d\"\ncommand = {cmd}\n"
+            )));
+            assert!(e.contains("must not contain a placeholder"), "{cmd}: {e}");
+        }
+        // With prompt_via_stdin, {prompt} in command[0] is rejected as a placeholder.
+        let e = err_of(&one(
+            "type = \"command\"\ndescription = \"d\"\ncommand = [\"x{prompt}\"]\nprompt_via_stdin = true\n",
+        ));
+        assert!(e.contains("must not contain a placeholder"), "{e}");
         // Placeholder embedded in a longer argument counts.
         assert!(resolve_str(&one(
             "type = \"command\"\ndescription = \"d\"\ncommand = [\"t\", \"--msg={prompt}\"]\n"
@@ -1295,6 +1411,45 @@ prompt_via_stdin = true
             "type = \"command\"\ndescription = \"d\"\ncommand = [\"x\", \"{prompt}\"]\nmax_concurrent = 0\n",
         ));
         assert_eq!(e, "backends.x: `max_concurrent` must be at least 1");
+    }
+
+    #[test]
+    fn max_concurrent_too_large() {
+        let e = err_of(&one(
+            "type = \"command\"\ndescription = \"d\"\ncommand = [\"x\", \"{prompt}\"]\nmax_concurrent = 4611686018427387904\n",
+        ));
+        assert_eq!(
+            e,
+            "backends.x: `max_concurrent` must be at most 1024, got 4611686018427387904"
+        );
+        let ok = resolve_str(&one(
+            "type = \"command\"\ndescription = \"d\"\ncommand = [\"x\", \"{prompt}\"]\nmax_concurrent = 1024\n",
+        ))
+        .unwrap();
+        assert_eq!(ok.get("x").unwrap().max_concurrent, Some(1024));
+    }
+
+    #[test]
+    fn foreign_secret_env_lists_every_api_key_env() {
+        let b = resolve_str(&format!(
+            "[backends.a]\ntype = \"claude-endpoint\"\ndescription = \"d\"\nbase_url = \"http://h\"\napi_key_env = \"KEY_A\"\nconfig_dir = {}\n\
+             [backends.b]\ntype = \"claude-endpoint\"\ndescription = \"d\"\nbase_url = \"http://h\"\napi_key_env = \"KEY_B\"\nconfig_dir = {}\n\
+             [backends.c]\ntype = \"command\"\ndescription = \"d\"\ncommand = [\"x\", \"{{prompt}}\"]\ndefault = true\n\
+             [backends.d]\ntype = \"claude-endpoint\"\ndescription = \"d\"\nbase_url = \"http://h\"\nconfig_dir = {}\n",
+            lit(&abs("ca")),
+            lit(&abs("cb")),
+            lit(&abs("cd")),
+        ))
+        .unwrap();
+        for name in ["a", "b", "c", "d"] {
+            assert_eq!(
+                b.get(name).unwrap().foreign_secret_env,
+                vec!["KEY_A".to_owned(), "KEY_B".to_owned()],
+                "{name}"
+            );
+        }
+        let implicit = resolve_str("").unwrap();
+        assert!(implicit.default_backend().foreign_secret_env.is_empty());
     }
 
     #[test]

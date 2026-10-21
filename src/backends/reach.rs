@@ -176,7 +176,7 @@ fn check_backend_with(
         BackendKind::Command {
             command,
             secret_env,
-            ..
+            prompt_via_stdin,
         } => {
             let Some(program) = command.first().filter(|p| !p.trim().is_empty()) else {
                 return Reachability::unreachable("command is empty");
@@ -185,6 +185,11 @@ fn check_backend_with(
                 Ok(path) => path,
                 Err(e) => return Reachability::unreachable(e),
             };
+            if let Some(e) =
+                super::launch::batch_argument_error(&backend.name, &path, *prompt_via_stdin)
+            {
+                return Reachability::unreachable(e);
+            }
             let Some(var) = secret_env else {
                 return Reachability::ok(format!("program {}", path.display()));
             };
@@ -562,6 +567,7 @@ mod tests {
             pass_env: Vec::new(),
             implicit: false,
             kind,
+            foreign_secret_env: Vec::new(),
         }
     }
 
@@ -880,6 +886,39 @@ mod tests {
             &no_probe,
         );
         assert!(!r.reachable);
+    }
+
+    #[test]
+    fn command_batch_script_with_argument_prompt_is_unreachable() {
+        let resolve = |_: &str| -> Result<PathBuf, String> { Ok(PathBuf::from("/x/agent.cmd")) };
+        let claude = || -> Result<PathBuf, String> { panic!("claude not needed") };
+        let secret = |_: &SecretId| -> Result<String, TokenError> { panic!("no secret") };
+        let r = check_backend_with(
+            &command(&["agent", "{prompt}"]),
+            &claude,
+            &secret,
+            &no_env,
+            &resolve,
+            &no_probe,
+        );
+        assert!(!r.reachable, "{r:?}");
+        let expected =
+            super::super::launch::batch_argument_error("cmd", Path::new("/x/agent.cmd"), false)
+                .unwrap();
+        assert_eq!(r.detail, expected);
+        assert!(r.detail.contains("prompt_via_stdin = true"), "{r:?}");
+
+        // Via stdin a .cmd is fine.
+        let b = backend(
+            "cmd",
+            BackendKind::Command {
+                command: vec!["agent".into()],
+                prompt_via_stdin: true,
+                secret_env: None,
+            },
+        );
+        let r = check_backend_with(&b, &claude, &secret, &no_env, &resolve, &no_probe);
+        assert!(r.reachable, "{r:?}");
     }
 
     #[test]

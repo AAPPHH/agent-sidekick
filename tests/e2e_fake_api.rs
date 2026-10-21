@@ -28,6 +28,10 @@ const ENDPOINT_KEY: &str = "e2e-endpoint-key-123456";
 const LEAK_OAUTH: &str = "sk-ant-oat01-MUSTNOTLEAK";
 const LEAK_API_KEY: &str = "sk-ant-api03-MUSTNOTLEAK";
 const LEAK_CANARY: &str = "MUSTNOTLEAK";
+/// Inherited `ANTHROPIC_CUSTOM_HEADERS` (claude adds it to every API request).
+const LEAK_CUSTOM_HEADERS: &str = "X-Caller-Gateway-Auth: Bearer gw-MUSTNOTLEAK-0123456789";
+/// Inherited model override (would be sent in the request body).
+const LEAK_MODEL: &str = "caller-model-MUSTNOTLEAK";
 
 /// Variables a Claude Code VS Code session hands to the MCP servers it starts (fake values).
 const FAKE_SESSION_VARS: &[(&str, &str)] = &[
@@ -211,6 +215,10 @@ fn endpoint_server(fake: &FakeApi, dir: &Path, claude: &Path, auth: Option<&str>
         ("E2E_LOCAL_KEY", ENDPOINT_KEY),
         ("CLAUDE_CODE_OAUTH_TOKEN", LEAK_OAUTH),
         ("ANTHROPIC_API_KEY", LEAK_API_KEY),
+        // A caller's gateway credential and model overrides must not reach the endpoint.
+        ("ANTHROPIC_CUSTOM_HEADERS", LEAK_CUSTOM_HEADERS),
+        ("ANTHROPIC_MODEL", LEAK_MODEL),
+        ("ANTHROPIC_SMALL_FAST_MODEL", LEAK_MODEL),
     ];
     env.extend_from_slice(FAKE_SESSION_VARS);
     Server::start(&config_dir, &env)

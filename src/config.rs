@@ -10,6 +10,9 @@ pub use crate::backends::RawBackend;
 
 pub const MAX_TURNS_LIMIT: u32 = 200;
 pub const MAX_TIMEOUT_S: u64 = 7200;
+/// Upper bound of `max_concurrent` (global: clamped with a warning; per backend: a config
+/// error). Far below tokio's `Semaphore::MAX_PERMITS`, so building the semaphores never panics.
+pub const MAX_CONCURRENT_LIMIT: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -64,7 +67,13 @@ impl Config {
     }
 
     fn clamp(&mut self) {
-        self.max_concurrent = self.max_concurrent.max(1);
+        if self.max_concurrent > MAX_CONCURRENT_LIMIT {
+            tracing::warn!(
+                "max_concurrent = {} is above the limit; using {MAX_CONCURRENT_LIMIT}",
+                self.max_concurrent
+            );
+        }
+        self.max_concurrent = self.max_concurrent.clamp(1, MAX_CONCURRENT_LIMIT);
         self.default_max_turns = self.default_max_turns.clamp(1, MAX_TURNS_LIMIT);
         self.default_timeout_s = self.default_timeout_s.clamp(1, MAX_TIMEOUT_S);
     }
@@ -90,6 +99,18 @@ mod tests {
         assert_eq!(cfg.max_concurrent, 1);
         assert_eq!(cfg.default_max_turns, MAX_TURNS_LIMIT);
         assert_eq!(cfg.default_timeout_s, 1800);
+    }
+
+    #[test]
+    fn huge_max_concurrent_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "max_concurrent = 4611686018427387904\n").unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert_eq!(cfg.max_concurrent, MAX_CONCURRENT_LIMIT);
+        assert!(cfg.max_concurrent <= tokio::sync::Semaphore::MAX_PERMITS);
+        std::fs::write(&p, "max_concurrent = 1024\n").unwrap();
+        assert_eq!(Config::load_from(&p).unwrap().max_concurrent, 1024);
     }
 
     #[test]

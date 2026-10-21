@@ -181,7 +181,7 @@ pub struct RunOutcome {
 pub enum RunError {
     #[error("working directory does not exist: {0}")]
     CwdMissing(PathBuf),
-    #[error("failed to start claude ({path}): {reason}")]
+    #[error("failed to start {path}: {reason}")]
     Spawn { path: PathBuf, reason: String },
     #[error("i/o error: {0}")]
     Io(String),
@@ -1027,6 +1027,41 @@ pub async fn run(
     run_launch(launch, req, &ctx.logs_dir, cancel).await
 }
 
+/// Create the logs directory. Unix: mode 0700 when created; an existing directory is
+/// restricted to 0700 as well (best effort). Run logs hold prompts and full agent output.
+#[cfg(unix)]
+fn create_logs_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    if let Ok(meta) = std::fs::metadata(dir) {
+        if meta.permissions().mode() & 0o077 != 0 {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(())
+}
+
+/// Windows: the profile directory's ACL already restricts access.
+#[cfg(not(unix))]
+fn create_logs_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// Create a new run log (never an existing file). Unix: mode 0600.
+fn create_log_file(path: &Path) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 /// Execute `launch` for `req` (cwd, timeout, and the header fields). Output goes to
 /// `<logs_dir>/<timestamp>-<short-id>.log`; see [`run`] for the cancellation semantics.
 pub async fn run_launch(
@@ -1038,11 +1073,11 @@ pub async fn run_launch(
     if !req.cwd.is_dir() {
         return Err(RunError::CwdMissing(req.cwd));
     }
-    std::fs::create_dir_all(logs_dir).map_err(|e| io_err("creating logs dir", e))?;
+    create_logs_dir(logs_dir).map_err(|e| io_err("creating logs dir", e))?;
     let now = chrono::Utc::now();
     let id = uuid::Uuid::new_v4().simple().to_string();
     let log_path = logs_dir.join(format!("{}-{}.log", now.format("%Y%m%d-%H%M%S"), &id[..8]));
-    let mut file = File::create(&log_path).map_err(|e| io_err("creating log file", e))?;
+    let mut file = create_log_file(&log_path).map_err(|e| io_err("creating log file", e))?;
 
     let batch = crate::locate::is_batch_script(&launch.program);
     file.write_all(header(&launch, &req, &now.to_rfc3339()).as_bytes())
@@ -1475,6 +1510,56 @@ mod tests {
             std::io::Error::from(std::io::ErrorKind::NotFound),
         );
         assert!(!err.to_string().contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn spawn_error_names_the_program_not_claude() {
+        let err = spawn_error(
+            Path::new("/opt/agents/aider"),
+            false,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "failed to start {}: ",
+                Path::new("/opt/agents/aider").display()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("claude"), "{text}");
+    }
+
+    #[test]
+    fn log_file_is_created_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("a").join("logs");
+        create_logs_dir(&logs).unwrap();
+        create_logs_dir(&logs).unwrap();
+        let p = logs.join("run.log");
+        create_log_file(&p).unwrap();
+        // Never reuses (or follows) an existing path.
+        assert!(create_log_file(&p).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        create_logs_dir(&logs).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&logs), 0o700);
+        let p = logs.join("run.log");
+        create_log_file(&p).unwrap();
+        assert_eq!(mode(&p), 0o600);
+        // An existing, more open directory is restricted.
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_logs_dir(&open).unwrap();
+        assert_eq!(mode(&open), 0o700);
     }
 
     #[test]
