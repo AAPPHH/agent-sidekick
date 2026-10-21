@@ -524,6 +524,42 @@ fn provider_error_is_reported() {
     );
 }
 
+/// More output than the runner's in-memory buffer (64-128 KiB): the usage line still counts
+/// every step, because the result is computed from the complete output in the run log.
+#[test]
+fn usage_counts_all_steps_of_a_long_run() {
+    const STEPS: usize = 300;
+    let padding = "x".repeat(1000);
+    let mut canned = String::new();
+    for i in 0..STEPS {
+        canned.push_str(&ev(
+            json!({"type":"step_start","sessionID":"s1","part":{"type":"step-start"}}),
+        ));
+        canned.push('\n');
+        canned.push_str(&ev(json!({"type":"tool_use","sessionID":"s1","part":{"tool":"read","state":{"status":"completed","output": format!("{i} {padding}")}}})));
+        canned.push('\n');
+        canned.push_str(&ev(json!({"type":"step_finish","sessionID":"s1","part":{"reason":"tool-calls","tokens":{"input":100,"output":1},"cost":0.0}})));
+        canned.push('\n');
+    }
+    canned.push_str(&answer_lines(ANSWER));
+    assert!(canned.len() > 300 * 1024, "must exceed the runner's buffer");
+
+    let f = Fixture::new();
+    let mut server = f.start(&f.oc_backend(true, &canned, 0), &[]);
+    let (is_error, text) = f.run(&mut server, json!({"prompt": "hi"}));
+    assert!(!is_error, "{text}");
+    assert!(text.contains(ANSWER), "{text}");
+    let steps = STEPS + 2;
+    let input = STEPS * 100 + 1200 + 1300;
+    let output = STEPS + 30 + 12;
+    assert!(
+        text.contains(&format!(
+            "[usage] steps {steps}, tokens in {input} / out {output}"
+        )),
+        "{text}"
+    );
+}
+
 #[test]
 fn claude_falls_back_to_opencode_and_the_oauth_token_stays_behind() {
     let f = Fixture::new();

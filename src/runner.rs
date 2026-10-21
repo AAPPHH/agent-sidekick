@@ -182,6 +182,27 @@ pub struct RunOutcome {
     /// answer); see [`crate::harness::Normalized::failure`].
     pub failure: Option<String>,
     pub duration: Duration,
+    /// Byte offset in the log file where the agent's output starts (after the header); see
+    /// [`read_logged_output`].
+    pub output_offset: u64,
+}
+
+/// Largest log file [`read_logged_output`] reads back.
+pub const MAX_LOGGED_OUTPUT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The complete (redacted) output of a run, read back from its log file from `offset` on.
+/// `None` if the file cannot be read, is larger than [`MAX_LOGGED_OUTPUT_BYTES`] or shorter
+/// than `offset`; callers then fall back to [`RunOutcome::output`] (the bounded buffer).
+/// Harnesses whose structured output is summed up (opencode's token usage) need all events,
+/// not only the last 64-128 KiB.
+pub fn read_logged_output(log_path: &Path, offset: u64) -> Option<String> {
+    let len = std::fs::metadata(log_path).ok()?.len();
+    if len > MAX_LOGGED_OUTPUT_BYTES || len < offset {
+        return None;
+    }
+    let bytes = std::fs::read(log_path).ok()?;
+    let start = usize::try_from(offset).ok()?;
+    Some(String::from_utf8_lossy(bytes.get(start..)?).into_owned())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1087,7 +1108,9 @@ pub async fn run_launch(
     let mut file = create_log_file(&log_path).map_err(|e| io_err("creating log file", e))?;
 
     let batch = crate::locate::is_batch_script(&launch.program);
-    file.write_all(header(&launch, &req, &now.to_rfc3339()).as_bytes())
+    let head = header(&launch, &req, &now.to_rfc3339());
+    let output_offset = head.len() as u64;
+    file.write_all(head.as_bytes())
         .map_err(|e| io_err("writing log file", e))?;
 
     if cancel.is_cancelled() {
@@ -1102,6 +1125,7 @@ pub async fn run_launch(
             output: CANCELLED_BEFORE_START_MSG.to_owned(),
             failure: None,
             duration: Duration::ZERO,
+            output_offset,
         });
     }
 
@@ -1256,6 +1280,7 @@ pub async fn run_launch(
         output,
         failure: None,
         duration,
+        output_offset,
     })
 }
 
@@ -1733,5 +1758,22 @@ mod tests {
             start: 2,
             ..p(11, 10)
         }));
+    }
+
+    #[test]
+    fn read_logged_output_skips_the_header_and_respects_the_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        const HEAD: &str = "# header line\n# ---- output ----\n";
+        std::fs::write(&log, format!("{HEAD}line one\nline two\n")).unwrap();
+        let offset = HEAD.len() as u64;
+        assert_eq!(
+            read_logged_output(&log, offset).as_deref(),
+            Some("line one\nline two\n")
+        );
+        assert_eq!(read_logged_output(&log, 0).unwrap().lines().count(), 4);
+        // An offset beyond the end, or a missing file: no output (the caller falls back).
+        assert_eq!(read_logged_output(&log, 10_000), None);
+        assert_eq!(read_logged_output(&dir.path().join("missing.log"), 0), None);
     }
 }

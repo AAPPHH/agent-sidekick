@@ -573,3 +573,23 @@ Findings:
 - **gpt-oss is fast (5 to 8 s per task), Qwen is slow (5.5 to 6.5 min per task)** because one request per run gets no response headers for about 5 minutes. OpenCode's header timeout (300 s) fires and the retry answers in seconds. With `headerTimeout` 120 s the retry waited again, three times in a row, so this looks like queueing at the provider, not a lost request; a shorter timeout does not help. `request_timeout_s` stays an optional setting (unset by default). Prefer gpt-oss as the default model; use Qwen only when its latency is acceptable.
 - **The soft step cap works with both models:** they stop and summarise when the cap is reached instead of looping.
 - The OpenCode harness behaves as designed: isolated state dir, key only via `{env:...}`, read-only mode offered only read tools, `test_calc.py` untouched in the write runs.
+- **Usage line from the complete output (fixed after the doc delegation):** the opencode usage line (steps, tokens) was computed from the runner's in-memory buffer (the last 64-128 KiB), so long runs were undercounted (a doc run reported "steps 10" for 20 steps). The runner now records where the output starts in the run log (`RunOutcome::output_offset`), and the server normalizes the complete output read back from the log (up to 32 MiB; the buffer stays the fallback). Test: `usage_counts_all_steps_of_a_long_run` (fails without the fix: 98 of 302 steps). The mini-run numbers above are complete: those logs were 6-16 KB.
+
+## Delegating doc tasks to kiconnect (2026-10-21)
+
+docs/DEVELOPMENT.md and docs/RELEASING.md were delegated to `kiconnect` (gpt-oss-120b, `max_turns` 20, `timeout_s` 600) in the branch `docs/dev-release` and reviewed as a diff before merging.
+
+| Attempt | Prompt style | Result |
+|---|---|---|
+| DEVELOPMENT 1 | "read these files, then write" | 20 steps of reading (19 tool calls), never wrote; ended with a summary of what is "still to do" |
+| DEVELOPMENT 2 | explicit step budget and reading plan | read more than planned, printed the document in its reply instead of writing it |
+| DEVELOPMENT 3 | "the write tool is mandatory" | read 16 times, then **claimed** "Created docs/DEVELOPMENT.md with 91 lines" without any write call (no file existed) |
+| DEVELOPMENT 4 | all facts in the prompt, "write as your first action" | wrote the file in 2 steps (15k tokens in), but to the repo root instead of `docs/` |
+| RELEASING 1 | same as 4 | wrote in 2 steps (14k tokens in), again to the root |
+
+Review changes: DEVELOPMENT.md: truncated module/test descriptions completed (my fact list had only first comment lines), outdated module descriptions corrected (runner, token), non-breaking hyphens replaced. RELEASING.md: restructured into headings with indented code blocks; `Cargo.lock` added to the release commit; checksum check needs the downloaded assets; version pinning for `curl | sh`; `repository` is a URL; no local `render-installers.sh` step needed.
+
+Lessons (apply to every delegation to kiconnect):
+- gpt-oss-120b explores far beyond a stated reading plan and can report success that did not happen. **Never trust the result text; check the diff and the files** (this is why the user's rule "review as a diff, never merge blindly" matters).
+- What works: gather the facts in the main session (cheap greps) and let the model only write; ask for one write as the first action. Expect wrong paths for new files (check `git status`).
+- Quality is draft level: structure and wording are usable, details need review. For docs the saving over writing them directly is small; it pays off more for mechanical work with a test as the check (like the calc.py fix).

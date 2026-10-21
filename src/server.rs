@@ -1146,9 +1146,13 @@ impl SidekickServer {
 
         match result {
             Ok(mut outcome) => {
-                // Harnesses with structured output (opencode JSON lines) translate the runner's
-                // output buffer into the result text; claude and command keep the tail as is.
-                if let Some(n) = backend.harness().normalize_output(&outcome.output) {
+                // Harnesses with structured output (opencode JSON lines) translate the run's
+                // output into the result text; claude and command keep the tail as is. The full
+                // output comes from the log (the buffer only holds the last 64-128 KiB, which
+                // would undercount steps and tokens); the buffer is the fallback.
+                let full = runner::read_logged_output(&outcome.log_path, outcome.output_offset);
+                let raw = full.as_deref().unwrap_or(&outcome.output);
+                if let Some(n) = backend.harness().normalize_output(raw) {
                     // Redacted again: decoding JSON escapes could have revealed a secret.
                     outcome.tail =
                         redact_with(secrets, &runner::truncate_tail(&n.text, runner::TAIL_CHARS));
@@ -1683,6 +1687,7 @@ mod tests {
             output: "done".into(),
             failure: None,
             duration: Duration::from_millis(12_340),
+            output_offset: 0,
         }
     }
 
