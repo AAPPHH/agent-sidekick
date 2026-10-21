@@ -94,8 +94,26 @@ const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 /// Same text as the v0.1 runner warning.
 const BASE_URL_WARNING: &str = "warning: ANTHROPIC_BASE_URL is inherited from the server environment; claude sends its requests (with the agent token) to that endpoint";
 
-/// Header note for command backends when model/allowed_tools were requested.
-pub const COMMAND_IGNORED_NOTE: &str = "note: model/allowed_tools are ignored for command backends";
+/// Which request parameters a command backend ignores: `allowed_tools` always, `model` when
+/// its command has no `{model}`. `None` for claude-* backends or when none of them was set.
+/// Returns `"model/allowed_tools"`, `"model"` or `"allowed_tools"`.
+pub fn command_ignored(backend: &Backend, req: &RunRequest) -> Option<&'static str> {
+    if !matches!(backend.kind, BackendKind::Command { .. }) {
+        return None;
+    }
+    let model = !backend.takes_model() && non_blank(req.model.as_deref()).is_some();
+    let tools = req
+        .allowed_tools
+        .iter()
+        .flatten()
+        .any(|t| !t.trim().is_empty());
+    match (model, tools) {
+        (true, true) => Some("model/allowed_tools"),
+        (true, false) => Some("model"),
+        (false, true) => Some("allowed_tools"),
+        (false, false) => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Credentials
@@ -469,9 +487,16 @@ fn child_env_inner(
 // Placeholders
 // ---------------------------------------------------------------------------
 
-/// Replace `{prompt}`, `{cwd}`, `{max_turns}` in one template element in a single pass:
-/// replacement text is never scanned again, unknown `{x}` stays literal.
-pub fn substitute(template: &str, prompt: &str, cwd: &Path, max_turns: u32) -> String {
+/// Replace `{prompt}`, `{cwd}`, `{max_turns}` and `{model}` in one template element in a
+/// single pass: replacement text is never scanned again, unknown `{x}` stays literal (so
+/// does `{model}` when `model` is `None`).
+pub fn substitute(
+    template: &str,
+    prompt: &str,
+    cwd: &Path,
+    max_turns: u32,
+    model: Option<&str>,
+) -> String {
     let mut out = String::with_capacity(template.len() + prompt.len());
     let mut rest = template;
     while let Some(idx) = rest.find('{') {
@@ -485,6 +510,9 @@ pub fn substitute(template: &str, prompt: &str, cwd: &Path, max_turns: u32) -> S
             rest = after;
         } else if let Some(after) = tail.strip_prefix("{max_turns}") {
             out.push_str(&max_turns.to_string());
+            rest = after;
+        } else if let (Some(m), Some(after)) = (model, tail.strip_prefix("{model}")) {
+            out.push_str(m);
             rest = after;
         } else {
             out.push('{');
@@ -526,7 +554,15 @@ pub fn build_launch(
             "backend {name}: internal error: credential type does not match backend type {ty}"
         ));
     }
-    let mut header = vec![format!("backend: {name} ({ty})")];
+    // The caller validates the model first; checked again here because it may land in argv.
+    let model = backend
+        .effective_model(req.model.as_deref())
+        .map_err(|e| format!("backend {name}: {e}"))?;
+    // Same form as the first line of the sidekick_run result.
+    let mut header = vec![match &model {
+        Some(m) => format!("backend: {name} ({ty}), model {m}"),
+        None => format!("backend: {name} ({ty})"),
+    }];
 
     match &backend.kind {
         BackendKind::ClaudeOauth { .. } | BackendKind::ClaudeEndpoint { .. } => {
@@ -544,11 +580,8 @@ pub fn build_launch(
                     }
                 }
             }
-            let model = non_blank(req.model.as_deref())
-                .or_else(|| non_blank(backend.model.as_deref()))
-                .map(str::to_owned);
             let req2 = RunRequest {
-                model,
+                model: model.clone(),
                 ..req.clone()
             };
             let secrets = match credential.secret() {
@@ -571,7 +604,9 @@ pub fn build_launch(
             let args: Vec<OsString> = command
                 .iter()
                 .skip(1)
-                .map(|a| substitute(a, &req.prompt, &req.cwd, req.max_turns).into())
+                .map(|a| {
+                    substitute(a, &req.prompt, &req.cwd, req.max_turns, model.as_deref()).into()
+                })
                 .collect();
             let stdin = prompt_via_stdin.then(|| req.prompt.clone());
             header.push(format!("program: {}", program.display()));
@@ -583,13 +618,8 @@ pub fn build_launch(
                     "argument"
                 }
             ));
-            let tools_set = req
-                .allowed_tools
-                .iter()
-                .flatten()
-                .any(|t| !t.trim().is_empty());
-            if non_blank(req.model.as_deref()).is_some() || tools_set {
-                header.push(COMMAND_IGNORED_NOTE.to_owned());
+            if let Some(what) = command_ignored(backend, req) {
+                header.push(format!("note: {what} ignored by this command backend"));
             }
             if let Some(var) = secret_env {
                 // The name only; the value never goes into the header.
@@ -652,6 +682,7 @@ mod tests {
             is_default: false,
             max_concurrent: None,
             model: None,
+            models: None,
             env: BTreeMap::new(),
             pass_env: Vec::new(),
             implicit: false,
@@ -1486,30 +1517,33 @@ mod tests {
     #[test]
     fn substitute_basic() {
         let cwd = Path::new("/work/dir");
-        assert_eq!(substitute("{prompt}", "hi", cwd, 3), "hi");
+        assert_eq!(substitute("{prompt}", "hi", cwd, 3, None), "hi");
         assert_eq!(
-            substitute("--dir={cwd} -n {max_turns}", "p", cwd, 12),
+            substitute("--dir={cwd} -n {max_turns}", "p", cwd, 12, None),
             format!("--dir={} -n 12", cwd.to_string_lossy())
         );
         assert_eq!(
-            substitute("no placeholders", "p", cwd, 1),
+            substitute("no placeholders", "p", cwd, 1, None),
             "no placeholders"
         );
-        assert_eq!(substitute("", "p", cwd, 1), "");
-        assert_eq!(substitute("{prompt}{prompt}", "ab", cwd, 1), "abab");
+        assert_eq!(substitute("", "p", cwd, 1, None), "");
+        assert_eq!(substitute("{prompt}{prompt}", "ab", cwd, 1, None), "abab");
     }
 
     #[test]
     fn substitute_is_single_pass() {
         let cwd = Path::new("/work/dir");
         assert_eq!(
-            substitute("{prompt}", "use {cwd} and {max_turns}", cwd, 5),
+            substitute("{prompt}", "use {cwd} and {max_turns}", cwd, 5, None),
             "use {cwd} and {max_turns}"
         );
-        assert_eq!(substitute("x{prompt}y", "{prompt}", cwd, 5), "x{prompt}y");
-        assert_eq!(substitute("{{prompt}}", "P", cwd, 5), "{P}");
         assert_eq!(
-            substitute("{{cwd}", "P", cwd, 5),
+            substitute("x{prompt}y", "{prompt}", cwd, 5, None),
+            "x{prompt}y"
+        );
+        assert_eq!(substitute("{{prompt}}", "P", cwd, 5, None), "{P}");
+        assert_eq!(
+            substitute("{{cwd}", "P", cwd, 5, None),
             format!("{{{}", cwd.to_string_lossy())
         );
     }
@@ -1517,12 +1551,38 @@ mod tests {
     #[test]
     fn substitute_unknown_placeholders_literal() {
         let cwd = Path::new("/w");
-        assert_eq!(substitute("{model} {x} {", "P", cwd, 1), "{model} {x} {");
-        assert_eq!(substitute("{prompt", "P", cwd, 1), "{prompt");
-        assert_eq!(substitute("}{prompt}{", "P", cwd, 1), "}P{");
-        assert_eq!(substitute("{PROMPT}", "P", cwd, 1), "{PROMPT}");
+        assert_eq!(
+            substitute("{model} {x} {", "P", cwd, 1, None),
+            "{model} {x} {"
+        );
+        assert_eq!(substitute("{prompt", "P", cwd, 1, None), "{prompt");
+        assert_eq!(substitute("}{prompt}{", "P", cwd, 1, None), "}P{");
+        assert_eq!(substitute("{PROMPT}", "P", cwd, 1, None), "{PROMPT}");
         // Multi-byte characters around braces.
-        assert_eq!(substitute("ä{prompt}ö{", "ü", cwd, 1), "äüö{");
+        assert_eq!(substitute("ä{prompt}ö{", "ü", cwd, 1, None), "äüö{");
+    }
+
+    #[test]
+    fn substitute_model_single_pass() {
+        let cwd = Path::new("/w");
+        let m = Some("qwen-qwen3-8-27b");
+        assert_eq!(
+            substitute("openai/{model}", "P", cwd, 1, m),
+            "openai/qwen-qwen3-8-27b"
+        );
+        assert_eq!(substitute("{model}", "P", cwd, 1, Some("A B")), "A B");
+        // A prompt containing `{model}` stays literal ...
+        assert_eq!(
+            substitute("{prompt}|{model}", "use {model}", cwd, 1, m),
+            "use {model}|qwen-qwen3-8-27b"
+        );
+        // ... and so does a model value containing other placeholders.
+        assert_eq!(
+            substitute("{model}:{prompt}", "P", cwd, 1, Some("{prompt}{cwd}")),
+            "{prompt}{cwd}:P"
+        );
+        assert_eq!(substitute("{{model}}", "P", cwd, 1, Some("m")), "{m}");
+        assert_eq!(substitute("{MODEL}", "P", cwd, 1, Some("m")), "{MODEL}");
     }
 
     // ---- build_launch ------------------------------------------------------
@@ -1591,7 +1651,10 @@ mod tests {
         assert_eq!(l.args, vec![OsString::from("--turns"), OsString::from("7")]);
         assert_eq!(l.stdin.as_deref(), Some(NASTY));
         assert!(l.header.contains(&"prompt delivery: stdin".to_owned()));
-        assert!(l.header.contains(&COMMAND_IGNORED_NOTE.to_owned()));
+        assert!(l
+            .header
+            .contains(&"note: model ignored by this command backend".to_owned()));
+        assert_eq!(l.header[0], "backend: agent (command)");
         assert!(!l
             .args
             .iter()
@@ -1602,17 +1665,111 @@ mod tests {
     fn command_note_only_when_model_or_tools_set() {
         let b = command("agent", &["agent"], true);
         let p = Path::new("/opt/agent");
+        let has_note = |l: &Launch| l.header.iter().any(|h| h.starts_with("note: "));
         let l = build_launch(&b, &req("x"), &Credential::None, p, Vec::new(), &[]).unwrap();
-        assert!(!l.header.contains(&COMMAND_IGNORED_NOTE.to_owned()));
+        assert!(!has_note(&l));
         let mut r = req("x");
         r.allowed_tools = Some(vec!["Read".into()]);
         let l = build_launch(&b, &r, &Credential::None, p, Vec::new(), &[]).unwrap();
-        assert!(l.header.contains(&COMMAND_IGNORED_NOTE.to_owned()));
+        assert!(l
+            .header
+            .contains(&"note: allowed_tools ignored by this command backend".to_owned()));
+        r.model = Some("m".into());
+        let l = build_launch(&b, &r, &Credential::None, p, Vec::new(), &[]).unwrap();
+        assert!(l
+            .header
+            .contains(&"note: model/allowed_tools ignored by this command backend".to_owned()));
         let mut r = req("x");
         r.allowed_tools = Some(vec![]);
         r.model = Some("  ".into());
         let l = build_launch(&b, &r, &Credential::None, p, Vec::new(), &[]).unwrap();
-        assert!(!l.header.contains(&COMMAND_IGNORED_NOTE.to_owned()));
+        assert!(!has_note(&l));
+    }
+
+    /// A command backend with `{model}` and an allowlist.
+    fn command_with_models(models: &[&str]) -> Backend {
+        let mut b = command(
+            "kic",
+            &[
+                "aider",
+                "--model",
+                "openai/{model}",
+                "--message",
+                "{prompt}",
+            ],
+            false,
+        );
+        b.models = Some(models.iter().map(|m| (*m).to_owned()).collect());
+        b.model = Some(models[0].to_owned());
+        b
+    }
+
+    #[test]
+    fn command_model_placeholder_is_substituted() {
+        let b = command_with_models(&["openai-gpt-oss-120b", "qwen-qwen3-8-27b"]);
+        let p = Path::new("/usr/bin/aider");
+        let args = |l: &Launch| -> Vec<String> {
+            l.args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        // Default model.
+        let l = build_launch(&b, &req("x"), &Credential::None, p, Vec::new(), &[]).unwrap();
+        assert_eq!(
+            args(&l),
+            ["--model", "openai/openai-gpt-oss-120b", "--message", "x"]
+        );
+        assert_eq!(
+            l.header[0],
+            "backend: kic (command), model openai-gpt-oss-120b"
+        );
+        // Requested model; a prompt mentioning {model} stays literal.
+        let mut r = req("say {model}");
+        r.model = Some(" qwen-qwen3-8-27b ".into());
+        let l = build_launch(&b, &r, &Credential::None, p, Vec::new(), &[]).unwrap();
+        assert_eq!(
+            args(&l),
+            [
+                "--model",
+                "openai/qwen-qwen3-8-27b",
+                "--message",
+                "say {model}"
+            ]
+        );
+        // The model is used, so only allowed_tools would be noted.
+        assert!(!l.header.iter().any(|h| h.starts_with("note: ")));
+        r.allowed_tools = Some(vec!["Read".into()]);
+        let l = build_launch(&b, &r, &Credential::None, p, Vec::new(), &[]).unwrap();
+        assert!(l
+            .header
+            .contains(&"note: allowed_tools ignored by this command backend".to_owned()));
+    }
+
+    #[test]
+    fn model_outside_allowlist_is_rejected_by_build_launch() {
+        let b = command_with_models(&["a", "b"]);
+        let p = Path::new("/usr/bin/aider");
+        let mut r = req("x");
+        r.model = Some("--evil".into());
+        let e = build_launch(&b, &r, &Credential::None, p, Vec::new(), &[]).unwrap_err();
+        assert!(e.contains("not offered by backend 'kic'"), "{e}");
+        assert!(e.contains("Allowed models: a, b"), "{e}");
+        // The same applies to a claude backend with an allowlist.
+        let mut c = endpoint("local", EndpointAuth::XApiKey);
+        c.models = Some(vec!["qwen3-coder".into()]);
+        c.model = Some("qwen3-coder".into());
+        r.model = Some("opus".into());
+        let e = build_launch(
+            &c,
+            &r,
+            &key_cred(KEY_A),
+            Path::new("/bin/claude"),
+            Vec::new(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("not offered by backend 'local'"), "{e}");
     }
 
     #[test]
@@ -1723,7 +1880,10 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(l.header[0], "backend: sidekick (claude-oauth)");
+        assert_eq!(
+            l.header[0],
+            "backend: sidekick (claude-oauth), model sonnet"
+        );
         assert_eq!(l.header[1], BASE_URL_WARNING);
         assert!(l.header.contains(&"program: /bin/claude".to_owned()));
         assert!(l.header.contains(&"prompt delivery: argument".to_owned()));

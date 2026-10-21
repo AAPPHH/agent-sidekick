@@ -108,14 +108,15 @@ agent-sidekick backends test local
 
 ### Command backend with a stored key
 
-A `command` backend can get a secret, e.g. the API key of a hosted OpenAI-compatible service, without putting it into `config.toml` or the MCP registration. `secret_env` names the variable the program reads it from. Example: Aider against the KI:connect.nrw gateway (any OpenAI-compatible endpoint works the same way):
+A `command` backend can get a secret, e.g. the API key of a hosted OpenAI-compatible service, without putting it into `config.toml` or the MCP registration. `secret_env` names the variable the program reads it from. Example: Aider against the KI:connect.nrw gateway (any OpenAI-compatible endpoint works the same way), as one backend for the provider that offers two of its models (see [Models](#models)):
 
 ```toml
 [backends.kiconnect]
 type = "command"
-description = "Aider with gpt-oss-120b via KI:connect.nrw (university quota). Free, medium quality; edits files in cwd directly without asking. For boilerplate, tests and small, well-specified changes."
+description = "Aider via KI:connect.nrw (university quota). Free, medium quality; edits files in cwd directly without asking. For boilerplate, tests and small, well-specified changes. Models: openai-gpt-oss-120b (general), qwen-qwen3-8-27b (code)."
 cost = "free"
-command = ["aider", "--model", "openai/openai-gpt-oss-120b", "--no-git", "--yes-always", "--no-show-model-warnings", "--no-check-update", "--no-pretty", "--no-stream", "--message", "{prompt}"]
+command = ["aider", "--model", "openai/{model}", "--no-git", "--yes-always", "--no-show-model-warnings", "--no-check-update", "--no-pretty", "--no-stream", "--message", "{prompt}"]
+models = ["openai-gpt-oss-120b", "qwen-qwen3-8-27b"]   # the first one is the default
 env = { OPENAI_API_BASE = "https://chat.kiconnect.nrw/api/v1", PYTHONUTF8 = "1" }
 secret_env = "OPENAI_API_KEY"
 ```
@@ -126,6 +127,22 @@ agent-sidekick backends test kiconnect
 ```
 
 The value is stored like the other secrets (OS keyring user `cmd-kiconnect`, file fallback `cmd-kiconnect.key`, see [Secrets per backend](#secrets-per-backend)) and set as `OPENAI_API_KEY` for this backend's runs only, replacing an inherited value of that name. It never appears in `config.toml`, `sidekick_status`, `sidekick_backends`, `backends list`/`test` or `doctor` (they show only where it is stored), and it is redacted from the run's output and log. Values shorter than 8 characters are not redacted; `setup` warns about that. `PYTHONUTF8=1` avoids encoding errors of Aider on Windows.
+
+### Models
+
+One backend per provider, the model as a parameter: a backend can offer several models, and the calling session picks the backend **and** the model (`sidekick_run` parameter `model`). Configure it with two keys, allowed for every type:
+
+- `models`: the models the backend offers, e.g. `["openai-gpt-oss-120b", "qwen-qwen3-8-27b"]`. It is an **allowlist**: a `model` that is not in it is rejected before anything runs (`sidekick_run` returns an error listing the allowed models; no fallback is tried, because the parameter is invalid). Names must be unique (case-sensitive), not blank, without leading/trailing whitespace or control characters, and must not start with `-` (they may end up in a command line, where they could be taken as an option). Inner spaces are allowed (some gateways use ids such as `Mistral Small 3.2 24B Instruct 2506`).
+- `model`: the default model, used when the request names none. With `models` it must be one of them; without `model` the default is the first entry of `models`.
+
+Per type:
+
+- **claude-oauth / claude-endpoint**: the model is passed as `--model`. `models` is optional; without it any model is accepted (aliases like `opus`, `sonnet`, `haiku` or full model ids), as before. With it, only the listed ones.
+- **command**: the model reaches the program only through the placeholder `{model}` in an argument (e.g. `"openai/{model}"`). It is substituted in the same single pass as `{prompt}`, `{cwd}` and `{max_turns}` and always stays inside its argument. Because the value lands in the program's argument list, `models` is **required** when `{model}` is used; `models` or `model` without `{model}` in `command` is a config error (it would have no effect). A command backend without `{model}` ignores the request's `model` (the result notes it).
+
+With a `fallback`, the requested model is checked against the fallback backend's own `models`: if the fallback does not offer it, the fallback runs with its default model and the result says so (`note: model X not offered by <fallback>; used its default Y`).
+
+`sidekick_backends` lists `models` and `default_model` for every backend, so the calling session can choose from them; `backends list` shows them in the MODELS column (default first, marked with `*`) and `backends test <name>` prints them.
 
 Notes for the `local` backend:
 
@@ -217,12 +234,12 @@ Each run's environment is built from the server's environment, so one backend's 
 ### Command backends
 
 - `command` is an argument array; the first element is the program. **No shell** is involved: pipes, redirections, `$VAR` or `%VAR%` in the array are passed literally.
-- Placeholders `{prompt}`, `{cwd}` and `{max_turns}` are replaced inside each element in a single pass. The replacement is never scanned again, so a prompt that contains `{cwd}` stays literal, and `{prompt}` always ends up in **one** argument, whatever it contains. Unknown `{...}` are left as is.
+- Placeholders `{prompt}`, `{cwd}`, `{max_turns}` and `{model}` are replaced inside each element in a single pass. The replacement is never scanned again, so a prompt that contains `{cwd}` or `{model}` stays literal, and `{prompt}` always ends up in **one** argument, whatever it contains. Unknown `{...}` are left as is. `{model}` requires `models`, see [Models](#models).
 - `command` must contain `{prompt}` in an argument after `command[0]`, unless `prompt_via_stdin = true`: then the prompt is written to the program's stdin and `{prompt}` must not appear. `command[0]` (the program) is never substituted, so a placeholder there is a config error.
 - A bare program name is looked up in the absolute `PATH` entries (on Windows with `PATHEXT`); empty or relative `PATH` entries are ignored, and a relative path with a directory separator is rejected. An absolute path must exist.
 - On Windows, `.cmd`/`.bat` programs require `prompt_via_stdin = true` (otherwise the run fails with an error): `cmd.exe` cannot pass arbitrary prompt text safely as an argument. Point `command[0]` at an `.exe` otherwise (pip installs Aider as `aider.exe`).
 - The prompt is always an argument unless `prompt_via_stdin` is set; very long prompts can exceed the OS command-line limit (about 32 000 characters on Windows), so prefer `prompt_via_stdin` for tools that support it.
-- The `model` and `allowed_tools` parameters of `sidekick_run` are ignored for command backends (the log notes it); `model` in the backend's config is a config error. Put the model into the command instead.
+- The `allowed_tools` parameter of `sidekick_run` is ignored for command backends, and so is `model` unless the command uses `{model}` (the result and the log note it).
 - Command backends are configured only in `config.toml`. `sidekick_run` can select one by name but can never supply or change a command.
 - The program runs with the permissions of the MCP server; tools like Aider with `--yes-always` edit files without asking.
 - `secret_env = "VAR"` hands the backend's stored secret to the program in `VAR`, see [Command backend with a stored key](#command-backend-with-a-stored-key). `VAR` must be a plain variable name (`A-Z`, `a-z`, `0-9`, `_`), must not be `CLAUDE_CODE_OAUTH_TOKEN`, `AGENT_SIDEKICK_TOKEN` or `AGENT_SIDEKICK_*`, and must not also be a key of `env` (config errors). `ANTHROPIC_API_KEY` is allowed, e.g. for Aider with Claude models. Without a stored secret the backend is not reachable and a run fails with a hint to `setup --backend <name>`.
@@ -246,6 +263,8 @@ Put rules like these into the `CLAUDE.md` of your projects (or `~/.claude/CLAUDE
 - `local` (free): boilerplate, test scaffolding, docs, mechanical refactors.
 - `sidekick` (second Claude account, quota): complex multi-file changes and debugging.
 - `aider` (free, edits without asking): small edits to files you name; review the diff.
+- Pick the model from the backend's `models` in `sidekick_backends` (or omit `model` for
+  its `default_model`); a model the backend does not list is rejected.
 - Always pass `cwd` (absolute project path) and a self-contained prompt.
 - Use `fallback: "local"` only for tasks that are safe to retry; the failed primary may
   have changed files. Check `git status` after a fallback.
@@ -265,10 +284,10 @@ Put rules like these into the `CLAUDE.md` of your projects (or `~/.claude/CLAUDE
 | `fallback`      | none                 | Backend used if the primary fails, see [Fallback](#fallback). |
 | `max_turns`     | 30                   | Maximum 200. Passed as `--max-turns` (claude-*) or `{max_turns}` (command). |
 | `timeout_s`     | 1800                 | Maximum 7200. The whole process tree is killed on timeout. Applies per attempt: a fallback gets its own full `timeout_s`. |
-| `model`         | backend's `model` / CLI default | Passed as `--model` (claude-* only). |
+| `model`         | backend's default model / CLI default | One of the backend's `models` (see `sidekick_backends`); validated against that allowlist before anything runs. Passed as `--model` (claude-*) or `{model}` (command), see [Models](#models). |
 | `allowed_tools` | none                 | List passed as `--allowedTools` (claude-* only). |
 
-The result starts with the backend that actually ran, `backend: <name> (<type>)`. After a fallback that line also names the failed primary backend and the reason; if the primary ran, a separate line `primary: exit_code N, log <path> — it ran and may have left changes in cwd` follows.
+The result starts with the backend that actually ran and its model, `backend: <name> (<type>), model <model>` (without `, model ...` when no model was requested and the backend has no default, or the command backend takes no model). After a fallback that line also names the failed primary backend and the reason; if the primary ran, a separate line `primary: exit_code N, log <path> — it ran and may have left changes in cwd` follows.
 Then follow `exit_code:`, `log:` (the path of the full run log), `duration_s:` and the last 4000 characters of output.
 
 - **Cancellation:** cancelling the tool call in Claude Code (Esc) kills the delegated run's whole process tree; a cancelled run that is still queued never starts.
@@ -282,21 +301,23 @@ No parameters. Returns a JSON object:
 {
   "config_error": null,
   "backends": [
-    { "name": "local", "type": "claude-endpoint", "description": "...", "cost": "free", "default": false,
+    { "name": "kiconnect", "type": "command", "description": "...", "cost": "free", "default": false,
+      "models": ["openai-gpt-oss-120b", "qwen-qwen3-8-27b"], "default_model": "openai-gpt-oss-120b",
       "reachable": true, "detail": "...", "max_concurrent": null, "running": 0, "queued": 0 }
   ]
 }
 ```
 
 - `config_error`: `null`, or the problem with `config.toml`. Then `backends` is empty and `sidekick_run` fails until the file is fixed.
-- Per backend: `name`, `type`, `description`, `cost`, `default`, `reachable`, `detail` (why it is or is not reachable), `max_concurrent` (`null` without a per-backend limit), `running` and `queued`.
+- Per backend: `name`, `type`, `description`, `cost`, `default`, `models` (the allowlist for `sidekick_run`'s `model`; `null`: a claude-* backend accepts any model, a command backend without `{model}` takes none), `default_model` (used when `model` is omitted; `null`: the account's/endpoint's default, or no model), `reachable`, `detail` (why it is or is not reachable), `max_concurrent` (`null` without a per-backend limit), `running` and `queued`.
+- Pick the backend by `description` and `cost`, and the model from its `models`.
 
 It never contains secrets or environment values.
 
 ### `sidekick_status`
 
 Shows running and queued runs, per backend and in total, with the global and per-backend limits.
-Without a `[backends]` section it also shows the global `default model` and the agent's Claude config dir. With `[backends]`, the line of each `claude-oauth` and `claude-endpoint` backend shows that backend's effective `model` and `config_dir` instead (the top-level `default_model` is not used then).
+Without a `[backends]` section it also shows the global `default model` and the agent's Claude config dir. With `[backends]`, the line of each `claude-oauth` and `claude-endpoint` backend shows that backend's effective `model` and `config_dir` instead (the top-level `default_model` is not used then). A backend with `models` also shows its allowlist (`models [a, b]`); a command backend with `{model}` shows its default model and allowlist.
 
 ## CLI reference
 
@@ -334,12 +355,13 @@ pass_env = []             # inherited variables to keep for every backend, see a
 | `max_concurrent` | all | no own limit | Per-backend limit (at least 1), in addition to the global one. |
 | `env` | all | none | Extra non-secret variables, e.g. `{ CLAUDE_CODE_ATTRIBUTION_HEADER = "0" }`. Not allowed: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `AGENT_SIDEKICK_*`. |
 | `pass_env` | all | none | Inherited variables to keep for this backend, see [session isolation](#child-environment-and-session-isolation). |
-| `model` | claude-oauth, claude-endpoint | CLI default | Default `--model`; the `model` parameter of `sidekick_run` overrides it. |
+| `model` | all | first of `models`, else CLI default | Default model: `--model` (claude-*) or the value of `{model}` (command; only with `{model}` in `command`). Must be one of `models` when both are set. The `model` parameter of `sidekick_run` overrides it. |
+| `models` | all | none (claude-*: any model) | Models the backend offers; an allowlist for `sidekick_run`'s `model`, see [Models](#models). Required for a command backend that uses `{model}`, an error for one that does not. |
 | `config_dir` | claude-oauth, claude-endpoint | `sidekick`: `AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` or `~/.claude-sidekick`; others: `~/.claude-sidekick-<name>` | `CLAUDE_CONFIG_DIR` of the agent; absolute or starting with `~`. |
 | `base_url` | claude-endpoint | (required) | `http://` or `https://` URL of the Anthropic-compatible API. Must not contain `user:password@` (config error; store the key with `agent-sidekick setup --backend <name>` or set `api_key_env`); ASCII host (`xn--` form for internationalised names) and a valid port. |
 | `auth` | claude-endpoint | `x-api-key` | `x-api-key` (`ANTHROPIC_API_KEY`) or `bearer` (`ANTHROPIC_AUTH_TOKEN`). |
 | `api_key_env` | claude-endpoint | none (stored key) | Name of an environment variable with the key. It is removed from every other backend's environment. |
-| `command` | command | (required) | Program and arguments with `{prompt}`, `{cwd}`, `{max_turns}` (placeholders only after `command[0]`). |
+| `command` | command | (required) | Program and arguments with `{prompt}`, `{cwd}`, `{max_turns}`, `{model}` (placeholders only after `command[0]`). |
 | `prompt_via_stdin` | command | `false` | Send the prompt on stdin instead of `{prompt}`. |
 | `secret_env` | command | none | Variable that receives the backend's stored secret (`setup --backend <name>`), e.g. `OPENAI_API_KEY`. Not allowed: `CLAUDE_CODE_OAUTH_TOKEN`, `AGENT_SIDEKICK_*`, or a key that is also in `env`. Values shorter than 8 characters are not redacted. |
 

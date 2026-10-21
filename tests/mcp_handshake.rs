@@ -73,6 +73,16 @@ fn handshake_lists_tools_and_validates_params() {
         .as_str()
         .unwrap()
         .contains("timeout"));
+    // The model parameter selects among the backend's models and is validated.
+    let model_desc = props["model"]["description"].as_str().unwrap();
+    assert!(
+        model_desc.contains("sidekick_backends") && model_desc.contains("allowlist"),
+        "{model_desc}"
+    );
+    assert!(
+        desc.contains("models") && desc.contains("default_model"),
+        "{desc}"
+    );
 
     // Without config.toml there is exactly the implicit backend.
     let res = server.call_tool("sidekick_backends", json!({}));
@@ -91,6 +101,14 @@ fn handshake_lists_tools_and_validates_params() {
     assert!(b["description"].as_str().is_some_and(|d| !d.is_empty()));
     assert!(b["reachable"].is_boolean(), "{report}");
     assert!(b["detail"].is_string(), "{report}");
+    // The implicit backend accepts any model and has no configured default.
+    assert_eq!(b["models"], Value::Null, "{report}");
+    assert_eq!(b["default_model"], Value::Null, "{report}");
+    assert!(b.as_object().unwrap().contains_key("models"), "{report}");
+    assert!(
+        b.as_object().unwrap().contains_key("default_model"),
+        "{report}"
+    );
     assert_eq!(b["running"], 0, "{report}");
     assert_eq!(b["queued"], 0, "{report}");
     let at = &props["allowed_tools"];

@@ -546,3 +546,205 @@ fn stopped_run_still_names_backend() {
     let (res, _) = server.wait_response(holder, RUN_WITHIN);
     assert!(text_of(&res).contains("SLOW-DONE"), "{res}");
 }
+
+/// Script that prints its first arguments (Unix: also the argument count).
+fn args_script(dir: &Path) -> PathBuf {
+    script(
+        dir,
+        "args",
+        "echo ARGS-RAN\nprintf 'ARGC:%s\\n' \"$#\"\nprintf 'ARG1:[%s]\\n' \"$1\"\nprintf 'ARG2:[%s]\\n' \"$2\"",
+        "echo ARGS-RAN\necho ARG1:[%~1]\necho ARG2:[%~2]\necho ARG3:[%~3]",
+    )
+}
+
+/// `[backends.<name>]` running `program` with the arguments `{model}`, `END` (Unix: and the
+/// prompt; Windows: prompt on stdin), offering `models` (a TOML array).
+fn model_backend(name: &str, program: &Path, default: bool, models: &str) -> String {
+    let program = program.to_string_lossy();
+    let invocation = if cfg!(windows) {
+        format!("command = ['{program}', '{{model}}', 'END']\nprompt_via_stdin = true\n")
+    } else {
+        format!("command = ['{program}', '{{model}}', 'END', '{{prompt}}']\n")
+    };
+    format!(
+        "[backends.{name}]\ntype = \"command\"\ndescription = \"{name} test backend\"\n\
+         default = {default}\ncost = \"free\"\n{invocation}models = {models}\n\n"
+    )
+}
+
+/// Backends `kic` (default; models `vendor/model-a.v1` (default), `qwen-qwen3-8-27b`),
+/// `other` (models `only-one`) and `bad` (exits 3, no `{model}`).
+fn model_fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = dir.path().join("scripts");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let args = args_script(&scripts);
+    let config = [
+        model_backend(
+            "kic",
+            &args,
+            true,
+            "['vendor/model-a.v1', 'qwen-qwen3-8-27b']",
+        ),
+        model_backend("other", &args, false, "['only-one']"),
+        command_backend("bad", &bad_script(&scripts), false, ""),
+    ]
+    .concat();
+    let server = start(&config, &dir);
+    Fixture { dir, work, server }
+}
+
+/// The chosen model arrived as exactly one argument, right before `END`.
+fn assert_model_arg(text: &str, model: &str) {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    assert!(lines.contains(&"ARGS-RAN"), "{text}");
+    let arg1 = format!("ARG1:[{model}]");
+    assert!(lines.contains(&arg1.as_str()), "{text}");
+    assert!(lines.contains(&"ARG2:[END]"), "{text}");
+    if cfg!(unix) {
+        assert!(lines.contains(&"ARGC:3"), "{text}");
+    } else {
+        assert!(lines.contains(&"ARG3:[]"), "{text}");
+    }
+}
+
+#[test]
+fn model_is_passed_as_one_argument() {
+    let mut f = model_fixture();
+    // Default model.
+    let (is_error, text) = run(&mut f.server, &f.work, json!({"prompt": "hello"}));
+    assert!(!is_error, "{text}");
+    assert!(
+        text.starts_with("backend: kic (command), model vendor/model-a.v1\n"),
+        "{text}"
+    );
+    assert_model_arg(&text, "vendor/model-a.v1");
+    assert!(!text.contains("note:"), "{text}");
+    // Requested model (trimmed); a prompt mentioning {model} is not substituted.
+    let (is_error, text) = run(
+        &mut f.server,
+        &f.work,
+        json!({"prompt": "say {model}", "model": " qwen-qwen3-8-27b "}),
+    );
+    assert!(!is_error, "{text}");
+    assert!(
+        text.starts_with("backend: kic (command), model qwen-qwen3-8-27b\n"),
+        "{text}"
+    );
+    assert_model_arg(&text, "qwen-qwen3-8-27b");
+
+    // sidekick_backends shows the models and the default.
+    let res = f.server.call_tool("sidekick_backends", json!({}));
+    let report: Value = serde_json::from_str(&text_of(&res)).unwrap();
+    let find = |name: &str| {
+        report["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let kic = find("kic");
+    assert_eq!(
+        kic["models"],
+        json!(["vendor/model-a.v1", "qwen-qwen3-8-27b"]),
+        "{report}"
+    );
+    assert_eq!(kic["default_model"], "vendor/model-a.v1", "{report}");
+    let bad = find("bad");
+    assert_eq!(bad["models"], Value::Null, "{report}");
+    assert_eq!(bad["default_model"], Value::Null, "{report}");
+
+    // sidekick_status shows the default model and the allowlist.
+    let line = backend_line(&mut f.server, "kic");
+    assert!(
+        line.ends_with("model vendor/model-a.v1, models [vendor/model-a.v1, qwen-qwen3-8-27b]"),
+        "{line}"
+    );
+    drop(f.dir);
+}
+
+#[test]
+fn model_outside_allowlist_is_rejected_without_running() {
+    let mut f = model_fixture();
+    let (is_error, text) = run(
+        &mut f.server,
+        &f.work,
+        json!({"prompt": "hello", "model": "opus", "fallback": "other"}),
+    );
+    assert!(is_error, "{text}");
+    assert!(
+        text.contains("'opus' is not offered by backend 'kic'"),
+        "{text}"
+    );
+    assert!(
+        text.contains("vendor/model-a.v1, qwen-qwen3-8-27b"),
+        "{text}"
+    );
+    // Neither the primary nor the fallback ran.
+    assert!(!text.contains("ARGS-RAN"), "{text}");
+    assert!(!text.contains("fallback after"), "{text}");
+    let logs = f.dir.path().join("logs");
+    let run_logs = std::fs::read_dir(&logs)
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.ends_with(".log") && n != "agent-sidekick.log"
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(run_logs, 0, "a run log was written");
+}
+
+#[test]
+fn fallback_uses_its_default_when_model_not_offered() {
+    let mut f = model_fixture();
+    // `bad` ignores the model (no {model}) and fails; `other` does not offer the model.
+    let (is_error, text) = run(
+        &mut f.server,
+        &f.work,
+        json!({
+            "prompt": "hello",
+            "backend": "bad",
+            "model": "qwen-qwen3-8-27b",
+            "fallback": "other"
+        }),
+    );
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        text.lines().next(),
+        Some("backend: other (command), model only-one — fallback after 'bad' failed: exit_code 3"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "note: model qwen-qwen3-8-27b not offered by other; used its default only-one"
+        ),
+        "{text}"
+    );
+    assert_model_arg(&text, "only-one");
+
+    // The fallback offers the requested model: it is used, no note.
+    let (is_error, text) = run(
+        &mut f.server,
+        &f.work,
+        json!({
+            "prompt": "hello",
+            "backend": "bad",
+            "model": "qwen-qwen3-8-27b",
+            "fallback": "kic"
+        }),
+    );
+    assert!(!is_error, "{text}");
+    assert!(
+        text.starts_with("backend: kic (command), model qwen-qwen3-8-27b — fallback after 'bad'"),
+        "{text}"
+    );
+    assert!(!text.contains("not offered"), "{text}");
+    assert_model_arg(&text, "qwen-qwen3-8-27b");
+}

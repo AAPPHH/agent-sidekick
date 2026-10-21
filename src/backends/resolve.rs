@@ -6,13 +6,19 @@
 //! - `[backends]` present: at least one backend, exactly one with `default = true`.
 //! - `cost` is optional and defaults by type: claude-oauth `quota`, claude-endpoint `paid`,
 //!   command `free`.
+//! - `models` (all types) is an allowlist of model names; `model` is the default and must be
+//!   one of them (without `model` the default is `models[0]`). A command backend needs
+//!   `models` exactly when an argument contains `{model}`.
 //! - All problems are collected and reported together, one per line, each prefixed with
 //!   `backends.<name>: ` (or `backends: ` / `pass_env: ` for cross-backend/global problems).
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use super::{Backend, BackendKind, BackendType, Backends, Cost, RawBackend, IMPLICIT_BACKEND};
+use super::{
+    command_uses_model, Backend, BackendKind, BackendType, Backends, Cost, RawBackend,
+    IMPLICIT_BACKEND,
+};
 use crate::config::Config;
 
 /// Inputs that come from the environment, injected for testability.
@@ -127,6 +133,7 @@ fn implicit_backend(cfg: &Config, defaults: &ResolveDefaults) -> Result<Backend,
             .map(str::trim)
             .filter(|m| !m.is_empty())
             .map(str::to_owned),
+        models: None,
         env: BTreeMap::new(),
         pass_env: Vec::new(),
         implicit: true,
@@ -264,12 +271,7 @@ fn resolve_one(
     }
 
     // Fields that are not allowed for this type.
-    let set_fields: [(&str, bool, &[BackendType]); 8] = [
-        (
-            "model",
-            raw.model.is_some(),
-            &[BackendType::ClaudeOauth, BackendType::ClaudeEndpoint],
-        ),
+    let set_fields: [(&str, bool, &[BackendType]); 7] = [
         (
             "config_dir",
             raw.config_dir.is_some(),
@@ -304,14 +306,7 @@ fn resolve_one(
         }
     }
 
-    let model = match raw.model.as_deref().map(str::trim) {
-        Some("") if kind != BackendType::Command => {
-            errs.push("`model` must not be blank".to_owned());
-            None
-        }
-        Some(m) if kind != BackendType::Command => Some(m.to_owned()),
-        _ => None,
-    };
+    let (model, models) = resolve_models(raw, &mut errs);
 
     let backend_kind = match kind {
         BackendType::ClaudeOauth => {
@@ -384,13 +379,32 @@ fn resolve_one(
                         errs.push("`command` contains a NUL character".to_owned());
                     }
                     // command[0] is the program and is never substituted.
-                    if ["{prompt}", "{cwd}", "{max_turns}"]
-                        .iter()
-                        .any(|p| cmd[0].contains(p))
-                    {
+                    if PLACEHOLDERS.iter().any(|p| cmd[0].contains(p)) {
                         errs.push(
                             "`command[0]` (the program) must not contain a placeholder \
-                             ({prompt}, {cwd}, {max_turns}); only the arguments are substituted"
+                             ({prompt}, {cwd}, {max_turns}, {model}); only the arguments are \
+                             substituted"
+                                .to_owned(),
+                        );
+                    }
+                    // {model} lands in argv: only names from the `models` allowlist.
+                    match (command_uses_model(cmd), raw.models.is_some()) {
+                        (true, false) => errs.push(
+                            "`models` is required when `command` uses `{model}` (the list of \
+                             model names a request may put into the command line)"
+                                .to_owned(),
+                        ),
+                        (false, true) => errs.push(
+                            "`models` has no effect without `{model}` in `command`; add \
+                             `{model}` to an argument or remove `models`"
+                                .to_owned(),
+                        ),
+                        _ => {}
+                    }
+                    if raw.model.is_some() && !command_uses_model(cmd) {
+                        errs.push(
+                            "`model` has no effect without `{model}` in `command`; add \
+                             `{model}` to an argument (with `models`) or remove `model`"
                                 .to_owned(),
                         );
                     }
@@ -434,12 +448,78 @@ fn resolve_one(
         is_default: raw.default.unwrap_or(false),
         max_concurrent: raw.max_concurrent,
         model,
+        models,
         env,
         pass_env,
         implicit: false,
         kind: kind_val,
         foreign_secret_env: Vec::new(),
     })
+}
+
+/// Placeholders of a command template (never allowed in `command[0]`).
+const PLACEHOLDERS: [&str; 4] = ["{prompt}", "{cwd}", "{max_turns}", "{model}"];
+
+/// Problem with one model name, if any. Names may contain inner spaces (some gateways use
+/// display names as ids) but no control characters, no leading/trailing whitespace and no
+/// leading `-` (it could be taken as an option where the name lands in argv).
+fn model_name_problem(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some("must not be blank")
+    } else if name.chars().any(char::is_control) {
+        Some("must not contain control characters")
+    } else if name.trim() != name {
+        Some("must not have leading or trailing whitespace")
+    } else if name.starts_with('-') {
+        Some("must not start with `-`")
+    } else {
+        None
+    }
+}
+
+/// `model` (the default) and `models` (the allowlist) of a backend: every name valid,
+/// `models` non-empty without duplicates, `model` one of `models`. Without `model` the default
+/// is `models[0]`. (The command-specific `{model}` rules are checked with `command`.)
+fn resolve_models(
+    raw: &RawBackend,
+    errs: &mut Vec<String>,
+) -> (Option<String>, Option<Vec<String>>) {
+    let before = errs.len();
+    // `model` keeps its v0.2 behaviour of being trimmed.
+    let model = raw.model.as_deref().map(str::trim);
+    if let Some(m) = model {
+        if let Some(p) = model_name_problem(m) {
+            errs.push(format!("`model` {p}"));
+        }
+    }
+    if let Some(list) = &raw.models {
+        if list.is_empty() {
+            errs.push("`models` must not be empty (omit it to allow any model)".to_owned());
+        }
+        for (i, m) in list.iter().enumerate() {
+            if let Some(p) = model_name_problem(m) {
+                errs.push(format!("`models[{i}]` ({m:?}) {p}"));
+            } else if list[..i].contains(m) {
+                errs.push(format!("`models` lists {m:?} more than once"));
+            }
+        }
+        if let Some(m) = model {
+            if !m.is_empty() && !list.iter().any(|x| x == m) {
+                errs.push(format!(
+                    "`model` {m:?} (the default) must be one of `models`: {}",
+                    list.join(", ")
+                ));
+            }
+        }
+    }
+    if errs.len() != before {
+        return (None, None);
+    }
+    let models = raw.models.clone();
+    let default = model
+        .map(str::to_owned)
+        .or_else(|| models.as_ref().and_then(|l| l.first().cloned()));
+    (default, models)
 }
 
 /// `config_dir` of a claude-* backend: configured (with `~` expanded, must be absolute) or
@@ -998,8 +1078,10 @@ prompt_via_stdin = true
             e.contains("backends.x: field `base_url` is not allowed for type `command`"),
             "{e}"
         );
+        // `model` is allowed for command backends, but only together with `{model}`.
+        assert!(!e.contains("field `model`"), "{e}");
         assert!(
-            e.contains("backends.x: field `model` is not allowed for type `command`"),
+            e.contains("backends.x: `model` has no effect without `{model}` in `command`"),
             "{e}"
         );
         let e = err_of(&one(
@@ -1342,6 +1424,32 @@ prompt_via_stdin = true
             &b.get("kiconnect").unwrap().kind,
             BackendKind::Command { secret_env: Some(v), .. } if v == "OPENAI_API_KEY"
         ));
+        let kic = b.get("kiconnect").unwrap();
+        assert_eq!(
+            kic.models,
+            Some(vec![
+                "openai-gpt-oss-120b".to_owned(),
+                "qwen-qwen3-8-27b".to_owned()
+            ])
+        );
+        assert_eq!(kic.model.as_deref(), Some("openai-gpt-oss-120b"));
+        assert!(!b.get("aider").unwrap().takes_model());
+    }
+
+    /// The provider-per-backend example in the README resolves.
+    #[test]
+    fn readme_kiconnect_example_is_valid() {
+        let readme = include_str!("../../README.md").replace("\r\n", "\n");
+        let start = readme.find("```toml\n[backends.kiconnect]").unwrap() + "```toml\n".len();
+        let end = start + readme[start..].find("```").unwrap();
+        let toml = format!(
+            "{}[backends.s]\ntype = \"claude-oauth\"\ndescription = \"d\"\ndefault = true\n",
+            &readme[start..end]
+        );
+        let b = resolve_str(&toml).unwrap();
+        let kic = b.get("kiconnect").unwrap();
+        assert_eq!(kic.models.as_ref().map(Vec::len), Some(2));
+        assert_eq!(kic.model.as_deref(), Some("openai-gpt-oss-120b"));
     }
 
     #[test]
@@ -1450,6 +1558,146 @@ prompt_via_stdin = true
         }
         let implicit = resolve_str("").unwrap();
         assert!(implicit.default_backend().foreign_secret_env.is_empty());
+    }
+
+    /// A command backend `x` with `command` (TOML array) and `extra` lines.
+    fn cmd_models(command: &str, extra: &str) -> String {
+        one(&format!(
+            "type = \"command\"\ndescription = \"d\"\ncommand = {command}\n{extra}"
+        ))
+    }
+
+    const MODEL_CMD: &str = r#"["aider", "--model", "openai/{model}", "--message", "{prompt}"]"#;
+
+    #[test]
+    fn command_models_and_default() {
+        let b = resolve_str(&cmd_models(
+            MODEL_CMD,
+            "models = [\"openai-gpt-oss-120b\", \"qwen-qwen3-8-27b\", \"Mistral Small 3.2 24B Instruct 2506\"]\n",
+        ))
+        .unwrap();
+        let d = b.default_backend();
+        assert_eq!(d.model.as_deref(), Some("openai-gpt-oss-120b"));
+        assert_eq!(d.models.as_ref().map(Vec::len), Some(3));
+        assert!(d.takes_model());
+        // Explicit default from the list.
+        let b = resolve_str(&cmd_models(
+            MODEL_CMD,
+            "models = [\"a\", \"b\"]\nmodel = \" b \"\n",
+        ))
+        .unwrap();
+        assert_eq!(b.default_backend().model.as_deref(), Some("b"));
+        // Default not in the list.
+        let e = err_of(&cmd_models(
+            MODEL_CMD,
+            "models = [\"a\", \"b\"]\nmodel = \"c\"\n",
+        ));
+        assert_eq!(
+            e,
+            "backends.x: `model` \"c\" (the default) must be one of `models`: a, b"
+        );
+    }
+
+    #[test]
+    fn command_model_placeholder_rules() {
+        // {model} without models.
+        let e = err_of(&cmd_models(MODEL_CMD, ""));
+        assert!(
+            e.contains("`models` is required when `command` uses `{model}`"),
+            "{e}"
+        );
+        // models without {model}.
+        let e = err_of(&cmd_models(
+            "[\"aider\", \"{prompt}\"]",
+            "models = [\"a\"]\n",
+        ));
+        assert!(
+            e.contains("`models` has no effect without `{model}`"),
+            "{e}"
+        );
+        // model without {model}.
+        let e = err_of(&cmd_models("[\"aider\", \"{prompt}\"]", "model = \"a\"\n"));
+        assert!(e.contains("`model` has no effect without `{model}`"), "{e}");
+        // {model} in command[0] is never substituted and is an error; it does not count.
+        let e = err_of(&cmd_models(
+            "[\"agent-{model}\", \"{prompt}\"]",
+            "models = [\"a\"]\n",
+        ));
+        assert!(e.contains("must not contain a placeholder"), "{e}");
+        assert!(e.contains("{model}); only the arguments"), "{e}");
+        assert!(
+            e.contains("`models` has no effect without `{model}`"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn models_name_rules() {
+        let cases: [(&str, &str); 7] = [
+            ("[]", "`models` must not be empty"),
+            ("[\"a\", \"\"]", "`models[1]` (\"\") must not be blank"),
+            ("[\"  \"]", "`models[0]` (\"  \") must not be blank"),
+            ("[\" a\"]", "must not have leading or trailing whitespace"),
+            ("[\"a \"]", "must not have leading or trailing whitespace"),
+            ("[\"-a\"]", "`models[0]` (\"-a\") must not start with `-`"),
+            ("[\"a\\nb\"]", "must not contain control characters"),
+        ];
+        for (list, want) in cases {
+            let e = err_of(&cmd_models(MODEL_CMD, &format!("models = {list}\n")));
+            assert!(e.contains(want), "{list}: {e}");
+        }
+        // Duplicates (case-sensitive).
+        let e = err_of(&cmd_models(MODEL_CMD, "models = [\"a\", \"b\", \"a\"]\n"));
+        assert_eq!(e, "backends.x: `models` lists \"a\" more than once");
+        assert!(resolve_str(&cmd_models(MODEL_CMD, "models = [\"a\", \"A\"]\n")).is_ok());
+        // The default model follows the same rules.
+        let e = err_of(&one(
+            "type = \"claude-oauth\"\ndescription = \"d\"\nmodel = \"--dangerously\"\n",
+        ));
+        assert_eq!(e, "backends.x: `model` must not start with `-`");
+        let e = err_of(&one(
+            "type = \"claude-oauth\"\ndescription = \"d\"\nmodel = \"a\\tb\"\n",
+        ));
+        assert!(e.contains("control characters"), "{e}");
+    }
+
+    #[test]
+    fn claude_models_allowlist_is_optional() {
+        let b = resolve_str(&one(
+            "type = \"claude-oauth\"\ndescription = \"d\"\nmodels = [\"opus\", \"sonnet\"]\n",
+        ))
+        .unwrap();
+        let d = b.default_backend();
+        assert_eq!(d.model.as_deref(), Some("opus"));
+        assert_eq!(d.models, Some(vec!["opus".to_owned(), "sonnet".to_owned()]));
+        assert!(d.effective_model(Some("haiku")).is_err());
+        assert_eq!(
+            d.effective_model(Some("sonnet")).unwrap().as_deref(),
+            Some("sonnet")
+        );
+        // Without models any model is accepted, and there may be no default.
+        let b = resolve_str(&one("type = \"claude-oauth\"\ndescription = \"d\"\n")).unwrap();
+        let d = b.default_backend();
+        assert_eq!((d.model.as_deref(), d.models.as_ref()), (None, None));
+        assert_eq!(
+            d.effective_model(Some("fable")).unwrap().as_deref(),
+            Some("fable")
+        );
+        assert_eq!(d.effective_model(None).unwrap(), None);
+        // Endpoint: default must be in the list.
+        let e = err_of(&one(
+            "type = \"claude-endpoint\"\ndescription = \"d\"\nbase_url = \"http://h\"\n\
+             models = [\"qwen3-coder\"]\nmodel = \"other\"\n",
+        ));
+        assert!(e.contains("must be one of `models`: qwen3-coder"), "{e}");
+    }
+
+    #[test]
+    fn command_without_model_placeholder_ignores_model() {
+        let b = resolve_str(&cmd_with("")).unwrap();
+        let d = b.default_backend();
+        assert!(!d.takes_model());
+        assert_eq!(d.effective_model(Some("anything")).unwrap(), None);
     }
 
     #[test]

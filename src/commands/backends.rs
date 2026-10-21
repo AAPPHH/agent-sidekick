@@ -16,6 +16,8 @@ use crate::APP_NAME;
 
 /// Width the DESCRIPTION column is truncated to.
 pub const DESCRIPTION_WIDTH: usize = 60;
+/// Width the MODELS column is truncated to.
+pub const MODELS_WIDTH: usize = 40;
 /// At most this many reachability checks run at the same time.
 const CHECK_PARALLELISM: usize = 8;
 
@@ -125,7 +127,7 @@ pub fn truncate(text: &str, width: usize) -> String {
 /// The `backends list` table. With `reach` (same order as `backends.iter()`), REACHABLE and
 /// DETAIL columns are added.
 pub fn format_table(backends: &Backends, reach: Option<&[Reachability]>) -> String {
-    let mut header = vec!["NAME", "TYPE", "COST", "DEFAULT", "DESCRIPTION"];
+    let mut header = vec!["NAME", "TYPE", "COST", "DEFAULT", "MODELS", "DESCRIPTION"];
     if reach.is_some() {
         header.extend(["REACHABLE", "DETAIL"]);
     }
@@ -136,6 +138,7 @@ pub fn format_table(backends: &Backends, reach: Option<&[Reachability]>) -> Stri
             b.backend_type().to_string(),
             b.cost.to_string(),
             if b.is_default { "*" } else { "" }.to_owned(),
+            truncate(&models_cell(b), MODELS_WIDTH),
             truncate(&redact_all(&b.description), DESCRIPTION_WIDTH),
         ];
         if let Some(r) = reach.and_then(|r| r.get(i)) {
@@ -145,6 +148,28 @@ pub fn format_table(backends: &Backends, reach: Option<&[Reachability]>) -> Stri
         rows.push(row);
     }
     render_rows(&rows)
+}
+
+/// The MODELS cell: the default model first, marked with `*`, then the rest of the
+/// allowlist; `(any)` where a claude-* backend accepts any model; `-` for a command backend
+/// that takes no model.
+pub fn models_cell(b: &Backend) -> String {
+    if !b.takes_model() {
+        return "-".to_owned();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = &b.model {
+        parts.push(format!("{d}*"));
+    }
+    match &b.models {
+        Some(list) => parts.extend(
+            list.iter()
+                .filter(|m| Some(*m) != b.model.as_ref())
+                .cloned(),
+        ),
+        None => parts.push("(any)".to_owned()),
+    }
+    parts.join(", ")
 }
 
 /// Left-aligned columns separated by two spaces; the last column is not padded.
@@ -293,8 +318,22 @@ pub fn describe(backend: &Backend) -> Vec<String> {
     if let Some(n) = backend.max_concurrent {
         lines.push(format!("max_concurrent: {n}"));
     }
-    if let Some(m) = &backend.model {
-        lines.push(format!("model:       {m}"));
+    if backend.takes_model() {
+        lines.push(match (&backend.model, &backend.kind) {
+            (Some(m), _) => format!("model:       {m} (default)"),
+            (None, BackendKind::ClaudeEndpoint { .. }) => {
+                "model:       the endpoint's default".to_owned()
+            }
+            (None, _) => "model:       the account's default".to_owned(),
+        });
+        lines.push(match &backend.models {
+            Some(list) => format!("models:      {} (allowlist)", list.join(", ")),
+            None => "models:      any (no allowlist)".to_owned(),
+        });
+    } else {
+        lines.push(
+            "models:      none (no {model} in command; a requested model is ignored)".to_owned(),
+        );
     }
     match &backend.kind {
         BackendKind::ClaudeOauth { config_dir } => {
@@ -392,6 +431,7 @@ pub(crate) mod tests {
             is_default,
             max_concurrent: None,
             model: None,
+            models: None,
             env: BTreeMap::new(),
             pass_env: Vec::new(),
             implicit: false,
@@ -569,6 +609,77 @@ pub(crate) mod tests {
         );
         let text = describe(&command("aider", false)).join("\n");
         assert!(!text.contains("secret_env"), "{text}");
+    }
+
+    /// A command backend with `{model}` offering `models`, default `default`.
+    fn command_with_models(name: &str, models: &[&str], default: &str) -> Backend {
+        let mut b = backend(
+            name,
+            BackendKind::Command {
+                command: vec![
+                    "aider".into(),
+                    "--model".into(),
+                    "openai/{model}".into(),
+                    "{prompt}".into(),
+                ],
+                prompt_via_stdin: false,
+                secret_env: None,
+            },
+            false,
+        );
+        b.models = Some(models.iter().map(|m| (*m).to_owned()).collect());
+        b.model = Some(default.to_owned());
+        b
+    }
+
+    #[test]
+    fn models_column_and_describe() {
+        let kic = command_with_models("kic", &["gpt-oss", "qwen", "mistral"], "qwen");
+        assert_eq!(models_cell(&kic), "qwen*, gpt-oss, mistral");
+        assert_eq!(models_cell(&command("aider", false)), "-");
+        assert_eq!(models_cell(&oauth("s", true)), "(any)");
+        let mut o = oauth("s", true);
+        o.model = Some("opus".into());
+        assert_eq!(models_cell(&o), "opus*, (any)");
+        o.models = Some(vec!["sonnet".into(), "opus".into()]);
+        assert_eq!(models_cell(&o), "opus*, sonnet");
+
+        let table = format_table(&Backends::new(vec![kic.clone(), oauth("s", true)]), None);
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(lines[0].contains("  MODELS  "), "{table}");
+        let col = lines[0].find("MODELS").unwrap();
+        let kic_line = lines.iter().find(|l| l.starts_with("kic")).unwrap();
+        assert!(
+            kic_line[col..].starts_with("qwen*, gpt-oss, mistral"),
+            "{table}"
+        );
+        // Long lists are truncated.
+        let many: Vec<String> = (0..20).map(|i| format!("model-number-{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let mut long = command_with_models("long", &refs, "model-number-0");
+        long.is_default = true;
+        let table = format_table(&Backends::new(vec![long]), None);
+        assert!(table.contains("model-number-0*, model-number-1"), "{table}");
+        assert!(table.contains("..."), "{table}");
+        assert!(!table.contains("model-number-19"), "{table}");
+
+        let text = describe(&kic).join("\n");
+        assert!(text.contains("model:       qwen (default)"), "{text}");
+        assert!(
+            text.contains("models:      gpt-oss, qwen, mistral (allowlist)"),
+            "{text}"
+        );
+        let text = describe(&oauth("s", true)).join("\n");
+        assert!(
+            text.contains("model:       the account's default"),
+            "{text}"
+        );
+        assert!(text.contains("models:      any (no allowlist)"), "{text}");
+        let text = describe(&command("aider", false)).join("\n");
+        assert!(
+            text.contains("models:      none (no {model} in command"),
+            "{text}"
+        );
     }
 
     #[test]

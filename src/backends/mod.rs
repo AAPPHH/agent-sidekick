@@ -106,8 +106,13 @@ pub struct RawBackend {
     pub default: Option<bool>,
     pub cost: Option<Cost>,
     pub max_concurrent: Option<usize>,
-    /// Default model for claude-* backends (`--model`); not allowed for `command`.
+    /// Default model: claude-* `--model`; command: the value of `{model}` when the request
+    /// names none. Must be one of `models` when both are set.
     pub model: Option<String>,
+    /// Models the backend offers (an allowlist for the request's `model`; the first one is
+    /// the default when `model` is not set). Required for a command backend whose command
+    /// uses `{model}`.
+    pub models: Option<Vec<String>>,
     /// Extra, non-secret environment variables for the child (all types).
     pub env: Option<BTreeMap<String, String>>,
     /// Inherited variables to keep for this backend although they would be removed.
@@ -120,7 +125,8 @@ pub struct RawBackend {
     pub api_key_env: Option<String>,
     /// claude-endpoint: how the key is sent.
     pub auth: Option<EndpointAuth>,
-    /// command: program and arguments; placeholders `{prompt}`, `{cwd}`, `{max_turns}`.
+    /// command: program and arguments; placeholders `{prompt}`, `{cwd}`, `{max_turns}`,
+    /// `{model}`.
     pub command: Option<Vec<String>>,
     /// command: send the prompt on stdin instead of via `{prompt}`.
     pub prompt_via_stdin: Option<bool>,
@@ -138,8 +144,12 @@ pub struct Backend {
     pub is_default: bool,
     /// Per-backend concurrency limit (in addition to the global one).
     pub max_concurrent: Option<usize>,
-    /// Default model (claude-* only).
+    /// Default model (claude-*: `--model`; command: the value of `{model}`). With `models`
+    /// it is always one of them.
     pub model: Option<String>,
+    /// Allowlist of models a request may choose (`None`: claude-* accepts any model; a
+    /// command backend without `{model}` takes no model).
+    pub models: Option<Vec<String>>,
     pub env: BTreeMap<String, String>,
     pub pass_env: Vec<String>,
     /// True for the implicit `sidekick` backend created when `[backends]` is absent.
@@ -181,6 +191,40 @@ impl Backend {
         }
     }
 
+    /// Whether a run on this backend uses a model: claude-* always (`--model` or the
+    /// account's/endpoint's default), a command backend only with `{model}` in its command.
+    pub fn takes_model(&self) -> bool {
+        match &self.kind {
+            BackendKind::Command { command, .. } => command_uses_model(command),
+            _ => true,
+        }
+    }
+
+    /// The model a run uses for the caller's `requested` model (trimmed, blank = none):
+    /// the requested one or the backend's default. `Ok(None)`: no model is passed (claude-*
+    /// without default, or a command backend without `{model}`, which ignores a model).
+    /// `Err`: the requested model is not in the backend's allowlist (user-facing message).
+    pub fn effective_model(&self, requested: Option<&str>) -> Result<Option<String>, String> {
+        if !self.takes_model() {
+            return Ok(None);
+        }
+        let requested = requested.map(str::trim).filter(|m| !m.is_empty());
+        let Some(m) = requested else {
+            return Ok(self.model.clone());
+        };
+        match &self.models {
+            Some(list) if !list.iter().any(|x| x == m) => Err(format!(
+                "Invalid parameter 'model': '{m}' is not offered by backend '{}'. Allowed \
+                 models: {} (default {}). Choose one of them or omit 'model'; see \
+                 sidekick_backends.",
+                self.name,
+                list.join(", "),
+                self.model.as_deref().unwrap_or("-")
+            )),
+            _ => Ok(Some(m.to_owned())),
+        }
+    }
+
     /// The secret this backend reads from the keyring/file store, if any.
     /// claude-endpoint with `api_key_env` reads the environment instead (`None`); a command
     /// backend has one only with `secret_env`.
@@ -198,6 +242,12 @@ impl Backend {
             _ => None,
         }
     }
+}
+
+/// Whether a command template uses `{model}` in an argument (`command[0]` is never
+/// substituted).
+pub fn command_uses_model(command: &[String]) -> bool {
+    command.iter().skip(1).any(|a| a.contains("{model}"))
 }
 
 /// All configured backends (at least one, exactly one default), sorted by name.

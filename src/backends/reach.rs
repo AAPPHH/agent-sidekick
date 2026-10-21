@@ -563,6 +563,7 @@ mod tests {
             is_default: true,
             max_concurrent: None,
             model: None,
+            models: None,
             env: BTreeMap::new(),
             pass_env: Vec::new(),
             implicit: false,

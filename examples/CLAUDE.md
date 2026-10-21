@@ -6,7 +6,12 @@ These rules are for the main Claude Code session. Adapt the backend names to you
 configure and add one for every other backend you do).
 
 - Before the first delegation in a session, call `sidekick_backends` and read each backend's
-  `description`, `cost` and `reachable`. Do not delegate to a backend that is not reachable.
+  `description`, `cost`, `reachable`, `models` and `default_model`. Do not delegate to a
+  backend that is not reachable.
+- Pick the backend and then the model: pass `model` only with a name from that backend's
+  `models` (anything else is rejected and nothing runs), or omit it to use its
+  `default_model`. A backend with `models: null` either accepts any Claude model (claude-*
+  backends, e.g. `sonnet`, `opus`) or takes no model (command backends).
 - Choose the backend by task:
   - `local` (free, local model): boilerplate, test scaffolding, docstrings/comments,
     mechanical refactors (renames, moving code, applying a pattern you have already
@@ -19,7 +24,10 @@ configure and add one for every other backend you do).
     without asking and without git): boilerplate, tests and small, well-specified changes
     when `local` is unavailable or too slow. Only reachable once its key is stored. The
     prompt goes to a hosted service, so do not use it for confidential code. Review the diff
-    afterwards.
+    afterwards. Models: `openai-gpt-oss-120b` (default, general tasks) and
+    `qwen-qwen3-8-27b` (code-heavy tasks).
+  - On `sidekick`, use the default model for routine work and `model: "opus"` only for the
+    hardest tasks.
   - Keep work you need to judge carefully (security, data migrations, public APIs) in this
     session.
 - Always pass `cwd` (absolute path of the project). The server's own working directory is
@@ -36,4 +44,5 @@ configure and add one for every other backend you do).
   bulk work; do not fan out many parallel `sidekick` runs.
 - After a delegated run, read the result (exit code, output tail) and verify the change
   yourself (diff, tests) before building on it. The first line of the result names the
-  backend that actually ran.
+  backend and model that actually ran; after a fallback, a note says when the fallback did
+  not offer the requested model and used its default instead.

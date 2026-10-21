@@ -35,11 +35,11 @@ const INSTRUCTIONS: &str = "agent-sidekick delegates work to a separate, headles
 default a second Claude Code instance with its own account, optionally other configured \
 backends (a local model behind an Anthropic-compatible endpoint, or another agent CLI). Call \
 `sidekick_backends` to see the configured backends with their description, cost and \
-reachability, and pick one by its description and cost. Use `sidekick_run` to hand off a \
-self-contained prompt (optionally with `backend` and a `fallback`); it runs in the given \
-working directory and returns which backend ran, exit code, log path and the tail of the \
-output. Use `sidekick_status` to see running/queued jobs per backend and diagnose setup \
-problems. If a run fails because no token or key is stored, ask the user to run \
+reachability, and pick one by its description and cost, and a model from its `models`. Use \
+`sidekick_run` to hand off a self-contained prompt (optionally with `backend`, `model` and a \
+`fallback`); it runs in the given working directory and returns which backend and model ran, \
+exit code, log path and the tail of the output. Use `sidekick_status` to see running/queued \
+jobs per backend and diagnose setup problems. If a run fails because no token or key is stored, ask the user to run \
 `agent-sidekick setup` (or `agent-sidekick setup --backend <name>`) in a terminal.";
 
 /// Upper bound for all reachability checks of one `sidekick_backends` call.
@@ -77,8 +77,12 @@ pub struct RunParams {
     pub cwd: Option<String>,
     /// Maximum number of agentic turns (1-200). Default: from config.toml (30 unless configured).
     pub max_turns: Option<u32>,
-    /// Model for the agent, e.g. "sonnet" or "opus". Default: the backend's model from
-    /// config.toml, else the account's/endpoint's default. Ignored by command backends.
+    /// Model for the agent: selects among the models the backend offers (see
+    /// sidekick_backends: `models`, `default_model`). Validated against the backend's
+    /// allowlist when it has one (an unlisted model is an error; nothing runs). Default: the
+    /// backend's `default_model`, else the account's/endpoint's default. A backend with
+    /// `models: null` accepts any model if it is a Claude backend (e.g. "sonnet", "opus") and
+    /// ignores the model if it is a command backend.
     pub model: Option<String>,
     /// Tools the agent may use without asking, e.g. ["Read", "Edit", "Bash(git:*)"].
     /// Default: Claude Code's defaults for headless mode. Ignored by command backends.
@@ -366,11 +370,50 @@ fn backend_label(b: &Backend) -> String {
     format!("{} ({})", b.name, b.backend_type())
 }
 
+/// [`backend_label`] plus `, model <m>` when the run on `b` uses a model (the requested one
+/// or the backend's default); nothing when the backend has no default and none was requested
+/// or ignores the model (command backend without `{model}`).
+fn run_label(b: &Backend, req: &RunRequest) -> String {
+    match b.effective_model(req.model.as_deref()) {
+        Ok(Some(m)) => format!("{}, model {m}", backend_label(b)),
+        _ => backend_label(b),
+    }
+}
+
+/// The request for the fallback attempt on `fb`: the caller's model if `fb` offers it,
+/// otherwise `fb`'s default model, with a note for the result.
+fn fallback_request(fb: &Backend, req: &RunRequest) -> (RunRequest, Option<String>) {
+    match (fb.effective_model(req.model.as_deref()), &req.model) {
+        (Err(_), Some(m)) => {
+            let fb_req = RunRequest {
+                model: None,
+                ..req.clone()
+            };
+            let default = fb.model.as_deref().unwrap_or("(none)");
+            let note = format!(
+                "note: model {m} not offered by {}; used its default {default}",
+                fb.name
+            );
+            (fb_req, Some(note))
+        }
+        _ => (req.clone(), None),
+    }
+}
+
 /// Result text of an attempt on `backend` that ended as [`Attempt::Stopped`] (cancelled while
 /// queued, server shutdown, working directory gone, wait error): the backend line, the reason
 /// and, if a fallback was requested, why it was not used.
-fn stopped_text(backend: &Backend, reason: &str, fallback: Option<&Backend>) -> String {
-    let mut s = format!("backend: {}\n{}", backend_label(backend), reason.trim_end());
+fn stopped_text(
+    backend: &Backend,
+    req: &RunRequest,
+    reason: &str,
+    fallback: Option<&Backend>,
+) -> String {
+    let mut s = format!(
+        "backend: {}\n{}",
+        run_label(backend, req),
+        reason.trim_end()
+    );
     if let Some(fb) = fallback {
         let _ = write!(
             s,
@@ -394,7 +437,7 @@ fn format_run_result(
     let mut s = String::new();
     match fallback_from {
         None => {
-            let _ = writeln!(s, "backend: {}", backend_label(ran));
+            let _ = writeln!(s, "backend: {}", run_label(ran, req));
         }
         Some((primary, attempt)) => {
             let reason = match attempt {
@@ -404,7 +447,7 @@ fn format_run_result(
             let _ = writeln!(
                 s,
                 "backend: {} — fallback after '{}' failed: {reason}",
-                backend_label(ran),
+                run_label(ran, req),
                 primary.name
             );
             if let Attempt::Ran(o) = attempt {
@@ -422,10 +465,8 @@ fn format_run_result(
     for line in extra_lines {
         let _ = writeln!(s, "{line}");
     }
-    if ran.backend_type() == BackendType::Command
-        && (req.model.is_some() || req.allowed_tools.is_some())
-    {
-        s.push_str("note: model/allowed_tools were ignored (command backend)\n");
+    if let Some(what) = backends::launch::command_ignored(ran, req) {
+        let _ = writeln!(s, "note: {what} ignored (command backend)");
     }
     s.push_str(&format_outcome(outcome, req.timeout));
     s
@@ -465,6 +506,12 @@ struct BackendInfo {
     description: String,
     cost: &'static str,
     default: bool,
+    /// Allowlist of models (`null`: claude-* accepts any model, a command backend without
+    /// `{model}` takes none).
+    models: Option<Vec<String>>,
+    /// Model used when the request names none (`null`: the account's/endpoint's default, or
+    /// none for a command backend without `{model}`).
+    default_model: Option<String>,
     reachable: bool,
     detail: String,
     max_concurrent: Option<usize>,
@@ -757,7 +804,8 @@ impl SidekickServer {
     /// Delegate a prompt to a separate, headless agent. By default this is a
     /// headless Claude Code instance that runs with its own account (not the caller's);
     /// `backend` selects another configured backend (see sidekick_backends: choose by
-    /// description and cost), `fallback` names a backend to use if the chosen one is unreachable, lacks credentials,
+    /// description and cost) and `model` one of that backend's models (validated against its
+    /// allowlist), `fallback` names a backend to use if the chosen one is unreachable, lacks credentials,
     /// fails to start or exits with an error (not after a timeout; the fallback gets its own
     /// timeout_s, so the request can take up to about 2x timeout_s). The agent runs in `cwd`
     /// with the given limits and cannot see this conversation, so the prompt must be
@@ -802,6 +850,10 @@ impl SidekickServer {
             Ok(sel) => sel,
             Err(msg) => return tool_error(msg),
         };
+        // A model the primary does not offer is an invalid parameter: no run, no fallback.
+        if let Err(msg) = primary.effective_model(req.model.as_deref()) {
+            return tool_error(msg);
+        }
         let timeout = req.timeout;
 
         let (cancel, _forward) = run_cancel_token(&ctx.ct, &state.shutdown);
@@ -835,12 +887,19 @@ impl SidekickServer {
                 );
                 // The fallback gets its own queue wait and its own full timeout.
                 with_phase(&phase, |p| *p = RunPhase::fallback(&fb.name));
+                let (fb_req, model_note) = fallback_request(fb, &req);
                 let second = self
-                    .attempt(fb, &req, &cancel, &ctx.ct, &phase, &mut secrets)
+                    .attempt(fb, &fb_req, &cancel, &ctx.ct, &phase, &mut secrets)
                     .await;
                 match (second, &first) {
                     (Attempt::Ran(o), _) => (
-                        format_run_result(fb, &o, &req, Some((primary, &first)), &[]),
+                        format_run_result(
+                            fb,
+                            &o,
+                            &fb_req,
+                            Some((primary, &first)),
+                            model_note.as_slice(),
+                        ),
                         outcome_is_error(&o),
                     ),
                     (Attempt::NotStarted(r) | Attempt::Stopped(r), Attempt::Ran(o)) => {
@@ -879,16 +938,18 @@ impl SidekickServer {
                 ),
                 true,
             ),
-            (Attempt::Stopped(r), fb) => (stopped_text(primary, &r, fb), true),
+            (Attempt::Stopped(r), fb) => (stopped_text(primary, &req, &r, fb), true),
         };
         drop(ticker);
         Ok(text_result(redact_with(&secrets, &text), is_error))
     }
 
     /// List the configured backends the agent can run on, as JSON: name, type, description,
-    /// cost (free | quota | paid), default, reachable (with a detail), max_concurrent and the
-    /// current running/queued runs. Choose a backend for `sidekick_run` by its description and
-    /// cost; without `backend`, sidekick_run uses the default one. Never shows secrets.
+    /// cost (free | quota | paid), default, models (the models the backend offers, or null),
+    /// default_model, reachable (with a detail), max_concurrent and the current running/queued
+    /// runs. Pick the backend for `sidekick_run` by its description and cost, and the model
+    /// from that backend's `models` (or omit `model` to use its `default_model`); without
+    /// `backend`, sidekick_run uses the default one. Never shows secrets.
     #[tool]
     async fn sidekick_backends(&self) -> Result<CallToolResult, McpError> {
         let report = self.backends_report().await;
@@ -1050,7 +1111,7 @@ impl SidekickServer {
             backend_type = %ty,
             cwd = %req.cwd.display(),
             max_turns = req.max_turns,
-            model = ?req.model,
+            model = ?backend.effective_model(req.model.as_deref()).ok().flatten(),
             timeout_s = req.timeout.as_secs(),
             prompt_chars = req.prompt.chars().count(),
             "sidekick_run started"
@@ -1132,6 +1193,8 @@ impl SidekickServer {
                 description: b.description.clone(),
                 cost: b.cost.as_str(),
                 default: b.is_default,
+                models: b.models.clone(),
+                default_model: b.effective_model(None).ok().flatten(),
                 reachable,
                 detail: redact_all(&detail),
                 max_concurrent: b.max_concurrent,
@@ -1232,13 +1295,21 @@ impl SidekickServer {
                         }
                         backends::BackendKind::Command { .. } => None,
                     };
+                    let allowlist = b
+                        .models
+                        .as_ref()
+                        .map(|l| format!(", models [{}]", l.join(", ")))
+                        .unwrap_or_default();
                     if let Some((fallback_model, config_dir)) = claude {
                         let _ = write!(
                             s,
-                            ", model {}, config_dir {}",
+                            ", model {}{allowlist}, config_dir {}",
                             non_blank(b.model.as_deref()).unwrap_or(fallback_model),
                             config_dir.display()
                         );
+                    } else if let Some(m) = &b.model {
+                        // A command backend with `{model}` (it then always has a default).
+                        let _ = write!(s, ", model {m}{allowlist}");
                     }
                     s.push('\n');
                 }
@@ -1714,13 +1785,18 @@ mod tests {
     #[test]
     fn stopped_result_names_backend() {
         let primary = command("aider");
-        let text = stopped_text(&primary, "Working directory does not exist: /x.\n", None);
+        let text = stopped_text(
+            &primary,
+            &request(None),
+            "Working directory does not exist: /x.\n",
+            None,
+        );
         assert_eq!(
             text,
             "backend: aider (command)\nWorking directory does not exist: /x."
         );
         let fb = endpoint("local");
-        let text = stopped_text(&primary, CANCELLED_QUEUED_MSG, Some(&fb));
+        let text = stopped_text(&primary, &request(None), CANCELLED_QUEUED_MSG, Some(&fb));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "backend: aider (command)");
         assert_eq!(lines[1], CANCELLED_QUEUED_MSG);
@@ -1782,6 +1858,7 @@ mod tests {
             is_default,
             max_concurrent: None,
             model: None,
+            models: None,
             env: Default::default(),
             pass_env: Vec::new(),
             implicit: false,
@@ -1939,12 +2016,121 @@ mod tests {
         );
         assert!(!text.contains("primary:"), "{text}");
         assert!(
-            text.contains("note: model/allowed_tools were ignored (command backend)"),
+            text.contains("note: model ignored (command backend)"),
             "{text}"
         );
-        // No note for claude backends.
+        // No note for claude backends; the first line names the model.
         let text = format_run_result(&primary, &ok, &request(Some("opus")), None, &[]);
         assert!(!text.contains("note:"), "{text}");
+        assert!(
+            text.starts_with("backend: sidekick (claude-oauth), model opus\n"),
+            "{text}"
+        );
+    }
+
+    /// A command backend with `{model}` offering `models` (default: the first).
+    fn command_with_models(name: &str, models: &[&str]) -> Backend {
+        let mut b = command(name);
+        b.kind = backends::BackendKind::Command {
+            command: vec!["agent".into(), "--model={model}".into(), "{prompt}".into()],
+            prompt_via_stdin: false,
+            secret_env: None,
+        };
+        b.models = Some(models.iter().map(|m| (*m).to_owned()).collect());
+        b.model = Some(models[0].to_owned());
+        b
+    }
+
+    #[test]
+    fn first_line_includes_effective_model() {
+        let ok = outcome(Some(0), false);
+        let kic = command_with_models("kic", &["gpt-oss", "qwen"]);
+        let text = format_run_result(&kic, &ok, &request(None), None, &[]);
+        assert!(
+            text.starts_with("backend: kic (command), model gpt-oss\nexit_code: 0\n"),
+            "{text}"
+        );
+        let text = format_run_result(&kic, &ok, &request(Some("qwen")), None, &[]);
+        assert!(
+            text.starts_with("backend: kic (command), model qwen\n"),
+            "{text}"
+        );
+        // Claude backend: its default, or nothing when it has none.
+        let mut local = endpoint("local");
+        local.model = Some("qwen3-coder".into());
+        let text = format_run_result(&local, &ok, &request(None), None, &[]);
+        assert!(
+            text.starts_with("backend: local (claude-endpoint), model qwen3-coder\n"),
+            "{text}"
+        );
+        let text = format_run_result(&oauth("s", true), &ok, &request(None), None, &[]);
+        assert!(text.starts_with("backend: s (claude-oauth)\n"), "{text}");
+        // A command backend without {model} ignores the model: not on the first line.
+        let text = format_run_result(&command("aider"), &ok, &request(Some("x")), None, &[]);
+        assert!(text.starts_with("backend: aider (command)\n"), "{text}");
+        let text = stopped_text(&kic, &request(None), "stopped", None);
+        assert!(
+            text.starts_with("backend: kic (command), model gpt-oss\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn allowlist_and_fallback_model() {
+        let kic = command_with_models("kic", &["gpt-oss", "qwen"]);
+        // Primary check (done in sidekick_run before anything starts).
+        let e = kic.effective_model(Some("opus")).unwrap_err();
+        assert!(e.contains("Invalid parameter 'model'"), "{e}");
+        assert!(e.contains("'opus' is not offered by backend 'kic'"), "{e}");
+        assert!(
+            e.contains("Allowed models: gpt-oss, qwen (default gpt-oss)"),
+            "{e}"
+        );
+        assert_eq!(
+            kic.effective_model(Some(" qwen ")).unwrap().as_deref(),
+            Some("qwen")
+        );
+        assert_eq!(
+            kic.effective_model(None).unwrap().as_deref(),
+            Some("gpt-oss")
+        );
+        // Fallback that does not offer the requested model: its default, with a note.
+        let (fb_req, note) = fallback_request(&kic, &request(Some("opus")));
+        assert_eq!(fb_req.model, None);
+        assert_eq!(
+            note.as_deref(),
+            Some("note: model opus not offered by kic; used its default gpt-oss")
+        );
+        let ok = outcome(Some(0), false);
+        let first = Attempt::NotStarted("down".into());
+        let primary = oauth("sidekick", true);
+        let text = format_run_result(
+            &kic,
+            &ok,
+            &fb_req,
+            Some((&primary, &first)),
+            note.as_slice(),
+        );
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next(),
+            Some("backend: kic (command), model gpt-oss — fallback after 'sidekick' failed: down")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("note: model opus not offered by kic; used its default gpt-oss")
+        );
+        // Offered model, or no model requested: unchanged, no note.
+        let (fb_req, note) = fallback_request(&kic, &request(Some("qwen")));
+        assert_eq!((fb_req.model.as_deref(), note), (Some("qwen"), None));
+        let (fb_req, note) = fallback_request(&kic, &request(None));
+        assert_eq!((fb_req.model, note), (None, None));
+        // Claude backend without allowlist accepts any model; a command backend without
+        // {model} ignores it (and keeps it for the "ignored" note).
+        let (fb_req, note) = fallback_request(&endpoint("local"), &request(Some("opus")));
+        assert_eq!((fb_req.model.as_deref(), note), (Some("opus"), None));
+        let (fb_req, note) = fallback_request(&command("aider"), &request(Some("opus")));
+        assert_eq!((fb_req.model.as_deref(), note), (Some("opus"), None));
     }
 
     #[test]
