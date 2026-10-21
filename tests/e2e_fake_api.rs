@@ -169,7 +169,6 @@ fn oauth_token_reaches_fake_api_and_is_not_leaked() {
 /// The inherited VS Code session variables must not reach the child (session isolation in
 /// the backends launch code).
 #[test]
-#[ignore = "enable after wave-2 merge"]
 fn oauth_child_does_not_inherit_session_identity() {
     let Some(claude) = e2e_claude("oauth_child_does_not_inherit_session_identity") else {
         return;
@@ -288,7 +287,6 @@ fn endpoint_case(test: &str, auth: Option<&str>) -> Option<(FakeApi, Vec<Record>
 
 /// Test B: claude-endpoint with the default `x-api-key` auth.
 #[test]
-#[ignore = "enable after wave-2 merge"]
 fn endpoint_backend_sends_api_key_and_no_oauth_token() {
     let Some((fake, _)) = endpoint_case("endpoint_backend_sends_api_key_and_no_oauth_token", None)
     else {
@@ -310,7 +308,6 @@ fn endpoint_backend_sends_api_key_and_no_oauth_token() {
 
 /// Test C: claude-endpoint with `auth = "bearer"` (ANTHROPIC_AUTH_TOKEN).
 #[test]
-#[ignore = "enable after wave-2 merge"]
 fn endpoint_backend_bearer_auth() {
     let Some((fake, _)) = endpoint_case("endpoint_backend_bearer_auth", Some("bearer")) else {
         return;
