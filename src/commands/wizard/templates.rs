@@ -278,7 +278,10 @@ mod tests {
             merged.contains("\"~/.claude-sidekick\"\n\n# KI:connect.nrw"),
             "{merged}"
         );
-        assert!(merged.contains("\n\n# The second Claude account"), "{merged}");
+        assert!(
+            merged.contains("\n\n# The second Claude account"),
+            "{merged}"
+        );
         assert!(!merged.contains("\n\n\n"), "{merged}");
         // Sections without a leading empty line get one; no doubled empty lines.
         assert_eq!(

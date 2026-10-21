@@ -203,7 +203,10 @@ mod tests {
     fn source_labels_are_german() {
         assert_eq!(
             source_label(&TokenSource::File(PathBuf::from("x").join("token"))),
-            format!("in der Datei {}", PathBuf::from("x").join("token").display())
+            format!(
+                "in der Datei {}",
+                PathBuf::from("x").join("token").display()
+            )
         );
         assert!(source_label(&TokenSource::Keyring).starts_with("im Schlüsselbund"));
         assert!(source_label(&TokenSource::Env).starts_with("in der Umgebungsvariable"));

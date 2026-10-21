@@ -689,7 +689,10 @@ fn gemini_without_npm_is_skipped_with_one_hint() {
     fake.npm = None;
     *fake.gemini.borrow_mut() = None;
     let (_, out) = run_ok(&fake, vec![A::Many(vec![1, 2]), A::Secret(CLAUDE_TOKEN)]);
-    assert!(out.contains("npm wurde neben Node.js nicht gefunden"), "{out}");
+    assert!(
+        out.contains("npm wurde neben Node.js nicht gefunden"),
+        "{out}"
+    );
     assert!(out.contains("Gemini wird übersprungen"), "{out}");
     // The manual command is named once, and the wizard does not tell the user to start
     // over while it keeps going.
