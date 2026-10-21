@@ -121,7 +121,12 @@ fn implicit_backend(cfg: &Config, defaults: &ResolveDefaults) -> Result<Backend,
         cost: Cost::Quota,
         is_default: true,
         max_concurrent: None,
-        model: cfg.default_model.clone(),
+        model: cfg
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned),
         env: BTreeMap::new(),
         pass_env: Vec::new(),
         implicit: true,
