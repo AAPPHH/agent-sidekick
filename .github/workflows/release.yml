@@ -28,7 +28,7 @@ jobs:
     name: tag matches Cargo.toml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Compare tag and package version
         run: |
@@ -64,7 +64,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # `targets` performs the `rustup target add`.
       - uses: dtolnay/rust-toolchain@stable
@@ -130,7 +130,7 @@ jobs:
     runs-on: macos-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -161,7 +161,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/download-artifact@v4
         with:

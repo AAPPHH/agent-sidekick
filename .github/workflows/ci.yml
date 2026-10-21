@@ -22,7 +22,7 @@ jobs:
       # Safety net: tests must never touch the real OS keyring of the runner.
       AGENT_SIDEKICK_DISABLE_KEYRING: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,7 +44,7 @@ jobs:
     name: lint install scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # shellcheck is preinstalled on the ubuntu runner images.
       - name: shellcheck
@@ -62,7 +62,7 @@ jobs:
     name: PSScriptAnalyzer
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Windows PowerShell 5.1: what a fresh machine runs `irm ... | iex` with.
       - name: Invoke-ScriptAnalyzer
@@ -99,7 +99,7 @@ jobs:
       AGENT_SIDEKICK_NO_SETUP: "1"
       AGENT_SIDEKICK_NO_MODIFY_PATH: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
