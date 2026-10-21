@@ -178,6 +178,10 @@ pub fn gemini_entry(
             return None;
         }
         let path = rel.split('/').fold(pkg.clone(), |p, c| p.join(c));
+        // A drive prefix (`C:x.js` on Windows) makes `join` replace the package path.
+        if !path.starts_with(&pkg) {
+            return None;
+        }
         is_file(&path).then_some(path)
     })
 }
@@ -293,9 +297,22 @@ mod tests {
         // A bin path that leaves the package is ignored.
         let read_evil = |_: &Path| Some(r#"{"bin":{"gemini":"../../evil.js"}}"#.to_owned());
         assert_eq!(
-            gemini_entry(&[root], &files(&[&abs("npm/evil.js")]), &read_evil),
+            gemini_entry(
+                std::slice::from_ref(&root),
+                &files(&[&abs("npm/evil.js")]),
+                &read_evil
+            ),
             None
         );
+        // A drive-prefixed bin path never leaves the package either (on Windows `join`
+        // would replace the package path; elsewhere `C:` is an ordinary directory name).
+        let read_drive = |_: &Path| Some(r#"{"bin":{"gemini":"C:/x.js"}}"#.to_owned());
+        let found = gemini_entry(&[root], &|_| true, &read_drive);
+        if cfg!(windows) {
+            assert_eq!(found, None);
+        } else {
+            assert!(found.unwrap().starts_with(&pkg));
+        }
     }
 
     #[test]
