@@ -184,6 +184,8 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
     };
     let claude_path = cfg.claude_path.as_deref();
     let mut lines = describe(backend);
+    // claude found and credential available: then `check_backend` itself probes base_url.
+    let mut prerequisites_ok = true;
 
     match &backend.kind {
         BackendKind::ClaudeOauth { .. } | BackendKind::ClaudeEndpoint { .. } => {
@@ -195,7 +197,10 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
                         claude.display()
                     ),
                 },
-                Err(e) => format!("claude:      not found: {e}"),
+                Err(e) => {
+                    prerequisites_ok = false;
+                    format!("claude:      not found: {e}")
+                }
             });
             let what = if matches!(backend.kind, BackendKind::ClaudeOauth { .. }) {
                 "token:"
@@ -204,7 +209,10 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
             };
             lines.push(match key_source(backend) {
                 Ok(source) => format!("{what:<13}{source}"),
-                Err(e) => format!("{what:<13}missing: {e}"),
+                Err(e) => {
+                    prerequisites_ok = false;
+                    format!("{what:<13}missing: {e}")
+                }
             });
         }
         BackendKind::Command { .. } => {
@@ -214,7 +222,9 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
             });
         }
     }
-    if let BackendKind::ClaudeEndpoint { base_url, .. } = &backend.kind {
+    if let (BackendKind::ClaudeEndpoint { base_url, .. }, false) = (&backend.kind, prerequisites_ok)
+    {
+        // `check_backend` stops before probing; show the server's state anyway.
         let probe = backends::probe_http(base_url, backends::reach::PROBE_TIMEOUT);
         lines.push(format!("probe:       {}", probe.detail));
     }
