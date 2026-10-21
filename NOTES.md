@@ -150,4 +150,51 @@ consoles unless `PYTHONUTF8=1` is set. A full aider run against KI:connect was n
 
 ## Verification status
 
-TODO: filled in by the orchestrator at the end.
+State as of 2026-10-21, version 0.2.0.
+
+### Verified automatically
+
+- **Windows 11 (MSVC, rustc 1.99.1)**: `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, and
+  `cargo test --locked` (267 unit tests plus the integration suites `backends_fallback`, `command_secret`,
+  `e2e_fake_api`, `mcp_handshake`, `runner_fake_claude`) all pass. They ran twice in a row to check for flakiness.
+- **Linux (WSL Ubuntu, native build, rustc 1.99.1)**: clippy with `-D warnings` and the full test suite pass,
+  including the Unix-only tests: `sh` fake scripts, the SIGTERM shutdown test, process-group and subreaper cleanup
+  (`runner_linux_setsid`), and 0600/0700 permissions.
+- **macOS**: compiled only through CI (`ring` needs the Apple toolchain); not run locally.
+- **End-to-end with the real claude CLI (2.1.296) against a local fake Anthropic API** (`AGENT_SIDEKICK_E2E=1 cargo test
+  --test e2e_fake_api`, no quota, Windows):
+  - implicit claude-oauth: the token arrives as `Bearer sk-ant-oat01-…`, and neither the tool result nor the run
+    log contains it;
+  - the inherited Claude Code session variables do not reach the child (its user agent no longer says
+    `claude-vscode`);
+  - claude-endpoint: the key is sent as `x-api-key` (or `Bearer` with `auth = "bearer"`), and no OAuth token or
+    inherited `ANTHROPIC_API_KEY`/`ANTHROPIC_CUSTOM_HEADERS`/model override is sent.
+- **MCP handshake** over stdio against the built binary: `initialize`, then `tools/list` returns `sidekick_run`,
+  `sidekick_status` and `sidekick_backends` with the expected schema. Cancellation (`notifications/cancelled`) and
+  progress notifications are covered as well.
+- **Reviews**: three multi-agent reviews (v0.1, v0.2 and a final one), each finding checked by two independent
+  verifiers. All confirmed findings are fixed, and `git log` records each fix.
+- **Binary smoke tests**: `--version`, `--help`, `doctor` (finds `claude.exe` on PATH and reports the missing token
+  and registration with next steps), and `backends list` with a claude-oauth + LiteLLM claude-endpoint config.
+
+### Not verified, to be checked manually
+
+1. **VS Code extension with a real token.** Run `CLAUDE_CONFIG_DIR=~/.claude-sidekick claude setup-token` (in
+   PowerShell: `$env:CLAUDE_CONFIG_DIR="$HOME\.claude-sidekick"; claude setup-token`), then `agent-sidekick setup`,
+   then "Developer: Reload Window". Then:
+   - `/mcp` must list `agent-sidekick` as connected;
+   - a short `sidekick_run` (e.g. "list the files in cwd", `cwd` = a scratch folder) must return `backend: sidekick
+     (claude-oauth)` and exit code 0;
+   - `sidekick_status` must show `token (sidekick): present`;
+   - pressing Esc during a longer run must stop it, and `sidekick_status` must show running 0 afterwards.
+2. **Real OS keyring**: the Windows Credential Manager entry `agent-sidekick` / `oauth-token` (and `cmd-<name>`,
+   `endpoint-<name>`) was not written in tests. Check that setup reports "stored in OS keyring", and that
+   `uninstall` removes the entry.
+3. **aider against KI:connect.nrw**: run it yourself with the kit in `C:\clones\aider-kiconnect-test` (README
+   there).
+4. **Tool use of the KI:connect models through LiteLLM**: needs a valid key. Run `tooltest.py` /
+   `streamtest.py` in `C:\clones\aider-kiconnect-test\litellm`. The proxy translation itself is verified (see above).
+5. **GitHub Actions**: `ci.yml` and `release.yml` have never run, because there is no remote yet. Set the
+   repository URL (`OWNER/agent-sidekick` placeholders in `install.sh`, `install.ps1` and the README, plus
+   `repository` in Cargo.toml), push, then tag `v0.2.0`. The `ubuntu-24.04-arm` runner is free for public repos only.
+6. **macOS** runtime behaviour (Keychain, process groups): CI only.
