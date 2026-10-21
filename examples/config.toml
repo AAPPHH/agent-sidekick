@@ -1,0 +1,71 @@
+# agent-sidekick config.toml with three backends.
+#
+# Copy to the config directory:
+#   Linux:   ~/.config/agent-sidekick/config.toml
+#   Windows: %APPDATA%\agent-sidekick\config.toml
+#   macOS:   ~/Library/Application Support/agent-sidekick/config.toml
+#
+# Without a [backends] section agent-sidekick behaves exactly like v0.1 (one implicit
+# claude-oauth backend named "sidekick"). As soon as [backends] exists, only the backends
+# listed here are available and exactly one of them must have `default = true`.
+#
+# The calling Claude session chooses a backend by reading `description` and `cost` from the
+# sidekick_backends tool, so write descriptions for that reader: what the backend is good
+# at, what it is bad at, and what it costs.
+
+max_concurrent = 2          # global limit over all backends; further runs are queued
+default_max_turns = 30
+default_timeout_s = 1800
+# claude_path = "/abs/path/to/claude"   # used by claude-oauth and claude-endpoint backends
+# pass_env = ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]   # inherited variables to keep for every backend
+# default_model = "sonnet"  # only applies to the implicit backend (no [backends] section)
+
+# 1) The second Claude account (subscription OAuth token).
+#    Token: `agent-sidekick setup` (asks for every claude-oauth backend) or
+#    `agent-sidekick setup --backend sidekick`. A claude-oauth backend named "sidekick"
+#    uses the v0.1 secret (keyring user `oauth-token`, file `token`), so an existing
+#    installation keeps its token.
+[backends.sidekick]
+type = "claude-oauth"
+description = "Second Claude subscription account (Claude Code). Best quality for complex, multi-file changes and debugging; uses that account's quota."
+default = true
+cost = "quota"
+max_concurrent = 1
+# config_dir = "~/.claude-sidekick"   # default for a backend named "sidekick"
+# model = "sonnet"
+
+# 2) Claude Code against a local model through Ollama's Anthropic-compatible API
+#    (Ollama 0.14 or later; pull the model first: `ollama pull qwen3-coder`).
+#    Key: `agent-sidekick setup --backend local` and enter any value such as `ollama`;
+#    local servers ignore it. Keys shorter than 8 characters are not redacted from output.
+#    LM Studio instead: base_url = "http://localhost:1234", auth = "bearer",
+#    model = the model identifier shown in LM Studio, and optionally
+#    env = { CLAUDE_CODE_ATTRIBUTION_HEADER = "0" } (LM Studio's recommendation for
+#    prompt caching).
+#    Ollama's cloud (https://ollama.com) needs auth = "bearer" and a real API key.
+[backends.local]
+type = "claude-endpoint"
+description = "Claude Code driving a local qwen3-coder via Ollama. Free and private, but slower and weaker than Claude: good for boilerplate, tests, docs and mechanical refactors; not for subtle multi-file logic."
+cost = "free"
+base_url = "http://localhost:11434"
+model = "qwen3-coder"
+# auth = "x-api-key"        # default: ANTHROPIC_API_KEY (x-api-key header); "bearer": ANTHROPIC_AUTH_TOKEN
+# api_key_env = "OLLAMA_API_KEY"   # read the key from this variable of the MCP server's environment instead
+# config_dir = "~/.claude-sidekick-local"   # default ~/.claude-sidekick-<name>; must differ from every claude-oauth dir
+# max_concurrent = 1        # a local GPU usually serves one request at a time well
+
+# 3) Aider (https://aider.chat) with the same local model, as a command backend.
+#    No shell is involved: every array element is one argument, and {prompt} is replaced by
+#    the whole prompt as a single argument. Placeholders: {prompt}, {cwd}, {max_turns}.
+#    Aider has no turn limit flag, so {max_turns} is not used here.
+#    --message: process one message, then exit. --yes-always: answer every confirmation
+#    with yes. --no-auto-commits: leave the changes uncommitted for review.
+[backends.aider]
+type = "command"
+description = "Aider with local qwen3-coder (Ollama). Free; edits files in cwd directly without asking (no tool permissions, no shell commands), changes are left uncommitted. Good for small, well-specified edits to named files."
+cost = "free"
+command = ["aider", "--model", "ollama_chat/qwen3-coder", "--yes-always", "--no-auto-commits", "--no-check-update", "--message", "{prompt}"]
+env = { OLLAMA_API_BASE = "http://127.0.0.1:11434" }
+max_concurrent = 1
+# prompt_via_stdin = true   # required if command[0] is a .cmd/.bat script (then omit {prompt})
+# pass_env = ["ANTHROPIC_API_KEY"]   # a command backend may keep an inherited variable that is normally removed
