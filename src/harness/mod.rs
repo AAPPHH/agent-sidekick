@@ -2,18 +2,17 @@
 //! it.
 //!
 //! A backend (`[backends.<name>]`) names its harness with
-//! `harness = "claude" | "opencode" | "command"` (or, legacy, with
-//! `type = "claude-oauth" | "claude-endpoint" | "command"`; opencode has no legacy form).
-//! `harness = "codex"` is known but not enabled yet (a config error). Each harness has one
-//! adapter implementing [`Harness`]:
+//! `harness = "claude" | "opencode" | "codex" | "command"` (or, legacy, with
+//! `type = "claude-oauth" | "claude-endpoint" | "command"`; opencode and codex have no
+//! legacy form). Each harness has one adapter implementing [`Harness`]:
 //!
 //! - [`claude::ClaudeHarness`]: the official `claude` CLI, in OAuth mode (a Claude account's
 //!   token, internal type `claude-oauth`) or endpoint mode (an Anthropic-compatible
 //!   `base_url` with an API key, internal type `claude-endpoint`).
 //! - [`opencode::OpencodeHarness`]: the OpenCode CLI (`opencode run --format json`) against
 //!   an OpenAI-compatible endpoint, Ollama or OpenRouter, isolated per backend.
-//! - [`codex::CodexHarness`]: a stub for the OpenAI Codex CLI: located, versioned and listed
-//!   (`harness list`/`install`), but no backend can use it yet.
+//! - [`codex::CodexHarness`]: the OpenAI Codex CLI (`codex exec --json`) with a ChatGPT login
+//!   or an API key, in a per-backend `CODEX_HOME`.
 //! - [`command::CommandHarness`]: any other agent CLI, configured as an argument array with
 //!   placeholders.
 //!
@@ -67,7 +66,6 @@ pub enum HarnessKind {
     Claude,
     #[serde(rename = "opencode")]
     OpenCode,
-    /// Stub: known (lookup, version, install hint) but not usable by a backend yet.
     Codex,
     Command,
 }
@@ -96,13 +94,12 @@ impl HarnessKind {
     }
 
     /// The harness of an internal backend type (also the mapping of the legacy `type`).
-    /// Never [`HarnessKind::Codex`]: the codex stub has no backend type, so no backend runs
-    /// it.
     pub fn of_type(ty: BackendType) -> Self {
         match ty {
             BackendType::ClaudeOauth | BackendType::ClaudeEndpoint => HarnessKind::Claude,
             BackendType::Command => HarnessKind::Command,
             BackendType::OpenCode => HarnessKind::OpenCode,
+            BackendType::Codex => HarnessKind::Codex,
         }
     }
 
@@ -258,6 +255,62 @@ impl Backend {
     }
 }
 
+/// Create `dir` with parents (Unix: mode 0700, it holds sessions, logs and possibly a login).
+#[cfg(unix)]
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    Ok(())
+}
+
+/// Create `dir` with parents.
+#[cfg(not(unix))]
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// Write `contents` to `path` unless it already holds exactly that (then nothing is
+/// written, so concurrent runs of one backend never race on an identical file). Written
+/// through a temp file in the same directory and renamed into place.
+pub(crate) fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|old| old == contents) {
+        return Ok(());
+    }
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_extension(format!(
+        "{ext}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&tmp, contents)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            // Another run may have written the same content meanwhile.
+            if std::fs::read_to_string(path).is_ok_and(|old| old == contents) {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Characters an argument may contain when the program is a `.cmd`/`.bat` wrapper (cmd.exe
+/// re-parses arguments): letters, digits and `-_./:@+`.
+pub(crate) fn batch_safe(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./:@+".contains(c))
+}
+
 /// Internal error for an adapter called with a backend of another harness (the dispatchers
 /// never do that).
 pub(crate) fn wrong_harness(adapter: &dyn Harness, backend: &Backend) -> String {
@@ -304,6 +357,11 @@ mod tests {
             HarnessKind::of_type(BackendType::Command),
             HarnessKind::Command
         );
+        assert_eq!(
+            HarnessKind::of_type(BackendType::OpenCode),
+            HarnessKind::OpenCode
+        );
+        assert_eq!(HarnessKind::of_type(BackendType::Codex), HarnessKind::Codex);
     }
 
     #[test]
@@ -321,12 +379,10 @@ mod tests {
     #[test]
     fn normalize_output_is_identity_for_claude_and_command() {
         let raw = "line 1\n\u{1b}[31mred\u{1b}[0m\n{\"json\": true}\n";
-        for h in [
-            HarnessKind::Claude,
-            HarnessKind::Codex,
-            HarnessKind::Command,
-        ] {
+        for h in [HarnessKind::Claude, HarnessKind::Command] {
             assert_eq!(h.adapter().normalize_output(raw), None);
         }
+        // opencode and codex translate their JSON lines.
+        assert!(HarnessKind::Codex.adapter().normalize_output(raw).is_some());
     }
 }

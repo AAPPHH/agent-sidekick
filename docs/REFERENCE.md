@@ -1,6 +1,6 @@
 # agent-sidekick: technical reference
 
-agent-sidekick is a local MCP server (stdio) that lets a normal Claude Code session hand off prompts to a second, headless agent.
+agent-sidekick is a local MCP server (stdio) that lets a normal Claude Code session (or an OpenAI Codex CLI session, see [Codex as MCP host](#codex-as-mcp-host)) hand off prompts to a second, headless agent.
 Without a `[backends]` section that agent is a second Claude Code instance with its own credentials (a separate account's OAuth token) and its own config directory, so its usage and settings stay apart from your main session. The setup wizard can instead make KI:connect.nrw (through OpenCode) or Gemini the default backend.
 Optionally, further [backends](#backends) send work to a local model (Claude Code against Ollama or LM Studio) or to another agent CLI such as Aider.
 It is a single binary with no runtime dependencies besides the official `claude` CLI. Prebuilt binaries and the install one-liners are for Linux and Windows 11; on macOS build it from source (`cargo install --locked --git https://github.com/AAPPHH/agent-sidekick`).
@@ -27,8 +27,9 @@ A backend is a place where `sidekick_run` executes a prompt. Backends are config
 | `claude-endpoint` | The official `claude` CLI against an Anthropic-compatible endpoint, e.g. a local model in Ollama or LM Studio. | API key stored with `agent-sidekick setup --backend <name>`, or read from an environment variable (`api_key_env`). |
 | `command` | Any other agent CLI, e.g. Aider, started directly (no shell) with the prompt as one argument or on stdin. | Optional: a secret stored with `agent-sidekick setup --backend <name>`, handed to the program in the variable named by `secret_env`. |
 | `opencode` (only as `harness = "opencode"`) | The [OpenCode](https://opencode.ai) CLI against an OpenAI-compatible endpoint, Ollama or OpenRouter, in a per-backend isolated directory. See [OpenCode backends](#opencode-backends). | Provider key stored with `agent-sidekick setup --backend <name>` (not for Ollama), or read from `api_key_env`. |
+| `codex` (only as `harness = "codex"`) | The OpenAI [Codex CLI](https://www.npmjs.com/package/@openai/codex) (`codex exec`), with its own `CODEX_HOME` per backend. See [Codex backends](#codex-backends). | `auth = "chatgpt"`: your ChatGPT plan, logged in once with `codex login` (shown by `agent-sidekick setup --backend <name>`). `auth = "api-key"`: an OpenAI API key stored with `agent-sidekick setup --backend <name>`, or read from `api_key_env`. |
 
-**Harnesses (since 0.3.0):** instead of `type`, a backend can name the agent CLI that runs it with `harness`: `harness = "claude"` without `base_url` is the same as `type = "claude-oauth"`, `harness = "claude"` with `base_url` the same as `type = "claude-endpoint"`, and `harness = "command"` the same as `type = "command"`. `harness = "opencode"` has no `type` equivalent (`type = "opencode"` is a config error). `codex` (the OpenAI Codex CLI) is known as a harness but not enabled yet: `harness list` and `harness install codex` show it, and a backend with `harness = "codex"` is a config error ("codex harness is not enabled yet (stub)"). Existing configs with `type` keep working unchanged; if both are set they must agree (otherwise it is a config error). `agent-sidekick harness list` shows whether each harness is installed (path, version), `agent-sidekick harness install <name>` prints its official install command (it never runs it).
+**Harnesses (since 0.3.0):** instead of `type`, a backend can name the agent CLI that runs it with `harness`: `harness = "claude"` without `base_url` is the same as `type = "claude-oauth"`, `harness = "claude"` with `base_url` the same as `type = "claude-endpoint"`, and `harness = "command"` the same as `type = "command"`. `harness = "opencode"` and `harness = "codex"` have no `type` equivalent (`type = "opencode"` / `type = "codex"` are config errors). Existing configs with `type` keep working unchanged; if both are set they must agree (otherwise it is a config error). `agent-sidekick harness list` shows whether each harness is installed (path, version), `agent-sidekick harness install <name>` prints its official install command (it never runs it).
 
 **Upgrading from v0.1:** without a `[backends]` section nothing changes. There is one implicit backend named `sidekick` of type `claude-oauth` that uses the existing token, config dir and `default_model`.
 As soon as `[backends]` exists, only the backends listed there are available.
@@ -150,8 +151,9 @@ A run waits for a slot of its backend first, then for a global slot; queued runs
 - `claude-endpoint`: `claude` is found, the key is available (stored, or the `api_key_env` variable is set), and an HTTP `GET` of `base_url` answers within 2 seconds. Any HTTP response counts, also 4xx/5xx; connection errors and timeouts do not.
 - `command`: the program (`command[0]`) is found, and with `secret_env` a secret is stored for the backend.
 - `opencode`: OpenCode is installed (found), the provider key is available (not needed for Ollama), and the provider's model list answers within 2 seconds: `GET {base_url}/models` with the key as `Authorization: Bearer` (openai-compatible), `GET {base_url}/api/tags` (Ollama), `GET https://openrouter.ai/api/v1/models` without key (OpenRouter). Any HTTP response counts except 401/403, which means the key was rejected.
+- `codex`: Codex is installed (found); `auth = "chatgpt"`: the login file `<CODEX_HOME>/auth.json` exists (only its existence is checked, it is never read; no network request); `auth = "api-key"`: the key is available and `GET {base_url}/models` (without `base_url`: `https://api.openai.com/v1/models`) with the key as bearer token answers with anything but 401/403.
 
-The HTTP probes are the only network requests agent-sidekick makes itself for backends (never a model call; for every other request see [Security](#security)). They go only to the configured `base_url` (which must not contain credentials, see [claude-endpoint backends](#claude-endpoint-backends)) or OpenRouter's public model list, follow no redirects, have a 2 s timeout and run only for `sidekick_backends`, `agent-sidekick backends list --check` / `backends test`, `doctor`, and right before a run on a `claude-endpoint` or `opencode` backend. Only the openai-compatible opencode probe carries a credential (its own provider key, to its own `base_url`); all others carry none.
+The HTTP probes are the only network requests agent-sidekick makes itself for backends (never a model call; for every other request see [Security](#security)). They go only to the configured `base_url` (which must not contain credentials, see [claude-endpoint backends](#claude-endpoint-backends)), OpenRouter's public model list or, for a codex api-key backend without `base_url`, OpenAI's model list; they follow no redirects, have a 2 s timeout and run only for `sidekick_backends`, `agent-sidekick backends list --check` / `backends test`, `doctor`, and right before a run on a `claude-endpoint`, `opencode` or codex api-key backend. Only the openai-compatible opencode probe and the codex api-key probe carry a credential (the backend's own key, to its own provider); all others carry none.
 Loopback hosts are probed directly; other hosts go through the proxy from `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (honouring `NO_PROXY`), as `claude` itself would. A proxy that answers for an unreachable upstream makes the endpoint look reachable.
 
 ### Secrets per backend
@@ -165,6 +167,8 @@ Loopback hosts are probed directly; other hosts go through the proxy from `HTTPS
 | `command` without `secret_env` | none | none | none |
 | `opencode` (openai-compatible, openrouter) | `backend-<name>` | `backend-<name>.key` | `api_key_env` (a variable of the MCP server's environment) |
 | `opencode` with `provider = "ollama"` | none | none | none |
+| `codex` with `auth = "api-key"` | `backend-<name>` | `backend-<name>.key` | `api_key_env` (a variable of the MCP server's environment) |
+| `codex` with `auth = "chatgpt"` | none (Codex keeps the login in `<config-dir>/codex/<name>/auth.json`, written by `codex login`) | none | none |
 
 A backend named `sidekick` therefore keeps using the token of a v0.1 installation. Files are created with mode 0600 (Unix) or a user-only ACL (Windows).
 `api_key_env` is read from the environment of the MCP server, i.e. what Claude Code passes to it; set the variable in the user or OS environment that Claude Code inherits, or add it to the registration (`claude mcp add ... -e NAME=value`). Re-running `agent-sidekick setup` keeps such extra `-e` variables of the user-scope registration (it prints their names, never their values), see [CLI reference](#cli-reference).
@@ -175,6 +179,7 @@ The variable is removed from the environment of every other backend's runs, see 
 Every child inherits the MCP server's environment, minus:
 
 - every variable starting with `CLAUDE_CODE_` or `CLAUDE_AGENT_SDK_`, and `CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `CLAUDE_CONFIG_DIR`, `AI_AGENT`, `MCP_CONNECTION_NONBLOCKING`. Exception: `CLAUDE_CODE_GIT_BASH_PATH` is kept, because Claude Code on Windows needs it to find Git Bash (it is host configuration, not session state or a credential);
+- every variable starting with `CODEX_`: the session and settings of a Codex host (`CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_CI`, `CODEX_SANDBOX*`, `CODEX_MANAGED_*`, ...) and its credentials (`CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`). Exception: `CODEX_CA_CERTIFICATE` (a corporate CA bundle) is kept. Codex passes an MCP server only an allowlisted environment, but a server started from a shell inside a Codex session would otherwise hand these on;
 - competing credentials: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AGENT_SIDEKICK_TOKEN` (and `CLAUDE_CODE_OAUTH_TOKEN` via the prefix rule);
 - every variable named in the `api_key_env` of any configured backend, for all other backends, so one endpoint's key never reaches another backend's child (the owning endpoint gets its key as `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` anyway);
 - `ANTHROPIC_BASE_URL` for `claude-endpoint` (which sets its own) and `command` backends. For `claude-oauth` an inherited `ANTHROPIC_BASE_URL` is kept (proxies) and logged as a warning;
@@ -191,6 +196,7 @@ Then the backend's `env` table is applied (it may set `CLAUDE_CODE_*` variables;
 | `claude-endpoint` | `CLAUDE_CONFIG_DIR`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` (`auth = "x-api-key"`) or `ANTHROPIC_AUTH_TOKEN` (`auth = "bearer"`). `CLAUDE_CODE_OAUTH_TOKEN` is never set. |
 | `command` | nothing; with `secret_env`, that variable is set to the backend's stored secret (last, so it replaces an inherited value or a `pass_env` exception of the same name) |
 | `opencode` | `AGENT_SIDEKICK_PROVIDER_KEY` (the provider key), the isolation variables (`HOME`, on Windows also `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`; `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `TEMP`, `TMP`, `TMPDIR`, `npm_config_cache`), the `OPENCODE_DISABLE_*` flags, `OPENCODE_PERMISSION`, `OPENCODE_CONFIG_CONTENT` and on Windows `OPENCODE_GIT_BASH_PATH`. Inherited `OPENCODE_*`, `ANTHROPIC_*`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `PWD`, `OLDPWD` and `npm_config_cache` are removed first. See [OpenCode backends](#opencode-backends). |
+| `codex` | `CODEX_HOME` and `CODEX_SQLITE_HOME` (both `<config-dir>/codex/<name>`); with `auth = "api-key"` the key as `CODEX_API_KEY` (OpenAI) or `AGENT_SIDEKICK_PROVIDER_KEY` (with `base_url`). Inherited `ANTHROPIC_*`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_FEDERATION_RULE_ID`, `OPENAI_IDENTITY_TOKEN_FILE`, `OPENAI_WORKLOAD_IDENTITY_CONTEXT`, `RUST_LOG` and `AGENT_SIDEKICK_PROVIDER_KEY` are removed first (not re-allowable with `pass_env`, nor `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`). `HOME`/`USERPROFILE` stay the user's. See [Codex backends](#codex-backends). |
 
 The `secret_env` of a command backend is treated like an `api_key_env`: an inherited variable of that name is removed from every backend's child (the command backend itself gets the stored value).
 
@@ -282,6 +288,60 @@ Known limits (OpenCode 1.19.3, verified with a local stub server):
 - **WSL:** with Windows `PATH` interop, the Linux lookup can pick up the Windows npm shim `opencode` (a shell script that runs the Windows `opencode.exe`). `HOME`/`XDG_*` isolation does not cross into a Windows process (no `WSLENV`), so that run would use the Windows user's real OpenCode configuration and home. In WSL install OpenCode natively and point `harness_path` at it.
 - The provider must support tool calling for the model (OpenCode always sends tools). A vLLM-based gateway without auto tool choice answers 400, which shows up as `[error] APIError: ...`.
 
+### Codex backends
+
+The OpenAI Codex CLI (`npm install -g @openai/codex`; `agent-sidekick harness install codex` prints the official commands) runs with your ChatGPT plan or an OpenAI API key:
+
+```toml
+[backends.codex]
+harness = "codex"
+auth = "chatgpt"          # the default; or "api-key"
+description = "OpenAI Codex agent (GPT models). Strong for code changes, debugging and reviews; edits files and runs commands in cwd inside Codex's sandbox."
+max_concurrent = 1
+# default = true          # exactly one backend in config.toml needs it; set it here if codex is your only backend
+# models = ["gpt-6.1-sol", "gpt-6-luna"]   # optional allowlist; without it any model, and Codex's default when none is requested
+```
+
+```sh
+agent-sidekick setup --backend codex   # chatgpt: creates the backend's CODEX_HOME and prints the `codex login` command; api-key: asks for the key
+agent-sidekick backends test codex     # codex found, logged in (or key stored and accepted)
+```
+
+Keys:
+
+| Key | Meaning |
+|-----|---------|
+| `harness` | `"codex"` (required; there is no `type` for it). |
+| `auth` | `"chatgpt"` (default): your ChatGPT plan (Plus, Pro, Business, Edu, Enterprise); you log in once with `codex login` in the backend's own `CODEX_HOME` (the exact command, for PowerShell, Git Bash or sh, is printed by `setup --backend <name>`; without a browser use `codex login --device-auth`). Codex keeps and refreshes the login in `<config-dir>/codex/<name>/auth.json`. `"api-key"`: an OpenAI API key (keyring user `backend-<name>`, or `api_key_env`), billed per token. |
+| `base_url` | Only with `api-key`: a Responses-compatible provider instead of OpenAI (`http(s)://.../v1`; Codex calls `{base_url}/responses`). An endpoint that only offers `/chat/completions` cannot be used with Codex 0.163 (use an opencode backend for it). Same URL rules as for claude-endpoint. |
+| `wire_api` | Only with `api-key` and `base_url`; only `"responses"` is accepted (the default; anything else is a config error). |
+| `api_key_env` | Only with `api-key`: read the key from this variable of the MCP server's environment instead of the stored one. |
+| `models` / `model` | Optional. `models` is the allowlist, `model` the default. Without either, any requested model is passed and a run without `model` uses Codex's default model. |
+| `read_only` | `true`: `--sandbox read-only` (Codex may read, not write; shell commands that write are blocked). Default `false`: `--sandbox workspace-write` (writes in `cwd`, shell commands without network). |
+| `windows_sandbox` | Windows only: Codex's sandbox implementation, passed as `-c windows.sandbox=<value>`: `mxc` (default; Windows 11 24H2/25H2 with the MXC capability), `elevated` (needs a one-time admin setup), `unelevated` (weaker). Without a working sandbox, workspace-write shell commands are rejected ("blocked by policy"). |
+| `harness_path` | Absolute path (or `~/...`) of the codex executable. Default: the npm package's native `codex.exe` (next to a `codex.cmd` in `PATH` or in `%APPDATA%\npm`, x64 or arm64 package), then `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe` (standalone installer), then `codex.exe` in `PATH`; on Unix `codex` in `PATH`. The `.cmd` shim is never used; a `.cmd`/`.bat` here restricts model names and `cwd` to plain characters. |
+| `cost` | Default `quota` (chatgpt) or `paid` (api-key). |
+
+`description`, `default`, `max_concurrent`, `env` and `pass_env` work as for every backend (`env` must not set `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`); `config_dir`, `provider`, `request_timeout_s`, `command`, `prompt_via_stdin` and `secret_env` are not allowed.
+
+How a run works:
+
+- argv: `codex exec --json --ephemeral --skip-git-repo-check --color never --sandbox <read-only|workspace-write> --cd <cwd> [-m <model>] [-c windows.sandbox=<impl>] -`; the prompt goes to stdin.
+- **Isolation:** `CODEX_HOME` and `CODEX_SQLITE_HOME` are the backend's own directory `<config-dir>/codex/<name>/`, so your own `~/.codex` (its ChatGPT login, config, MCP servers and sessions) is never read or written, and Codex's state (SQLite databases, logs, skills, sandbox logs) stays in that directory. `HOME`/`USERPROFILE` are not changed: the agent's shell commands need your real profile (git config, toolchains). Codex reads `AGENTS.md` in the project like Claude Code reads `CLAUDE.md`; a project's `.codex/config.toml` is ignored (Codex loads it only for trusted projects, and the generated config trusts none).
+- **Generated config:** `<config-dir>/codex/<name>/config.toml` is rewritten before each run when it changed. It contains no secret: `cli_auth_credentials_store = "file"` (so `codex login` stores the login in that directory, never in the OS keyring), no update check, no history file, no analytics, the shell filters below, and for `base_url` a custom provider `sidekick` (`wire_api = "responses"`, `env_key = "AGENT_SIDEKICK_PROVIDER_KEY"`). It never contains `projects` or `mcp_servers`.
+- **The agent's shell commands never see a key:** by default Codex passes the whole environment to the commands the model runs, including `CODEX_API_KEY`, `OPENAI_API_KEY` and a provider key (verified with codex 0.163.0). The generated config switches on Codex's own exclusion of variables whose names contain `KEY`, `SECRET` or `TOKEN` and excludes `AGENT_SIDEKICK_*`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_*` and `CLAUDE*` (verified: only Codex's own `CODEX_*` runtime variables remain). This also removes other `*_TOKEN`/`*_KEY` variables (e.g. `GH_TOKEN`) from the agent's commands.
+- **The key** is only in the child's environment: `CODEX_API_KEY` for OpenAI, `AGENT_SIDEKICK_PROVIDER_KEY` for a `base_url` provider (which ignores `CODEX_API_KEY`). It is never written into a file or an argument (`codex login --with-api-key` is never used) and is redacted from logs and results.
+- **`max_turns`** is ignored (Codex has no turn limit); `timeout_s` is the hard limit. **`allowed_tools`** is ignored; use `read_only`. Both are noted in the run log.
+- **Result:** the JSON event stream is translated into a compact activity summary (commands with exit code, MCP tool calls, changed files; the last 12), warnings (Codex reports transient reconnects and fallbacks as `error` events in runs that succeed, so they never fail a run), Codex's stderr lines, the final answer (the last `agent_message`), `[error] turn failed: ...` and a usage line (`[usage] tokens in X (cached Y) / out Z (reasoning R)`). A run that exits 0 without an answer counts as failed. The full event stream is in the run log.
+- **Before each run** a ChatGPT backend needs its login file (otherwise the run is not started and a fallback can take over); an api-key backend runs the provider probe of [Reachability](#reachability).
+
+Known limits (Codex CLI 0.163.0):
+
+- **Parallel runs of one ChatGPT login** may race when Codex refreshes the login; keep `max_concurrent = 1` (the wizard's template does).
+- **What Codex keeps in the backend directory:** observed with 0.163.0 even with `--ephemeral`: SQLite databases (`goals_1`, `logs_2`, `memories_1`, `queue_1`, `state_5.sqlite`, each with `-shm`/`-wal`), `installation_id` and `skills/`, besides `config.toml` and (ChatGPT) `auth.json`. Outside the temp directory Codex 0.163 also creates "PATH alias" helper binaries for its home (under the temp directory it refuses, with a warning that agent-sidekick filters from the result); their exact names and location were not verified (all tests used a temp directory). `uninstall --purge` removes the backend directory.
+- **Codex's own MCP servers, plugins and skills** of your `~/.codex` are not available to the delegated agent (its home is the backend's directory).
+- **Unix:** the npm package's vendor layout was not verified; point `harness_path` at the native binary if `codex` in `PATH` is a Node.js shim.
+
 ### CLAUDE.md routing example
 
 Put rules like these into the `CLAUDE.md` of your projects (or `~/.claude/CLAUDE.md`), adapted to your backend names. The full version is [`examples/CLAUDE.md`](../examples/CLAUDE.md).
@@ -353,17 +413,18 @@ Without a `[backends]` section it also shows the global `default model` and the 
 
 | Command | Purpose |
 |---------|---------|
-| `agent-sidekick setup` (interactive terminal, no flags) | Guided setup (wizard, German): prerequisites, profiles (KI:connect.nrw, second Claude account, Gemini), optional `npm install -g` of OpenCode/Gemini CLI, default backend, `config.toml` from templates (merge, backup + rewrite, or cancel for an existing file), keys, registration and `doctor`. |
+| `agent-sidekick setup` (interactive terminal, no flags) | Guided setup (wizard, German): prerequisites, profiles (KI:connect.nrw, second Claude account, Gemini, OpenAI Codex with ChatGPT plan or API key), optional `npm install -g` of OpenCode/Gemini CLI/Codex, default backend, `config.toml` from templates (merge, backup + rewrite, or cancel for an existing file), keys or the `codex login` command, registration with Claude Code (and, if Codex is installed, on request with Codex) and `doctor`. |
 | `agent-sidekick setup [--token-stdin] [--no-register] [--claude PATH] [--no-wizard]` | Non-interactive setup (also a bare `setup` without a terminal): ask for the token of every `claude-oauth` backend that has none yet (backends with a stored token are skipped) and register the MCP server. Endpoint keys and command secrets are not asked here (a hint names the `setup --backend` call). Re-registering keeps the extra `-e` variables of the existing user-scope registration and prints their names (never their values); `CLAUDE_CODE_OAUTH_TOKEN` and `AGENT_SIDEKICK_TOKEN` found there are dropped with a warning. |
 | `agent-sidekick setup --register-only [--claude PATH]` | Only (re-)register the MCP server: no token prompts and no terminal needed, e.g. after storing each token with `setup --backend <name> --token-stdin`. |
-| `agent-sidekick setup --backend <name> [--token-stdin]` | Set up one backend only: `claude-oauth` token, `claude-endpoint` API key (or a note that `api_key_env` is used), the `secret_env` value of a `command` backend (nothing to store without `secret_env`), the provider key of an `opencode` backend (keyring user `backend-<name>`; nothing to store for ollama or with `api_key_env`). The MCP registration is not changed. |
+| `agent-sidekick setup --backend <name> [--token-stdin]` | Set up one backend only: `claude-oauth` token, `claude-endpoint` API key (or a note that `api_key_env` is used), the `secret_env` value of a `command` backend (nothing to store without `secret_env`), the provider key of an `opencode` backend (keyring user `backend-<name>`; nothing to store for ollama or with `api_key_env`), the API key of a codex `api-key` backend (`backend-<name>`), or for a codex `chatgpt` backend: create its `CODEX_HOME` with the generated config, print the `codex login` command for it, wait for Enter (in a terminal) and report whether the login file exists. The MCP registration is not changed. |
+| `agent-sidekick setup --codex [--claude PATH]` | Only register the MCP server with the Codex CLI (`$CODEX_HOME/config.toml`, default `~/.codex/config.toml`; backup first), see [Codex as MCP host](#codex-as-mcp-host). No prompts, no terminal needed. |
 | `agent-sidekick backends list [--check]` | Table of name, type, cost, default and description; `--check` adds reachability. |
 | `agent-sidekick backends test <name>` | Reachability with details (claude version, resolved program, HTTP status). Exit code 0 if reachable, 1 otherwise. |
-| `agent-sidekick harness list` | Each known harness (`claude`, `opencode`, `codex`, `command`): installed or not, path, `--version` output, and the configured backends using it. `command` is generic (its program is configured per backend), so it shows `n/a`. `codex` is a stub (listed, not usable by backends yet); its native `codex.exe` from the npm package is preferred over the `.cmd` shim. `opencode --version` and `codex --version` run in a temporary isolated home that is removed afterwards. |
+| `agent-sidekick harness list` | Each known harness (`claude`, `opencode`, `codex`, `command`): installed or not, path, `--version` output, and the configured backends using it. `command` is generic (its program is configured per backend), so it shows `n/a`. For `codex` the native `codex.exe` from the npm package is preferred over the `.cmd` shim. `opencode --version` and `codex --version` run in a temporary isolated home that is removed afterwards. |
 | `agent-sidekick harness install <name>` | Prints the official install command(s) of a harness; agent-sidekick never runs them. `command` has nothing to install. |
-| `agent-sidekick doctor [--offline]` | Checks the installation, the harness executables the backends use (`opencode`: path and version) and every backend, and prints next steps. Also shows an update hint at most once a day (checked and shown once, later runs that day stay quiet; result kept in `<config-dir>/update-check.json`, only if that directory exists); `--offline` skips the check. A failed check is an info line, never a doctor failure. |
+| `agent-sidekick doctor [--offline]` | Checks the installation, the harness executables the backends use (`opencode`, `codex`: path and version), every backend and, when the Codex CLI is installed, the [Codex registration](#codex-as-mcp-host) (read-only; not registered is fine), and prints next steps. Also shows an update hint at most once a day (checked and shown once, later runs that day stay quiet; result kept in `<config-dir>/update-check.json`, only if that directory exists); `--offline` skips the check. A failed check is an info line, never a doctor failure. |
 | `agent-sidekick update` | Checks the latest GitHub release and prints the install command if a newer one exists. Exit code 0 also when up to date or no release exists yet; 1 if the check failed (offline, rate limit, invalid `AGENT_SIDEKICK_UPDATE_URL`). |
-| `agent-sidekick uninstall [--purge]` | Removes the stored secrets of all configured backends (tokens, endpoint keys, command secrets, opencode provider keys, and the v0.1 token) and the MCP registration. The opencode backend directories (`<config-dir>/opencode/<name>`, no keys) are only removed with `--purge`. |
+| `agent-sidekick uninstall [--purge]` | Removes the stored secrets of all configured backends (tokens, endpoint keys, command secrets, opencode and codex keys, the ChatGPT login files of codex backends, and the v0.1 token), the MCP registration in Claude Code and the one in Codex (after a backup of the Codex config). The opencode and codex backend directories (`<config-dir>/opencode/<name>`, `<config-dir>/codex/<name>`, no keys left) are only removed with `--purge`. |
 
 ## Configuration
 
@@ -383,23 +444,25 @@ pass_env = []             # inherited variables to keep for every backend, see a
 | Key | Types | Default | Meaning |
 |-----|-------|---------|---------|
 | `type` | all | (required, or `harness`) | `claude-oauth`, `claude-endpoint` or `command`. |
-| `harness` | all | (required, or `type`) | `claude` (claude-oauth without `base_url`, claude-endpoint with it), `opencode` or `command`. If both `type` and `harness` are set they must agree; `opencode` has no `type`. `codex` is reserved (stub, a config error for now). |
+| `harness` | all | (required, or `type`) | `claude` (claude-oauth without `base_url`, claude-endpoint with it), `opencode`, `codex` or `command`. If both `type` and `harness` are set they must agree; `opencode` and `codex` have no `type`. |
 | `description` | all | (required) | What the backend is good for; read by the calling session. |
 | `default` | all | `false` | Exactly one backend must have `default = true`. |
-| `cost` | all | `quota` (claude-oauth), `paid` (claude-endpoint, opencode), `free` (command, opencode with ollama) | `free`, `quota` or `paid`; informs the caller. |
+| `cost` | all | `quota` (claude-oauth, codex with chatgpt), `paid` (claude-endpoint, opencode, codex with api-key), `free` (command, opencode with ollama) | `free`, `quota` or `paid`; informs the caller. |
 | `max_concurrent` | all | no own limit | Per-backend limit (at least 1), in addition to the global one. |
 | `env` | all | none | Extra non-secret variables, e.g. `{ CLAUDE_CODE_ATTRIBUTION_HEADER = "0" }`. Not allowed: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `AGENT_SIDEKICK_*`. |
 | `pass_env` | all | none | Inherited variables to keep for this backend, see [session isolation](#child-environment-and-session-isolation). |
 | `model` | all | first of `models`, else CLI default | Default model: `--model` (claude-*) or the value of `{model}` (command; only with `{model}` in `command`). Must be one of `models` when both are set. The `model` parameter of `sidekick_run` overrides it. |
 | `models` | all | none (claude-*: any model) | Models the backend offers; an allowlist for `sidekick_run`'s `model`, see [Models](#models). Required for a command backend that uses `{model}`, an error for one that does not. opencode needs `models` or `model`. |
 | `config_dir` | claude-oauth, claude-endpoint | `sidekick`: `AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` or `~/.claude-sidekick`; others: `~/.claude-sidekick-<name>` | `CLAUDE_CONFIG_DIR` of the agent; absolute or starting with `~`. |
-| `base_url` | claude-endpoint, opencode | (required; opencode: not for openrouter) | `http://` or `https://` URL of the Anthropic-compatible API. Must not contain `user:password@` (config error; store the key with `agent-sidekick setup --backend <name>` or set `api_key_env`); ASCII host (`xn--` form for internationalised names) and a valid port. |
-| `auth` | claude-endpoint | `x-api-key` | `x-api-key` (`ANTHROPIC_API_KEY`) or `bearer` (`ANTHROPIC_AUTH_TOKEN`). |
-| `api_key_env` | claude-endpoint, opencode | none (stored key) | Name of an environment variable with the key. It is removed from every other backend's environment. Not for opencode with ollama. |
+| `base_url` | claude-endpoint, opencode, codex (api-key) | (required; opencode: not for openrouter; codex: optional) | `http://` or `https://` URL of the API (Anthropic-compatible, OpenAI-compatible, or for codex Responses-compatible). Must not contain `user:password@` (config error; store the key with `agent-sidekick setup --backend <name>` or set `api_key_env`); ASCII host (`xn--` form for internationalised names) and a valid port. |
+| `auth` | claude-endpoint, codex | `x-api-key` (claude-endpoint), `chatgpt` (codex) | claude-endpoint: `x-api-key` (`ANTHROPIC_API_KEY`) or `bearer` (`ANTHROPIC_AUTH_TOKEN`). codex: `chatgpt` or `api-key`, see [Codex backends](#codex-backends). |
+| `api_key_env` | claude-endpoint, opencode, codex (api-key) | none (stored key) | Name of an environment variable with the key. It is removed from every other backend's environment. Not for opencode with ollama. |
 | `provider` | opencode | (required) | `openai-compatible`, `ollama` or `openrouter`, see [OpenCode backends](#opencode-backends). |
-| `harness_path` | opencode | looked up | Absolute path (or `~/...`) of the opencode executable. |
-| `read_only` | opencode | `false` | Deny OpenCode's edit, bash and webfetch tools. |
+| `harness_path` | opencode, codex | looked up | Absolute path (or `~/...`) of the harness executable. |
+| `read_only` | opencode, codex | `false` | opencode: deny the edit, bash and webfetch tools; codex: Codex's read-only sandbox. |
 | `request_timeout_s` | opencode | OpenCode's 300 | Header timeout before OpenCode retries a request (1 to 3600). |
+| `wire_api` | codex (api-key with `base_url`) | `responses` | Only `responses` is accepted. |
+| `windows_sandbox` | codex | `mxc` | Windows sandbox of Codex: `mxc`, `elevated` or `unelevated`. |
 | `command` | command | (required) | Program and arguments with `{prompt}`, `{cwd}`, `{max_turns}`, `{model}` (placeholders only after `command[0]`). |
 | `prompt_via_stdin` | command | `false` | Send the prompt on stdin instead of `{prompt}`. |
 | `secret_env` | command | none | Variable that receives the backend's stored secret (`setup --backend <name>`), e.g. `OPENAI_API_KEY`. Not allowed: `CLAUDE_CODE_OAUTH_TOKEN`, `AGENT_SIDEKICK_*`, or a key that is also in `env`. Values shorter than 8 characters are not redacted. |
@@ -444,17 +507,55 @@ On SIGTERM (sent by Claude Code when it stops the server) running process trees 
 
 - Secrets are stored in the OS keyring (service `agent-sidekick`; users per backend, see [Secrets per backend](#secrets-per-backend)). If no keyring is available they fall back to files in the config directory with mode 0600 (Unix) or a user-only ACL (Windows).
 - The server never writes secrets into logs, error messages or tool output itself, and it redacts the exact secrets of the run and anything matching `sk-ant-…` from the agent's output. Secrets shorter than 8 characters (placeholder keys like `ollama`) are not redacted, so they cannot mangle the output.
-  The delegated agent can, however, read its own credential from its environment (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`; for opencode backends `AGENT_SIDEKICK_PROVIDER_KEY`, which cannot be avoided because OpenCode resolves the key reference in its config from its own environment, and which project plugins see as well); an agent instructed to print it in altered form (encoded, reversed, split) could expose it in the log and the tool result. Treat the delegated agent as trusted with that credential.
+  The delegated agent can, however, read its own credential from its environment (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`; for opencode backends `AGENT_SIDEKICK_PROVIDER_KEY`, which cannot be avoided because OpenCode resolves the key reference in its config from its own environment, and which project plugins see as well); an agent instructed to print it in altered form (encoded, reversed, split) could expose it in the log and the tool result. Treat the delegated agent as trusted with that credential. Codex backends are the exception for shell commands: the generated config keeps every key out of the commands the model runs (see [Codex backends](#codex-backends)). Codex's sandbox still allows reading the whole disk, so the model's commands can read files that hold credentials, like any agent running as your user: in ChatGPT mode the login file `<CODEX_HOME>/auth.json`, and without a keyring the key files of the file fallback (e.g. `<config-dir>/backend-<name>.key`); both were read in a real run. agent-sidekick never reads the ChatGPT login, so it cannot redact it from the output.
 - `sidekick_backends`, `backends list/test` and `doctor` never print secrets or environment values.
 - Network: agent-sidekick itself makes only these requests, never a model call. All model traffic is made by `claude`, `opencode` or the configured command.
   - The reachability probe described in [Reachability](#reachability) (configured `base_url` only, 2 s timeout, no credentials except the provider key as bearer token for an opencode openai-compatible backend's `GET {base_url}/models`, without following redirects).
   - The update check of `doctor` (at most once a day, on by default; `doctor --offline` skips it) and of `update`: `GET https://api.github.com/repos/AAPPHH/agent-sidekick/releases/latest` (or `AGENT_SIDEKICK_UPDATE_URL`), no credentials; GitHub sees your IP address and the agent-sidekick version in the `User-Agent`.
-  - In the setup wizard, only after asking: the KI:connect key check (`GET {base_url}/models` with the key as bearer token, 15 s timeout) and `npm install -g opencode-ai` / `@google/gemini-cli`, which npm downloads from its registry.
+  - In the setup wizard, only after asking: the KI:connect or OpenAI key check (`GET {base_url}/models` or `https://api.openai.com/v1/models` with the key as bearer token, 15 s timeout) and `npm install -g opencode-ai` / `@google/gemini-cli` / `@openai/codex`, which npm downloads from its registry.
+- Under Codex as MCP host the server runs outside Codex's sandbox (as every MCP server does), and so does every agent it starts. That is why `sidekick_run` keeps Codex's approval prompt, see [Codex as MCP host](#codex-as-mcp-host).
 - Prompts are written to the run log in `<config-dir>/logs`; do not put secrets into prompts.
 - Run logs can contain the full prompt and the agent's complete output. On Unix the logs directory is created with mode 0700 and each run log with mode 0600; on Windows they keep the user-profile ACL.
 - To rotate or revoke a Claude token: revoke it in the Claude account settings, then run `claude setup-token` again (see the README) and `agent-sidekick setup --backend <name>` (`setup --no-wizard` skips backends that already have a token).
 - Never commit tokens or keys to Git.
 - The delegated agent runs with the permissions you grant via `allowed_tools`. In `-p` mode the workspace trust dialog is skipped, so only point `cwd` at directories you trust. Command backends run with the server's permissions and their own permission model. The wizard's Gemini backend passes `--skip-trust`, so a project's `.env` or `.gemini/settings.json` can redirect or read its key, see [Command backends](#command-backends); opencode backends run project plugins, see [OpenCode backends](#opencode-backends).
+
+## Codex as MCP host
+
+agent-sidekick also works as an MCP server of the OpenAI Codex CLI: Codex then gets `sidekick_backends`, `sidekick_run` and `sidekick_status` (as the tool namespace `mcp__agent_sidekick`) and can hand work to any configured backend, e.g. a Claude account or KI:connect.
+
+```sh
+agent-sidekick setup --codex     # register in $CODEX_HOME/config.toml (default ~/.codex/config.toml)
+agent-sidekick doctor            # "Codex MCP registration: registered in ..."
+```
+
+`setup --codex` writes this table (and asks for nothing else); start a new Codex session afterwards, `/mcp` lists the server:
+
+```toml
+[mcp_servers.agent-sidekick]
+command = '/abs/path/to/agent-sidekick'
+args = ["serve"]
+startup_timeout_sec = 30
+tool_timeout_sec = 15000
+env_vars = ["ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "LANG", "NO_PROXY", "SSL_CERT_DIR", "SSL_CERT_FILE", ...]
+
+[mcp_servers.agent-sidekick.tools.sidekick_backends]
+approval_mode = "approve"
+
+[mcp_servers.agent-sidekick.tools.sidekick_status]
+approval_mode = "approve"
+
+[mcp_servers.agent-sidekick.env]
+AGENT_SIDEKICK_CLAUDE = '/abs/path/to/claude'
+```
+
+- **`tool_timeout_sec`:** Codex cancels an MCP tool call after 60 s by default, and progress notifications do not extend that (unlike Claude Code; verified with codex 0.163.0). 15000 s covers the longest possible `sidekick_run` (two attempts of `timeout_s` = 7200 with a fallback, plus queueing). An entry without it (e.g. from `codex mcp add`, which cannot set timeouts) makes `doctor` fail.
+- **Environment:** Codex starts MCP servers with an allowlisted environment (on Windows: `APPDATA`, `LOCALAPPDATA`, `PATH`, `PATHEXT`, `TEMP`, `TMP`, `USERPROFILE`, `USERNAME`, the system variables; not `CODEX_*`, not your other variables). So `setup --codex` writes `AGENT_SIDEKICK_CLAUDE` (the claude it found, or `--claude PATH`) and a set `AGENT_SIDEKICK_CONFIG_DIR`/`AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` into `env` (paths, never secrets), and puts the names of every `api_key_env` and `pass_env` of `config.toml`, the proxy and CA variables, `LANG`, `CLAUDE_CODE_GIT_BASH_PATH` (a claude backend on Windows may need it) and on Unix `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR` and `XDG_CONFIG_HOME` into `env_vars`: Codex then forwards their values from its own environment, so no key is written into its config. After adding an `api_key_env` run `setup --codex` again; `doctor` names missing variables.
+- **Approval:** Codex asks before every MCP tool call by default (and refuses it in `codex exec`, "approval policy is never"). The read-only tools `sidekick_backends` and `sidekick_status` are registered with `approval_mode = "approve"`. `sidekick_run` keeps Codex's prompt, because the delegated agent works outside Codex's sandbox with its own permissions. To run it without asking (e.g. in `codex exec`), add `[mcp_servers.agent-sidekick.tools.sidekick_run]` with `approval_mode = "approve"` yourself.
+- **Editing:** the file is edited directly (with `toml_edit`), not with `codex mcp add`, which can set neither timeout and rewrites other tables. The previous file is copied to `config.toml.bak-agent-sidekick-<timestamp>` first; everything outside the `agent-sidekick` table stays byte for byte (checked before writing). Re-running `setup --codex` updates `command`, `args`, the timeouts, `env_vars` and the `env` values in place and keeps everything else of the entry (`enabled`, other `env` values, tool settings). `mcp_servers` as an inline table is not edited (error, nothing written). The new file is written next to the old one and renamed over it; on Unix it keeps the old file's mode (a new file gets 0600, since the config can hold other MCP servers' secrets), and a symlinked `config.toml` is written through to its target (the link stays).
+- **Instructions:** Codex uses (at least) the first 512 characters of the server instructions for tool selection; agent-sidekick names its three tools and the possibly long run time there.
+- **Cancellation:** whether Codex sends `notifications/cancelled` when a call times out or the user interrupts is not verified; when Codex ends, the server's stdin closes and every running process tree is killed.
+- `uninstall` removes the entry (after a backup); `doctor` checks it when Codex is installed (entry, `enabled`, `command` = this binary, `args`, timeout, `AGENT_SIDEKICK_CLAUDE` exists, variables of `config.toml` forwarded).
 
 ## VS Code
 
@@ -481,7 +582,7 @@ Run `agent-sidekick doctor` first; it checks the installation and every backend 
 ## Uninstall
 
 ```sh
-agent-sidekick uninstall          # remove stored secrets and the MCP registration
+agent-sidekick uninstall          # remove stored secrets and the MCP registrations (Claude Code, Codex)
 agent-sidekick uninstall --purge  # also delete the config directory (config, token files, logs)
 ```
 

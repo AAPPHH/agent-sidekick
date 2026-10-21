@@ -12,6 +12,8 @@
 //!   optionally with a stored secret handed over in the variable `secret_env`.
 //! - `opencode`: the OpenCode CLI (`harness = "opencode"`, no legacy `type`) against an
 //!   OpenAI-compatible endpoint, Ollama or OpenRouter, in a per-backend isolated directory.
+//! - `codex`: the OpenAI Codex CLI (`harness = "codex"`, no legacy `type`) with a ChatGPT
+//!   login or an API key, in a per-backend `CODEX_HOME`.
 //!
 //! Submodules: [`resolve`] (config validation), [`launch`] (environment, credentials,
 //! [`crate::runner::Launch`] building), [`reach`] (reachability checks).
@@ -43,6 +45,9 @@ pub enum BackendType {
     /// [`resolve`] (the legacy `type` stays limited to the v0.3 values).
     #[serde(rename = "opencode")]
     OpenCode,
+    /// Only reachable through `harness = "codex"`; `type = "codex"` is rejected by
+    /// [`resolve`] like `type = "opencode"`.
+    Codex,
 }
 
 impl BackendType {
@@ -52,6 +57,80 @@ impl BackendType {
             BackendType::ClaudeEndpoint => "claude-endpoint",
             BackendType::Command => "command",
             BackendType::OpenCode => "opencode",
+            BackendType::Codex => "codex",
+        }
+    }
+}
+
+/// How a codex backend authenticates (`auth = "chatgpt" | "api-key"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexAuth {
+    /// The user's ChatGPT login (subscription), done once with `codex login` in the
+    /// backend's own `CODEX_HOME`; Codex keeps and refreshes it in `<CODEX_HOME>/auth.json`.
+    Chatgpt,
+    /// An OpenAI API key (or the key of a Responses-compatible gateway with `base_url`),
+    /// stored with `setup --backend` or read from `api_key_env`.
+    ApiKey,
+}
+
+impl CodexAuth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CodexAuth::Chatgpt => "chatgpt",
+            CodexAuth::ApiKey => "api-key",
+        }
+    }
+}
+
+impl fmt::Display for CodexAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Codex's Windows sandbox implementation (`windows_sandbox = "mxc" | "elevated" |
+/// "unelevated"`), passed as `-c windows.sandbox=<value>`. Ignored on other platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsSandbox {
+    /// Windows 11 24H2/25H2 with the MXC capability (recommended by OpenAI).
+    #[default]
+    Mxc,
+    /// Needs a one-time admin setup (`codex sandbox` as administrator).
+    Elevated,
+    /// Weaker isolation, no admin setup.
+    Unelevated,
+}
+
+impl WindowsSandbox {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowsSandbox::Mxc => "mxc",
+            WindowsSandbox::Elevated => "elevated",
+            WindowsSandbox::Unelevated => "unelevated",
+        }
+    }
+}
+
+/// The `auth` value as written in config.toml: claude-endpoint uses `x-api-key`/`bearer`,
+/// codex `chatgpt`/`api-key`; [`resolve`] checks which values a backend may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawAuth {
+    XApiKey,
+    Bearer,
+    Chatgpt,
+    ApiKey,
+}
+
+impl RawAuth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RawAuth::XApiKey => "x-api-key",
+            RawAuth::Bearer => "bearer",
+            RawAuth::Chatgpt => "chatgpt",
+            RawAuth::ApiKey => "api-key",
         }
     }
 }
@@ -177,8 +256,9 @@ pub struct RawBackend {
     /// claude-endpoint, opencode: name of an environment variable holding the key (instead
     /// of the stored one).
     pub api_key_env: Option<String>,
-    /// claude-endpoint: how the key is sent.
-    pub auth: Option<EndpointAuth>,
+    /// claude-endpoint: how the key is sent (`x-api-key`, `bearer`); codex: how the backend
+    /// authenticates (`chatgpt`, `api-key`).
+    pub auth: Option<RawAuth>,
     /// command: program and arguments; placeholders `{prompt}`, `{cwd}`, `{max_turns}`,
     /// `{model}`.
     pub command: Option<Vec<String>>,
@@ -189,13 +269,19 @@ pub struct RawBackend {
     pub secret_env: Option<String>,
     /// opencode: `openai-compatible`, `ollama` or `openrouter`.
     pub provider: Option<OpencodeProvider>,
-    /// opencode: explicit path of the opencode executable (`~` is expanded).
+    /// opencode, codex: explicit path of the harness executable (`~` is expanded).
     pub harness_path: Option<PathBuf>,
-    /// opencode: deny the edit, bash and webfetch tools (default false).
+    /// opencode: deny the edit, bash and webfetch tools; codex: run in Codex's read-only
+    /// sandbox (default false).
     pub read_only: Option<bool>,
     /// opencode: seconds to wait for the provider's response headers before OpenCode retries
     /// the request (OpenCode's `headerTimeout`; unset: OpenCode's default of 300 s).
     pub request_timeout_s: Option<u64>,
+    /// codex (api-key with `base_url`): the provider's wire API. Only `responses` exists
+    /// (Codex 0.163 dropped chat completions); any other value is a config error.
+    pub wire_api: Option<String>,
+    /// codex: Windows sandbox implementation (`mxc`, `elevated`, `unelevated`; default mxc).
+    pub windows_sandbox: Option<WindowsSandbox>,
 }
 
 /// A validated backend.
@@ -260,6 +346,21 @@ pub enum BackendKind {
         /// Per-backend isolation directory `<config-dir>/opencode/<name>`.
         base_dir: PathBuf,
     },
+    Codex {
+        auth: CodexAuth,
+        /// api-key only: a Responses-compatible provider (normalized, no trailing `/`);
+        /// `None`: OpenAI's own API through Codex's built-in `openai` provider.
+        base_url: Option<String>,
+        /// api-key only: key from this environment variable instead of the stored secret.
+        api_key_env: Option<String>,
+        /// Configured codex executable (`None`: looked up, see [`crate::harness::codex`]).
+        harness_path: Option<PathBuf>,
+        /// `--sandbox read-only` instead of `workspace-write`.
+        read_only: bool,
+        windows_sandbox: WindowsSandbox,
+        /// The backend's own `CODEX_HOME`: `<config-dir>/codex/<name>`.
+        base_dir: PathBuf,
+    },
 }
 
 impl Backend {
@@ -269,6 +370,7 @@ impl Backend {
             BackendKind::ClaudeEndpoint { .. } => BackendType::ClaudeEndpoint,
             BackendKind::Command { .. } => BackendType::Command,
             BackendKind::OpenCode { .. } => BackendType::OpenCode,
+            BackendKind::Codex { .. } => BackendType::Codex,
         }
     }
 
@@ -327,7 +429,22 @@ impl Backend {
                 api_key_env: None,
                 ..
             } if provider.needs_key() => Some(SecretId::Backend(self.name.clone())),
+            BackendKind::Codex {
+                auth: CodexAuth::ApiKey,
+                api_key_env: None,
+                ..
+            } => Some(SecretId::Backend(self.name.clone())),
             _ => None,
+        }
+    }
+
+    /// Whether a run needs a provider key ([`launch::Credential::ProviderKey`]): opencode
+    /// with a key-based provider, codex with `auth = "api-key"`.
+    pub fn needs_provider_key(&self) -> bool {
+        match &self.kind {
+            BackendKind::OpenCode { provider, .. } => provider.needs_key(),
+            BackendKind::Codex { auth, .. } => *auth == CodexAuth::ApiKey,
+            _ => false,
         }
     }
 }
@@ -358,6 +475,10 @@ impl Backends {
                     ..
                 }
                 | BackendKind::OpenCode {
+                    api_key_env: Some(var),
+                    ..
+                }
+                | BackendKind::Codex {
                     api_key_env: Some(var),
                     ..
                 }

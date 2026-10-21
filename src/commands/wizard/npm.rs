@@ -14,6 +14,8 @@ use crate::locate::Os;
 pub const OPENCODE_PACKAGE: &str = "opencode-ai";
 /// npm package of the Gemini CLI.
 pub const GEMINI_PACKAGE: &str = "@google/gemini-cli";
+/// npm package of the OpenAI Codex CLI.
+pub const CODEX_PACKAGE: &str = "@openai/codex";
 /// Name of the Gemini CLI's executable in its package.json `bin`.
 const GEMINI_BIN: &str = "gemini";
 

@@ -1015,20 +1015,37 @@ fn header(launch: &Launch, req: &RunRequest, started: &str) -> String {
         .as_ref()
         .map_or_else(|| "(default)".to_owned(), |t| t.join(" "));
     let extra: String = launch.header.iter().map(|l| format!("# {l}\n")).collect();
+    let has = |prefix: &str| launch.header.iter().any(|l| l.starts_with(prefix));
+    // An adapter that explains max_turns (ignored, mapped) replaces the generic line.
+    let max_turns = if has("max_turns:") {
+        String::new()
+    } else {
+        format!("# max_turns: {}\n", req.max_turns)
+    };
+    // The backend line carries the model actually used (the requested one or the
+    // backend's default); req.model alone would say "(default)" for the latter.
+    let model_shown = has("model:")
+        || launch
+            .header
+            .iter()
+            .any(|l| l.starts_with("backend: ") && l.contains(", model "));
+    let model = if model_shown {
+        String::new()
+    } else {
+        format!("# model: {}\n", req.model.as_deref().unwrap_or("(default)"))
+    };
     let text = format!(
         "# agent-sidekick run\n\
          # started (UTC): {started}\n\
          {extra}\
          # cwd: {}\n\
-         # max_turns: {}\n\
-         # model: {}\n\
+         {max_turns}\
+         {model}\
          # allowed_tools: {tools}\n\
          # timeout: {}s\n\
          # prompt:\n{}\n\
          # ---- output (stdout+stderr) ----\n",
         req.cwd.display(),
-        req.max_turns,
-        req.model.as_deref().unwrap_or("(default)"),
         req.timeout.as_secs(),
         req.prompt,
     );
@@ -1484,6 +1501,21 @@ mod tests {
         let h = header(&launch, &r, "now");
         assert!(!h.contains("warning"));
         assert!(h.contains("# backend: local (claude-endpoint)"));
+        assert!(h.contains("# max_turns: "), "{h}");
+        assert!(h.contains("# model: (default)"), "{h}");
+
+        // Backend default model and an adapter max_turns note: no generic duplicates.
+        launch.header = vec![
+            "backend: gpt (codex), model fake-model".into(),
+            "max_turns: 7 ignored (codex has no turn limit)".into(),
+        ];
+        let h = header(&launch, &r, "now");
+        assert_eq!(h.matches("max_turns").count(), 1, "{h}");
+        assert!(!h.contains("# model:"), "{h}");
+        assert!(
+            h.contains("# backend: gpt (codex), model fake-model"),
+            "{h}"
+        );
     }
 
     #[test]

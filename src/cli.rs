@@ -8,7 +8,7 @@ use crate::{commands, logging};
 #[command(
     name = "agent-sidekick",
     version,
-    about = "MCP server that delegates tasks from Claude Code to a second, headless agent (configured backends)",
+    about = "MCP server that delegates tasks from Claude Code or Codex to a second, headless agent (configured backends)",
     propagate_version = true
 )]
 pub struct Cli {
@@ -19,9 +19,9 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Store the backends' tokens and register the MCP server with Claude Code
-    /// (`--backend <name>`: set up only that backend).
+    /// (`--backend <name>`: set up only that backend; `--codex`: register with Codex).
     Setup(commands::setup::SetupArgs),
-    /// Run the MCP server over stdio (started by Claude Code, not by hand).
+    /// Run the MCP server over stdio (started by Claude Code or Codex, not by hand).
     Serve,
     /// Check the installation and all backends; print next steps for anything that is missing
     /// (`--offline`: skip the daily update check).
@@ -30,7 +30,8 @@ pub enum Command {
     Backends(commands::backends::BackendsArgs),
     /// List the known harnesses (agent CLIs) or print a harness's official install command.
     Harness(commands::harness::HarnessArgs),
-    /// Remove the stored tokens/API keys of all backends and the MCP registration.
+    /// Remove the stored tokens/API keys of all backends and the MCP registrations (Claude
+    /// Code and Codex).
     Uninstall(commands::uninstall::UninstallArgs),
     /// Check for a newer release and print the command that installs it.
     Update,
@@ -125,8 +126,32 @@ mod tests {
             &["--backend", "work"][..],
             &["--token-stdin"][..],
             &["--no-register"][..],
+            &["--codex"][..],
         ] {
             let mut args = vec!["--register-only"];
+            args.extend_from_slice(other);
+            let err = setup(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_parses_and_conflicts() {
+        let a = setup(&["--codex"]).unwrap();
+        assert!(a.codex && !a.is_bare());
+        let a = setup(&["--codex", "--claude", "/x/claude"]).unwrap();
+        assert!(a.codex && a.claude.is_some());
+        for other in [
+            &["--backend", "work"][..],
+            &["--token-stdin"][..],
+            &["--no-register"][..],
+            &["--register-only"][..],
+        ] {
+            let mut args = vec!["--codex"];
             args.extend_from_slice(other);
             let err = setup(&args).unwrap_err();
             assert_eq!(

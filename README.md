@@ -1,7 +1,7 @@
 # agent-sidekick
 
-agent-sidekick ist ein kleiner lokaler MCP-Server für Claude Code.
-Deine Claude-Code-Sitzung kann damit Aufgaben an einen zweiten Agenten abgeben: an KI:connect.nrw (Hochschul-Kontingent, kostenlos, über den Agenten OpenCode), an ein zweites Claude-Konto oder an Gemini.
+agent-sidekick ist ein kleiner lokaler MCP-Server für Claude Code und die OpenAI-Codex-CLI.
+Deine Sitzung kann damit Aufgaben an einen zweiten Agenten abgeben: an KI:connect.nrw (Hochschul-Kontingent, kostenlos, über den Agenten OpenCode), an ein zweites Claude-Konto, an Gemini oder an OpenAI Codex (mit deinem ChatGPT-Abo oder einem API-Schlüssel).
 Die Hauptsitzung wählt Backend und Modell, der zweite Agent arbeitet im angegebenen Projektordner und liefert sein Ergebnis zurück.
 Es ist ein einzelnes Programm für Windows 11 und Linux.
 
@@ -37,7 +37,7 @@ Der erste Befehl installiert das Programm nach `~/.local/bin`. Er bietet an, die
 
 - Die Installation prüft den Download gegen `SHA256SUMS` und braucht weder Rust noch Git noch Node.js.
 - In einem interaktiven Terminal startet die Installation am Ende selbst `agent-sidekick setup`. Den zweiten Befehl brauchst du nur, wenn das Setup nicht lief oder du es abgebrochen hast.
-- Der Setup-Assistent prüft Claude Code, Node.js und OpenCode. Du wählst ein oder mehrere Profile: „KI:connect.nrw (Hochschul-Kontingent, kostenlos)“ (Vorschlag), „Claude-Zweitkonto“, „Gemini“. Ein fehlendes OpenCode oder Gemini CLI installiert er nach Rückfrage mit `npm install -g`. Wählst du mehrere neue Profile, fragt er nach dem Standard-Backend (Vorschlag: `kiconnect`). Dann fragt er die Schlüssel verdeckt ab (den KI:connect-Schlüssel kann er gleich online prüfen), schreibt erst danach die Konfiguration, meldet den Server bei Claude Code an und führt `agent-sidekick doctor` aus.
+- Der Setup-Assistent prüft Claude Code, Node.js, OpenCode und Codex. Du wählst ein oder mehrere Profile: „KI:connect.nrw (Hochschul-Kontingent, kostenlos)“ (Vorschlag), „Claude-Zweitkonto“, „Gemini“, „OpenAI Codex (ChatGPT-Abo oder API-Key)“. Ein fehlendes OpenCode, Gemini CLI oder Codex installiert er nach Rückfrage mit `npm install -g`. Wählst du mehrere neue Profile, fragt er nach dem Standard-Backend (Vorschlag: `kiconnect`). Dann fragt er die Schlüssel verdeckt ab (den KI:connect- oder OpenAI-Schlüssel kann er gleich online prüfen), schreibt erst danach die Konfiguration, zeigt beim ChatGPT-Abo den Anmeldebefehl für Codex, meldet den Server bei Claude Code an (und, wenn Codex installiert ist, auf Wunsch auch bei Codex) und führt `agent-sidekick doctor` aus.
 - Eine vorhandene `config.toml` wird nie stillschweigend überschrieben: Du wählst Zusammenführen, Sichern und neu schreiben oder Abbrechen.
 - Eine bestimmte Version installierst du in PowerShell mit `$env:VERSION = 'v0.3.0'` vor dem ersten Befehl, unter Linux mit `curl -fsSL https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.sh | VERSION=v0.3.0 sh`.
 
@@ -50,9 +50,50 @@ Danach VS Code neu laden (siehe [Erster Test](#erster-test)).
   - Linux: `curl -fsSL https://claude.ai/install.sh | bash`
 
   Öffne danach ein neues Terminal. Nutzt du das Terminal in VS Code, starte VS Code komplett neu. Weitere Wege stehen unter <https://code.claude.com/docs/en/setup>.
-- Node.js, nur für KI:connect (OpenCode) und Gemini: Download unter <https://nodejs.org/en/download>, unter Windows auch mit `winget install OpenJS.NodeJS.LTS`.
+- Node.js, nur für KI:connect (OpenCode), Gemini und zum Installieren von Codex: Download unter <https://nodejs.org/en/download>, unter Windows auch mit `winget install OpenJS.NodeJS.LTS`.
 - Für KI:connect: ein Konto an einer teilnehmenden Hochschule (Anmeldung über das Single Sign-On deiner Hochschule).
 - Für das Profil „Claude-Zweitkonto“: ein zweites Claude-Abonnement.
+- Für das Profil „OpenAI Codex“: die Codex-CLI (`npm install -g @openai/codex`, das Setup bietet es an) und ein ChatGPT-Abo (Plus, Pro, Business, Edu oder Enterprise) oder ein OpenAI-API-Schlüssel.
+
+## OpenAI Codex nutzen
+
+### Codex als zweiter Agent (mit deinem ChatGPT-Abo)
+
+Wähle im Setup das Profil „OpenAI Codex (ChatGPT-Abo oder API-Key)“ und dann „ChatGPT-Abo“. Das Setup legt für das Backend `codex` einen eigenen Codex-Ordner an und zeigt dir den Anmeldebefehl. Dein eigenes `~/.codex` mit deiner normalen Codex-Anmeldung bleibt dabei unberührt.
+
+Später oder erneut geht es mit:
+
+```sh
+agent-sidekick setup --backend codex
+```
+
+Der Befehl zeigt dir, was du in einem separaten Terminal ausführen sollst, unter Windows (PowerShell) zum Beispiel:
+
+```powershell
+$env:CODEX_HOME = "$env:APPDATA\agent-sidekick\codex\codex"; codex login; Remove-Item Env:CODEX_HOME
+```
+
+Unter Linux:
+
+```sh
+CODEX_HOME="$HOME/.config/agent-sidekick/codex/codex" codex login
+```
+
+Melde dich im Browser mit dem ChatGPT-Konto an, dessen Abo genutzt werden soll. Ohne Browser (z. B. über SSH) nimmst du `codex login --device-auth`. Prüfe danach mit `agent-sidekick backends test codex`. Die Läufe zählen auf das Codex-Kontingent deines ChatGPT-Abos.
+
+Mit einem OpenAI-API-Schlüssel wählst du im Setup „OpenAI-API-Schlüssel“ und fügst den Schlüssel von <https://platform.openai.com/api-keys> ein. Abgerechnet wird dann pro Token über dein OpenAI-Konto.
+
+Ohne weitere Angabe nimmt Codex sein Standardmodell. Codex arbeitet im Projektordner in seiner Sandbox: Es darf dort Dateien ändern, seine Befehle haben aber kein Netzwerk. Deine Schlüssel stehen nicht in den Umgebungsvariablen dieser Befehle. Lesen darf die Sandbox aber die ganze Festplatte: Codex kann also Dateien mit Zugangsdaten öffnen, etwa die ChatGPT-Anmeldung `auth.json` im Codex-Ordner des Backends oder, wenn kein Schlüsselbund verfügbar ist, die Schlüsseldateien von agent-sidekick (`backend-<name>.key`). Lass Codex deshalb nur in Projekten arbeiten, denen du vertraust.
+
+### agent-sidekick in Codex verwenden
+
+Ist die Codex-CLI installiert, fragt das Setup „Auch in Codex anmelden?“. Du kannst es auch jederzeit selbst ausführen:
+
+```sh
+agent-sidekick setup --codex
+```
+
+Das trägt agent-sidekick in deine Codex-Konfiguration ein (`~/.codex/config.toml`, vorher wird eine Sicherung angelegt). Starte danach eine neue Codex-Sitzung; `/mcp` zeigt `agent-sidekick`. Bitte Codex dann zum Beispiel: „Nutze sidekick_backends und lass den Claude-Agenten die Tests reparieren.“ Vor jedem `sidekick_run` fragt Codex nach deiner Zustimmung, denn der zweite Agent arbeitet außerhalb der Codex-Sandbox.
 
 ## KI:connect-API-Schlüssel erzeugen
 
@@ -110,6 +151,14 @@ Das Setup braucht die Claude-Code-CLI. Installiere sie wie unter [Voraussetzunge
 - **OpenCode fehlt:** Das Setup bietet `npm install -g opencode-ai` an. Du kannst den Befehl auch selbst ausführen und danach `agent-sidekick setup` erneut starten.
 - **Node.js fehlt:** Das Setup bricht ab, bevor es etwas schreibt. Installiere Node.js (siehe [Voraussetzungen](#voraussetzungen)), öffne ein **neues** Terminal und starte `agent-sidekick setup` erneut. Nutzt du das Terminal in VS Code, starte VS Code komplett neu. Ein neues Terminal in VS Code reicht nicht, es kennt Node.js sonst noch nicht.
 
+### Codex: „No ChatGPT login“ oder „not logged in“
+
+Das Codex-Backend hat noch keine Anmeldung in seinem eigenen Codex-Ordner. Führe `agent-sidekick setup --backend codex` aus und den Anmeldebefehl, den es anzeigt. Deine normale Codex-Anmeldung in `~/.codex` zählt dafür nicht.
+
+### Codex bricht `sidekick_run` nach 60 Sekunden ab
+
+Der Eintrag in der Codex-Konfiguration hat kein ausreichendes `tool_timeout_sec`, etwa weil er mit `codex mcp add` angelegt wurde. Führe `agent-sidekick setup --codex` aus; `agent-sidekick doctor` prüft den Eintrag.
+
 ### /mcp zeigt agent-sidekick nicht an
 
 Lade VS Code neu oder starte es komplett neu. Hilft das nicht, führe `agent-sidekick doctor` aus; es nennt den nächsten Schritt. `agent-sidekick setup --register-only` meldet den Server erneut bei Claude Code an, und `claude mcp list` zeigt, ob er eingetragen ist.
@@ -133,7 +182,7 @@ Claude Code startet den Server über den absoluten Pfad, der beim Setup eingetra
 ## Aktualisieren und deinstallieren
 
 - **Aktualisieren:** `agent-sidekick update` prüft, ob es eine neue Version gibt, und zeigt den passenden Installationsbefehl an. Führe ihn aus und lade VS Code neu. `agent-sidekick doctor` weist höchstens einmal am Tag auf ein Update hin.
-- **Deinstallieren:** `agent-sidekick uninstall` entfernt die gespeicherten Schlüssel und die Anmeldung bei Claude Code. `agent-sidekick uninstall --purge` löscht zusätzlich den Konfigurationsordner. Danach das Programm löschen: unter Windows den Ordner `%LOCALAPPDATA%\Programs\agent-sidekick`, unter Linux die Datei `~/.local/bin/agent-sidekick`.
+- **Deinstallieren:** `agent-sidekick uninstall` entfernt die gespeicherten Schlüssel, die ChatGPT-Anmeldung des Codex-Backends und die Anmeldung bei Claude Code und bei Codex. `agent-sidekick uninstall --purge` löscht zusätzlich den Konfigurationsordner. Danach das Programm löschen: unter Windows den Ordner `%LOCALAPPDATA%\Programs\agent-sidekick`, unter Linux die Datei `~/.local/bin/agent-sidekick`.
 
 ## Sicherheit beim Gemini-Profil
 
@@ -149,7 +198,7 @@ Nutze Gemini deshalb nur in Projektordnern, denen du vertraust, zum Beispiel nic
 - Jede Person nutzt ihren eigenen KI:connect-Schlüssel und ihre eigenen Claude-Konten.
 - Gib Schlüssel und Tokens nie weiter und schreib sie nie in Prompts, Dateien oder Repositories.
 - Beachte die Nutzungsbedingungen deiner Hochschule und von KI:connect.nrw, zum Beispiel welche Daten verarbeitet werden dürfen.
-- Das zweite Claude-Konto ist nur für deine eigenen Zwecke. Für jedes Konto gelten die Bedingungen von Anthropic, für Gemini die von Google.
+- Das zweite Claude-Konto ist nur für deine eigenen Zwecke. Für jedes Konto gelten die Bedingungen von Anthropic, für Gemini die von Google, für Codex und ChatGPT die von OpenAI.
 - agent-sidekick wechselt nicht automatisch zwischen Konten und umgeht keine Nutzungslimits.
 - Die Schlüssel liegen im Schlüsselbund des Betriebssystems (Windows-Anmeldeinformationsverwaltung, unter Linux Secret Service). Nur wenn kein Schlüsselbund verfügbar ist, liegen sie in einer geschützten Datei im Konfigurationsordner.
 

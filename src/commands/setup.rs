@@ -45,6 +45,10 @@ pub struct SetupArgs {
     /// setup instead (ask for the claude-oauth tokens of config.toml, then register).
     #[arg(long)]
     pub no_wizard: bool,
+    /// Only register the MCP server with the OpenAI Codex CLI (in `$CODEX_HOME/config.toml`,
+    /// default `~/.codex/config.toml`; a backup is written first); ask for nothing else.
+    #[arg(long, conflicts_with_all = ["backend", "token_stdin", "no_register", "register_only"])]
+    pub codex: bool,
 }
 
 impl SetupArgs {
@@ -56,6 +60,7 @@ impl SetupArgs {
             && self.backend.is_none()
             && !self.register_only
             && !self.no_wizard
+            && !self.codex
     }
 }
 
@@ -101,6 +106,9 @@ pub enum Step {
     ProviderUsesEnv { name: String, var: String },
     /// opencode with provider `ollama`: no key.
     ProviderNoKey { name: String },
+    /// codex with `auth = "chatgpt"`: create its `CODEX_HOME` with the generated config,
+    /// print the `codex login` commands and report whether the login exists.
+    CodexLogin { name: String, home: PathBuf },
 }
 
 impl Step {
@@ -128,7 +136,8 @@ impl Step {
             | Step::ProviderKey { .. }
             | Step::ProviderKeyHint { .. }
             | Step::ProviderUsesEnv { .. }
-            | Step::ProviderNoKey { .. } => None,
+            | Step::ProviderNoKey { .. }
+            | Step::CodexLogin { .. } => None,
         }
     }
 }
@@ -222,6 +231,23 @@ pub fn plan(backends: &Backends, only: Option<&str>) -> Result<Vec<Step>, String
                 },
                 BackendKind::OpenCode { .. } if single => Step::ProviderKey { name },
                 BackendKind::OpenCode { .. } => Step::ProviderKeyHint { name },
+                BackendKind::Codex {
+                    auth: backends::CodexAuth::Chatgpt,
+                    base_dir,
+                    ..
+                } => Step::CodexLogin {
+                    name,
+                    home: base_dir.clone(),
+                },
+                BackendKind::Codex {
+                    api_key_env: Some(var),
+                    ..
+                } => Step::ProviderUsesEnv {
+                    name,
+                    var: var.clone(),
+                },
+                BackendKind::Codex { .. } if single => Step::ProviderKey { name },
+                BackendKind::Codex { .. } => Step::ProviderKeyHint { name },
             }
         })
         .collect())
@@ -278,7 +304,8 @@ fn step_name(step: &Step) -> &str {
         | Step::ProviderKey { name }
         | Step::ProviderKeyHint { name }
         | Step::ProviderUsesEnv { name, .. }
-        | Step::ProviderNoKey { name } => name,
+        | Step::ProviderNoKey { name }
+        | Step::CodexLogin { name, .. } => name,
     }
 }
 
@@ -290,6 +317,9 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
         std::io::stdout().is_terminal(),
     ) {
         return super::wizard::run_interactive();
+    }
+    if args.codex {
+        return setup_codex(args.claude.as_deref());
     }
     // The configuration first: a broken config.toml must fail before anything is asked.
     let (cfg, backends) = load_backends().map_err(|e| anyhow!(e))?;
@@ -359,7 +389,7 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
     }
 
     for step in &steps {
-        run_step(step, &backends, args.token_stdin)?;
+        run_step(step, &backends, args.token_stdin, single)?;
     }
 
     if single {
@@ -418,7 +448,7 @@ fn stored_message(name: &str, source: &str) -> String {
     )
 }
 
-fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
+fn run_step(step: &Step, backends: &Backends, token_stdin: bool, single: bool) -> Result<()> {
     match step {
         Step::OauthStored { name, source, .. } => println!("{}", stored_message(name, source)),
         Step::OauthToken { name, config_dir } => {
@@ -487,13 +517,58 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
             println!("Provider key for backend `{name}` stored in {source}.");
         }
         Step::ProviderKeyHint { name } => println!(
-            "Backend `{name}` (opencode): run `{APP_NAME} setup --backend {name}` to store its \
-             provider API key."
+            "Backend `{name}` ({}): run `{APP_NAME} setup --backend {name}` to store its \
+             provider API key.",
+            harness_of(backends, name)
         ),
         Step::ProviderUsesEnv { name, var } => println!(
-            "Backend `{name}` (opencode): the provider key is read from the environment \
-             variable {var}; nothing is stored. It must be set in the MCP server's environment."
+            "Backend `{name}` ({}): the provider key is read from the environment \
+             variable {var}; nothing is stored. It must be set in the MCP server's environment.",
+            harness_of(backends, name)
         ),
+        Step::CodexLogin { name, home } => {
+            let backend = backends
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown backend `{name}`"))?;
+            let config = crate::harness::codex::prepare_home(backend).map_err(|e| anyhow!(e))?;
+            println!(
+                "\nBackend `{name}` (codex, ChatGPT login): its own CODEX_HOME is {}\n\
+                 (generated config: {}; your own ~/.codex is not used).",
+                home.display(),
+                config.display()
+            );
+            let auth = home.join(crate::harness::codex::AUTH_FILE);
+            if auth.is_file() {
+                println!(
+                    "Logged in: {} exists. To log in with another account, run:\n{}",
+                    auth.display(),
+                    crate::harness::codex::login_commands(home)
+                );
+            } else {
+                println!(
+                    "Not logged in yet. Log in with your ChatGPT account (Plus, Pro, Business, \
+                     Edu or Enterprise) in a terminal:\n{}\n\
+                     The login is stored only in this backend's CODEX_HOME.",
+                    crate::harness::codex::login_commands(home)
+                );
+                if single && std::io::stdin().is_terminal() {
+                    let mut line = String::new();
+                    print!("Press Enter when the login is done (or Ctrl+C to stop here): ");
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                    std::io::stdin().read_line(&mut line).ok();
+                }
+                if auth.is_file() {
+                    println!("Login found: {}.", auth.display());
+                } else {
+                    println!(
+                        "No login found yet ({} is missing). After logging in, check with \
+                         `{APP_NAME} backends test {name}`.",
+                        auth.display()
+                    );
+                }
+            }
+        }
         Step::ProviderNoKey { name } => println!(
             "Backend `{name}` (opencode, provider ollama): no key needed; nothing to store."
         ),
@@ -516,9 +591,100 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
     Ok(())
 }
 
+/// The harness name of backend `name` (for messages).
+fn harness_of(backends: &Backends, name: &str) -> &'static str {
+    backends
+        .get(name)
+        .map(|b| b.harness_kind().as_str())
+        .unwrap_or("backend")
+}
+
 /// Prompt for the `secret_env` value of a command backend.
 fn secret_prompt(name: &str, var: &str) -> String {
     format!("Value for {var} of backend {name} (input hidden): ")
+}
+
+/// `setup --codex`: register the MCP server with the Codex CLI.
+fn setup_codex(claude_flag: Option<&Path>) -> Result<ExitCode> {
+    // A broken config.toml does not block the registration; only the variable list is
+    // incomplete then.
+    let cfg = match crate::config::Config::load() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "warning: config.toml: {}; registering without its api_key_env/pass_env names",
+                crate::redact::redact_all(&format!("{e:#}"))
+            );
+            None
+        }
+    };
+    let self_exe = std::env::current_exe().context("determining the path of this executable")?;
+    if looks_like_dev_build(&self_exe) {
+        eprintln!(
+            "warning: {} looks like a cargo build output; the Codex registration will point \
+             there. Install with `cargo install --path .` (or copy the binary somewhere stable) \
+             for regular use.",
+            self_exe.display()
+        );
+    }
+    let claude_path = cfg.as_ref().and_then(|c| c.claude_path.clone());
+    let claude = match resolve_claude(claude_flag, claude_path.as_deref()) {
+        Ok(found) => Some(found.path),
+        Err(e) => {
+            eprintln!(
+                "note: Claude Code not found ({}); AGENT_SIDEKICK_CLAUDE is not set, so \
+                 backends with harness `claude` cannot run from Codex (other harnesses can). \
+                 Pass --claude <path> to set it.",
+                crate::redact::redact_all(&format!("{e:#}"))
+            );
+            None
+        }
+    };
+    let path = super::codex_host::real_config_path().ok_or_else(|| {
+        anyhow!("cannot determine the Codex config (home directory unknown); set CODEX_HOME")
+    })?;
+    register_codex(&path, &self_exe, claude.as_deref(), cfg.as_ref())?;
+    if crate::harness::codex::locate_real(None).is_err() {
+        println!(
+            "Note: the Codex CLI was not found here; `{APP_NAME} harness install codex` shows \
+             how to install it."
+        );
+    }
+    println!(
+        "\nDone. Start a new Codex session (`codex`); `/mcp` there lists `{APP_NAME}`. Check with \
+         `{APP_NAME} doctor`."
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Write the Codex registration into the Codex config at `path` (see
+/// [`super::codex_host`]) and say what happened.
+pub(crate) fn register_codex(
+    path: &Path,
+    self_exe: &Path,
+    claude: Option<&Path>,
+    cfg: Option<&crate::config::Config>,
+) -> Result<()> {
+    use super::codex_host::{self, Registration, Written, TOOL_TIMEOUT_SEC};
+    let reg = Registration::new(self_exe, claude, cfg, &|k| std::env::var_os(k));
+    match codex_host::register(path, &reg, &codex_host::timestamp()).map_err(|e| anyhow!(e))? {
+        Written::Unchanged => println!(
+            "MCP server `{APP_NAME}` is already registered in Codex ({}); nothing changed.",
+            path.display()
+        ),
+        Written::Changed { backup } => {
+            println!(
+                "Registered MCP server `{APP_NAME}` in Codex: {} ({} serve, tool_timeout_sec \
+                 {TOOL_TIMEOUT_SEC})",
+                path.display(),
+                self_exe.display()
+            );
+            if let Some(b) = backup {
+                println!("Backup of the previous Codex config: {}", b.display());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `--claude` wins over auto-detection (`config_claude_path`: `claude_path` in config.toml).
@@ -634,7 +800,7 @@ fn shadow_warning(entry: &claude_cli::McpEntry) -> Option<String> {
     }
     Some(format!(
         "another `{APP_NAME}` entry ({scope}) takes precedence over the user-scope registration \
-         in this directory and may point to an old binary. Remove it with {}.",
+         in this directory and may point to an old binary; {}.",
         claude_cli::remove_hint(entry)
     ))
 }
@@ -740,6 +906,60 @@ mod tests {
     }
 
     #[test]
+    fn codex_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg: crate::config::Config = toml::from_str(
+            "[backends.chat]\nharness = \"codex\"\nauth = \"chatgpt\"\ndescription = \"d\"\n\
+             default = true\n\
+             [backends.key]\nharness = \"codex\"\nauth = \"api-key\"\ndescription = \"d\"\n\
+             [backends.envkey]\nharness = \"codex\"\nauth = \"api-key\"\napi_key_env = \"K\"\n\
+             description = \"d\"\n",
+        )
+        .unwrap();
+        let backends = crate::backends::resolve_with(
+            &cfg,
+            &crate::backends::ResolveDefaults {
+                home: Some(tmp.path().to_path_buf()),
+                legacy_agent_config_dir: None,
+                config_dir: Some(tmp.path().join("cfg")),
+            },
+        )
+        .unwrap();
+        let home = tmp.path().join("cfg").join("codex").join("chat");
+        let full = plan(&backends, None).unwrap();
+        assert_eq!(
+            full,
+            vec![
+                Step::CodexLogin {
+                    name: "chat".into(),
+                    home: home.clone()
+                },
+                Step::ProviderUsesEnv {
+                    name: "envkey".into(),
+                    var: "K".into()
+                },
+                Step::ProviderKeyHint { name: "key".into() },
+            ]
+        );
+        assert!(!full.iter().any(Step::asks_secret));
+        assert_eq!(
+            plan(&backends, Some("key")).unwrap(),
+            vec![Step::ProviderKey { name: "key".into() }]
+        );
+        // The ChatGPT login is no secret: --token-stdin has nothing to read.
+        let one = plan(&backends, Some("chat")).unwrap();
+        assert!(check_token_stdin(&one, true, true).is_err());
+        assert_eq!(dirs_to_create(Vec::new(), &one), Vec::<PathBuf>::new());
+
+        // Running the step creates the CODEX_HOME with its config (not a terminal here, so
+        // nothing waits for input) and leaves no login behind.
+        run_step(&one[0], &backends, false, false).unwrap();
+        assert!(home.join("config.toml").is_file());
+        assert!(!home.join("auth.json").exists());
+        assert_eq!(harness_of(&backends, "key"), "codex");
+    }
+
+    #[test]
     fn wizard_only_for_bare_setup_in_a_terminal() {
         let bare = SetupArgs {
             token_stdin: false,
@@ -748,17 +968,19 @@ mod tests {
             backend: None,
             register_only: false,
             no_wizard: false,
+            codex: false,
         };
         assert!(wants_wizard(&bare, true, true));
         assert!(!wants_wizard(&bare, false, true));
         assert!(!wants_wizard(&bare, true, false));
-        let variants: [fn(&mut SetupArgs); 6] = [
+        let variants: [fn(&mut SetupArgs); 7] = [
             |a| a.token_stdin = true,
             |a| a.no_register = true,
             |a| a.claude = Some("/x/claude".into()),
             |a| a.backend = Some("kiconnect".into()),
             |a| a.register_only = true,
             |a| a.no_wizard = true,
+            |a| a.codex = true,
         ];
         for set in variants {
             let mut args = bare_clone(&bare);
@@ -775,6 +997,7 @@ mod tests {
             backend: a.backend.clone(),
             register_only: a.register_only,
             no_wizard: a.no_wizard,
+            codex: a.codex,
         }
     }
 

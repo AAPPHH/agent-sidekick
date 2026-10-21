@@ -12,7 +12,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use super::{Backend, BackendKind, BackendType};
+use super::{Backend, BackendKind, BackendType, CodexAuth};
 use crate::harness::{LaunchInput, SecretLoader};
 use crate::runner::{Launch, RunRequest};
 use crate::token::Token;
@@ -84,8 +84,29 @@ fn opencode_removed(name: &OsStr) -> bool {
             .eq_ignore_ascii_case("npm_config_cache")
 }
 
-/// Prefixes of inherited variables that are always removed (session isolation).
-const REMOVED_PREFIXES: &[&str] = &["CLAUDE_CODE_", "CLAUDE_AGENT_SDK_"];
+/// Exact names of inherited variables removed for codex backends besides every `CODEX_*`
+/// (removed for all backends): OpenAI credentials and settings Codex would pick up on its
+/// own, the provider key variable (the adapter sets its own), Codex's log level (it would
+/// flood the run log), and the caller's Anthropic settings.
+const CODEX_REMOVED_NAMES: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_FEDERATION_RULE_ID",
+    "OPENAI_IDENTITY_TOKEN_FILE",
+    "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    "RUST_LOG",
+    PROVIDER_KEY_ENV,
+];
+
+/// Removed for codex backends (`pass_env` cannot keep them).
+fn codex_removed(name: &OsStr) -> bool {
+    has_prefix(name, "ANTHROPIC_") || in_list(name, CODEX_REMOVED_NAMES)
+}
+
+/// Prefixes of inherited variables that are always removed (session isolation). `CODEX_*`:
+/// the session of a Codex host (`CODEX_HOME`, `CODEX_SESSION_ID`, `CODEX_THREAD_ID`,
+/// `CODEX_SANDBOX*`, ...) and its credentials (`CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`).
+const REMOVED_PREFIXES: &[&str] = &["CLAUDE_CODE_", "CLAUDE_AGENT_SDK_", "CODEX_"];
 
 /// Exact names of inherited variables that are always removed.
 const REMOVED_NAMES: &[&str] = &[
@@ -102,8 +123,18 @@ const REMOVED_NAMES: &[&str] = &[
 
 /// Exceptions to [`REMOVED_PREFIXES`]: host configuration, not session identity or a
 /// credential. `CLAUDE_CODE_GIT_BASH_PATH` tells claude on Windows where bash.exe is; without
-/// it a child claude may refuse to start ("requires git-bash").
-const KEPT_PREFIXED_NAMES: &[&str] = &["CLAUDE_CODE_GIT_BASH_PATH"];
+/// it a child claude may refuse to start ("requires git-bash"). `CODEX_CA_CERTIFICATE`: the
+/// corporate CA bundle Codex trusts (like `SSL_CERT_FILE`, which is never removed).
+const KEPT_PREFIXED_NAMES: &[&str] = &["CLAUDE_CODE_GIT_BASH_PATH", "CODEX_CA_CERTIFICATE"];
+
+/// Inherited variables that may never be kept for a codex backend via `pass_env`: its
+/// isolation and credential variables, set by the adapter.
+const CODEX_NEVER_PASSED: &[&str] = &[
+    "CODEX_HOME",
+    "CODEX_SQLITE_HOME",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+];
 
 /// Removed for claude-endpoint and command backends: claude sends these headers with every
 /// API request, so a caller's gateway credential would reach the backend's endpoint.
@@ -317,6 +348,7 @@ fn is_removed(name: &OsStr, backend: &Backend) -> bool {
             && (eq_name(name, BASE_URL_ENV) || eq_name(name, CUSTOM_HEADERS_ENV)))
         || (ty == BackendType::ClaudeEndpoint && in_list(name, ENDPOINT_MODEL_VARS))
         || (ty == BackendType::OpenCode && opencode_removed(name))
+        || (ty == BackendType::Codex && codex_removed(name))
 }
 
 /// May an inherited variable that matches the removal rules be kept via `pass_env`?
@@ -329,6 +361,11 @@ fn may_pass(name: &OsStr, backend: &Backend) -> bool {
         BackendType::OpenCode => {
             !in_list(name, CLAUDE_CREDENTIAL_VARS)
                 && (!opencode_removed(name) || in_list(name, OPENCODE_PASSABLE))
+        }
+        BackendType::Codex => {
+            !in_list(name, CLAUDE_CREDENTIAL_VARS)
+                && !in_list(name, CODEX_NEVER_PASSED)
+                && !codex_removed(name)
         }
         BackendType::ClaudeOauth => !in_list(name, CLAUDE_CREDENTIAL_VARS),
         BackendType::ClaudeEndpoint => {
@@ -444,9 +481,45 @@ fn child_env_inner(
             env.retain(|(k, _)| !eq_name(k, OAUTH_TOKEN_ENV));
             mismatch
         }
+        (
+            BackendKind::Codex {
+                auth,
+                base_url,
+                base_dir,
+                ..
+            },
+            cred,
+        ) => {
+            // Codex keeps its state (sessions, SQLite, the ChatGPT login) in CODEX_HOME;
+            // CODEX_SQLITE_HOME is set too so an inherited one cannot redirect the databases.
+            set_var(&mut env, CODEX_HOME_ENV, base_dir.as_os_str());
+            set_var(&mut env, "CODEX_SQLITE_HOME", base_dir.as_os_str());
+            let mismatch = match (auth, cred) {
+                // Codex's built-in `openai` provider reads CODEX_API_KEY; a custom provider
+                // (`base_url`) ignores it and reads the variable named by its `env_key`.
+                (CodexAuth::ApiKey, Credential::ProviderKey(k)) => {
+                    let var = if base_url.is_some() {
+                        PROVIDER_KEY_ENV
+                    } else {
+                        CODEX_API_KEY_ENV
+                    };
+                    set_var(&mut env, var, k.expose());
+                    false
+                }
+                (CodexAuth::Chatgpt, Credential::None) => false,
+                _ => true,
+            };
+            env.retain(|(k, _)| !eq_name(k, OAUTH_TOKEN_ENV));
+            mismatch
+        }
     };
     (env, mismatch)
 }
+
+/// Codex's state directory variable.
+pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
+/// The variable Codex's built-in `openai` provider reads the API key from (`codex exec`).
+pub const CODEX_API_KEY_ENV: &str = "CODEX_API_KEY";
 
 // ---------------------------------------------------------------------------
 // Placeholders
@@ -512,10 +585,7 @@ pub fn build_launch(
         BackendKind::Command { secret_env, .. } => secret_env.as_deref(),
         _ => None,
     };
-    let needs_provider_key = match &backend.kind {
-        BackendKind::OpenCode { provider, .. } => provider.needs_key(),
-        _ => false,
-    };
+    let needs_provider_key = backend.needs_provider_key();
     let credential_ok = matches!(
         (ty, command_secret, credential),
         (BackendType::ClaudeOauth, _, Credential::OauthToken(_))
@@ -524,8 +594,15 @@ pub fn build_launch(
             | (BackendType::Command, Some(_), Credential::CommandSecret(_))
     ) || matches!(
         (ty, needs_provider_key, credential),
-        (BackendType::OpenCode, true, Credential::ProviderKey(_))
-            | (BackendType::OpenCode, false, Credential::None)
+        (
+            BackendType::OpenCode | BackendType::Codex,
+            true,
+            Credential::ProviderKey(_)
+        ) | (
+            BackendType::OpenCode | BackendType::Codex,
+            false,
+            Credential::None
+        )
     );
     if !credential_ok {
         return Err(format!(

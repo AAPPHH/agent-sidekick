@@ -43,10 +43,20 @@ pub fn run(args: UninstallArgs) -> Result<ExitCode> {
             remove_secret(id, &mut removed_any),
         );
     }
+    for file in codex_logins(&resolved) {
+        step(
+            &format!("removing the ChatGPT login {}", file.display()),
+            remove_codex_login(&file, &mut removed_any),
+        );
+    }
     if !removed_any {
         println!("No stored tokens or API keys found.");
     }
     step("removing the MCP registration", remove_registration());
+    step(
+        "removing the Codex MCP registration",
+        remove_codex_registration(),
+    );
     if args.purge {
         step("removing the config directory", purge_config_dir());
     }
@@ -58,6 +68,16 @@ pub fn run(args: UninstallArgs) -> Result<ExitCode> {
                     "Note: {} holds an opencode backend's sessions, logs and generated config \
                      (no keys); it was left in place. `uninstall --purge` removes it with the \
                      config directory.",
+                    dir.display()
+                );
+            }
+        }
+        for dir in codex_dirs(&resolved) {
+            if dir.exists() {
+                println!(
+                    "Note: {} is a codex backend's CODEX_HOME (generated config, Codex's state \
+                     databases and helper files; its login was removed above); it was left in \
+                     place. `uninstall --purge` removes it with the config directory.",
                     dir.display()
                 );
             }
@@ -96,7 +116,9 @@ pub fn secrets_to_delete(resolved: &Result<Backends, String>) -> (Vec<SecretId>,
                     BackendKind::ClaudeOauth { .. } => SecretId::Oauth(b.name.clone()),
                     BackendKind::ClaudeEndpoint { .. } => SecretId::Endpoint(b.name.clone()),
                     BackendKind::Command { .. } => SecretId::Command(b.name.clone()),
-                    BackendKind::OpenCode { .. } => SecretId::Backend(b.name.clone()),
+                    BackendKind::OpenCode { .. } | BackendKind::Codex { .. } => {
+                        SecretId::Backend(b.name.clone())
+                    }
                 });
             }
         }
@@ -125,6 +147,42 @@ fn opencode_dirs(resolved: &Result<Backends, String>) -> Vec<PathBuf> {
             })
             .collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+/// `CODEX_HOME`s of the codex backends (`<config-dir>/codex/<name>`).
+fn codex_dirs(resolved: &Result<Backends, String>) -> Vec<PathBuf> {
+    match resolved {
+        Ok(backends) => backends
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BackendKind::Codex { base_dir, .. } => Some(base_dir.clone()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The ChatGPT login files (`auth.json`) of every codex backend, also of api-key backends
+/// (a login may have been made before the backend was switched).
+fn codex_logins(resolved: &Result<Backends, String>) -> Vec<PathBuf> {
+    codex_dirs(resolved)
+        .into_iter()
+        .map(|d| d.join(crate::harness::codex::AUTH_FILE))
+        .collect()
+}
+
+/// Delete a codex backend's `auth.json` if it exists (never read).
+fn remove_codex_login(file: &std::path::Path, removed_any: &mut bool) -> Result<()> {
+    match std::fs::remove_file(file) {
+        Ok(()) => {
+            *removed_any = true;
+            println!("Removed ChatGPT login {}", file.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("deleting {}: {e}", file.display())),
     }
 }
 
@@ -170,11 +228,38 @@ fn remove_registration() -> Result<()> {
     if let Ok(Some(entry)) = claude_cli::mcp_get(&found.path) {
         if !entry.is_user_scope() {
             println!(
-                "Note: `{APP_NAME}` is still registered here ({}). Remove it with {}.",
+                "Note: `{APP_NAME}` is still registered here ({}); {}.",
                 entry.scope.as_deref().unwrap_or("unknown scope"),
                 claude_cli::remove_hint(&entry)
             );
         }
+    }
+    Ok(())
+}
+
+/// Remove `[mcp_servers.agent-sidekick]` from the user's Codex config (`$CODEX_HOME` or
+/// `~/.codex`), after a backup; the rest of the file stays as it is.
+fn remove_codex_registration() -> Result<()> {
+    use super::codex_host::{self, Written};
+    let Some(path) = codex_host::real_config_path() else {
+        println!("Skipping the Codex registration (home directory unknown).");
+        return Ok(());
+    };
+    match codex_host::unregister(&path, &codex_host::timestamp()).map_err(anyhow::Error::msg)? {
+        None => println!(
+            "MCP server `{APP_NAME}` was not registered in Codex ({}).",
+            path.display()
+        ),
+        Some(Written::Changed { backup }) => {
+            println!(
+                "Removed MCP server `{APP_NAME}` from Codex ({}).",
+                path.display()
+            );
+            if let Some(b) = backup {
+                println!("Backup of the previous Codex config: {}", b.display());
+            }
+        }
+        Some(Written::Unchanged) => {}
     }
     Ok(())
 }

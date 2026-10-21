@@ -255,6 +255,23 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
                 });
             }
         }
+        BackendKind::Codex { auth, .. } => {
+            lines.push(match backends::resolve_program(backend, None) {
+                Ok(p) => match backend.harness().version(&p) {
+                    Ok(v) => format!("codex:       {} (version {v})", p.display()),
+                    Err(e) => format!("codex:       {} (`--version` failed: {e})", p.display()),
+                },
+                Err(e) => format!("codex:       not found: {e}"),
+            });
+            let what = match auth {
+                backends::CodexAuth::Chatgpt => "login:",
+                backends::CodexAuth::ApiKey => "key source:",
+            };
+            lines.push(match key_source(backend) {
+                Ok(source) => format!("{what:<13}{source}"),
+                Err(e) => format!("{what:<13}missing: {e}"),
+            });
+        }
         BackendKind::Command { secret_env, .. } => {
             lines.push(match backends::resolve_program(backend, None) {
                 Ok(p) => format!("program:     {}", p.display()),
@@ -305,6 +322,10 @@ fn key_source(backend: &Backend) -> std::result::Result<String, String> {
     | BackendKind::OpenCode {
         api_key_env: Some(var),
         ..
+    }
+    | BackendKind::Codex {
+        api_key_env: Some(var),
+        ..
     } = &backend.kind
     {
         // Doctor/test run in a terminal; the server reads its own environment.
@@ -343,6 +364,7 @@ pub fn describe(backend: &Backend) -> Vec<String> {
             (None, BackendKind::ClaudeEndpoint { .. }) => {
                 "model:       the endpoint's default".to_owned()
             }
+            (None, BackendKind::Codex { .. }) => "model:       Codex's default".to_owned(),
             (None, _) => "model:       the account's default".to_owned(),
         });
         lines.push(match &backend.models {
@@ -411,6 +433,55 @@ pub fn describe(backend: &Backend) -> Vec<String> {
             });
             lines.push(format!("state dir:   {}", base_dir.display()));
         }
+        BackendKind::Codex {
+            auth,
+            base_url,
+            api_key_env,
+            harness_path,
+            read_only,
+            windows_sandbox,
+            base_dir,
+        } => {
+            lines.push(format!("auth:        {auth}"));
+            lines.push(match base_url {
+                Some(u) => format!("base_url:    {u} (Responses API)"),
+                None => "provider:    OpenAI (Codex's built-in provider)".to_owned(),
+            });
+            lines.push(match harness_path {
+                Some(p) => format!("harness_path: {}", p.display()),
+                None => "harness_path: (looked up: npm global package, standalone install, PATH)"
+                    .to_owned(),
+            });
+            lines.push(format!(
+                "sandbox:     {}{}",
+                if *read_only {
+                    "read-only"
+                } else {
+                    "workspace-write"
+                },
+                if cfg!(windows) {
+                    format!(" (windows_sandbox {})", windows_sandbox.as_str())
+                } else {
+                    String::new()
+                }
+            ));
+            lines.push(match (auth, api_key_env) {
+                (backends::CodexAuth::Chatgpt, _) => format!(
+                    "login:       ChatGPT login in {} (`agent-sidekick setup --backend {}` \
+                     shows how)",
+                    base_dir.join(crate::harness::codex::AUTH_FILE).display(),
+                    backend.name
+                ),
+                (backends::CodexAuth::ApiKey, Some(var)) => {
+                    format!("api key:     from environment variable {var}")
+                }
+                (backends::CodexAuth::ApiKey, None) => format!(
+                    "api key:     OS keyring entry backend-{} (or its key file in the config directory)",
+                    backend.name
+                ),
+            });
+            lines.push(format!("codex home:  {}", base_dir.display()));
+        }
         BackendKind::Command {
             command,
             prompt_via_stdin,
@@ -463,7 +534,9 @@ pub(crate) fn claude_config_dir(backend: &Backend) -> Option<&PathBuf> {
     match &backend.kind {
         BackendKind::ClaudeOauth { config_dir }
         | BackendKind::ClaudeEndpoint { config_dir, .. } => Some(config_dir),
-        BackendKind::Command { .. } | BackendKind::OpenCode { .. } => None,
+        BackendKind::Command { .. } | BackendKind::OpenCode { .. } | BackendKind::Codex { .. } => {
+            None
+        }
     }
 }
 

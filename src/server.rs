@@ -31,17 +31,18 @@ use crate::redact::{redact_all, Secrets};
 use crate::runner::{self, RunError, RunOutcome, RunRequest, TAIL_CHARS};
 use crate::token::{self, SecretId, Token, TokenError, TokenSource};
 
-const INSTRUCTIONS: &str = "agent-sidekick delegates work to a separate, headless agent on one \
-of the configured backends (e.g. a second Claude Code instance with its own account, an \
-OpenCode or Gemini CLI agent on another provider, or a local model). Without `backend`, a run \
-goes to the configured default backend. Call `sidekick_backends` to see the configured backends \
-with their description, cost and reachability, and pick one by its description and cost, and a \
-model from its `models`. Use \
-`sidekick_run` to hand off a self-contained prompt (optionally with `backend`, `model` and a \
-`fallback`); it runs in the given working directory and returns which backend and model ran, \
-exit code, log path and the tail of the output. Use `sidekick_status` to see running/queued \
-jobs per backend and diagnose setup problems. If a run fails because no token or key is stored, ask the user to run \
-`agent-sidekick setup` (or `agent-sidekick setup --backend <name>`) in a terminal.";
+/// Server instructions. Codex uses (at least) the first 512 characters for tool selection, so
+/// the tools and the long run time come first (tested in tests/mcp_handshake.rs).
+const INSTRUCTIONS: &str = "agent-sidekick hands a self-contained task to a separate, \
+headless agent (another Claude Code account, OpenCode, Codex, Gemini or a local model). \
+`sidekick_backends`: the configured backends with description, cost, models and reachability; \
+pick one by description and cost. `sidekick_run`: run a prompt in a working directory \
+(optional `backend`, `model`, `fallback`); it returns when the agent is done, which can take \
+many minutes. `sidekick_status`: running/queued jobs and setup problems. Without `backend`, a \
+run goes to the configured default backend. The result names the backend and model that ran, \
+the exit code, the log path and the tail of the output. If a run fails because no token, key \
+or login is stored, ask the user to run `agent-sidekick setup` (or `agent-sidekick setup \
+--backend <name>`) in a terminal.";
 
 /// Upper bound for all reachability checks of one `sidekick_backends` call.
 const BACKENDS_CHECK_BUDGET: Duration = Duration::from_secs(PROBE_TIMEOUT.as_secs() + 1);
@@ -82,12 +83,12 @@ pub struct RunParams {
     /// sidekick_backends: `models`, `default_model`). Validated against the backend's
     /// allowlist when it has one (an unlisted model is an error; nothing runs). Default: the
     /// backend's `default_model`, else the account's/endpoint's default. A backend with
-    /// `models: null` accepts any model if it is a Claude backend (e.g. "sonnet", "opus") and
-    /// ignores the model if it is a command backend.
+    /// `models: null` accepts any model if it is a Claude or Codex backend (e.g. "sonnet",
+    /// "opus") and ignores the model if it is a command backend.
     pub model: Option<String>,
     /// Tools the agent may use without asking, e.g. ["Read", "Edit", "Bash(git:*)"].
-    /// Default: Claude Code's defaults for headless mode. Ignored by command and opencode
-    /// backends (opencode: use the backend's read_only setting).
+    /// Default: Claude Code's defaults for headless mode. Ignored by command, opencode and
+    /// codex backends (opencode/codex: use the backend's read_only setting).
     pub allowed_tools: Option<Vec<String>>,
     /// Timeout in seconds (1-7200) for each attempt; the whole process tree is killed when it
     /// expires. With a fallback the request can take up to about twice this.
@@ -1333,7 +1334,8 @@ impl SidekickServer {
                             Some(("(endpoint default)", config_dir))
                         }
                         backends::BackendKind::Command { .. }
-                        | backends::BackendKind::OpenCode { .. } => None,
+                        | backends::BackendKind::OpenCode { .. }
+                        | backends::BackendKind::Codex { .. } => None,
                     };
                     let allowlist = b
                         .models
@@ -1350,6 +1352,8 @@ impl SidekickServer {
                     } else if let Some(m) = &b.model {
                         // A command backend with `{model}` (it then always has a default).
                         let _ = write!(s, ", model {m}{allowlist}");
+                    } else if matches!(b.kind, backends::BackendKind::Codex { .. }) {
+                        let _ = write!(s, ", model (codex default){allowlist}");
                     }
                     s.push('\n');
                 }

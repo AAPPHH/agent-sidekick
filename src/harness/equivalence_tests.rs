@@ -141,6 +141,10 @@ fn credential(b: &Backend) -> Credential {
         BackendKind::OpenCode { .. } => {
             Credential::ProviderKey(Token::new(format!("provider-key-of-{}-123", b.name)))
         }
+        BackendKind::Codex { .. } if b.needs_provider_key() => {
+            Credential::ProviderKey(Token::new(format!("provider-key-of-{}-123", b.name)))
+        }
+        BackendKind::Codex { .. } => Credential::None,
     }
 }
 
@@ -351,6 +355,145 @@ fn an_oauth_token_never_reaches_another_harness() {
     }
 }
 
+/// One backend per harness (and claude/codex mode), for the session-isolation test.
+const EVERY_HARNESS: &str = r#"
+[backends.oauth]
+harness = "claude"
+description = "d"
+default = true
+
+[backends.endpoint]
+harness = "claude"
+description = "d"
+base_url = "http://localhost:11434"
+
+[backends.cmd]
+harness = "command"
+description = "d"
+command = ["agent", "{prompt}"]
+
+[backends.oc]
+harness = "opencode"
+description = "d"
+provider = "openai-compatible"
+base_url = "http://localhost:1/v1"
+model = "m"
+
+[backends.gpt]
+harness = "codex"
+description = "d"
+auth = "chatgpt"
+
+[backends.gptkey]
+harness = "codex"
+description = "d"
+auth = "api-key"
+"#;
+
+/// The MCP server can run inside a Claude Code session or a Codex session (as its MCP
+/// host, or started from a shell there): no session variable or caller credential of either
+/// reaches any harness's child, and only the claude-oauth backend gets an OAuth token.
+#[test]
+fn session_variables_of_claude_and_codex_hosts_reach_no_harness() {
+    // The opencode and codex adapters create their state directories: a temporary config dir.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg: Config = toml::from_str(EVERY_HARNESS).unwrap();
+    let backends = resolve_with(
+        &cfg,
+        &ResolveDefaults {
+            config_dir: Some(tmp.path().to_path_buf()),
+            ..defaults()
+        },
+    )
+    .unwrap();
+    let mut kinds = std::collections::HashSet::new();
+    let host = [
+        ("CODEX_HOME", "/home/u/.codex"),
+        ("CODEX_SQLITE_HOME", "/home/u/.codex"),
+        ("CODEX_SESSION_ID", "s"),
+        ("CODEX_THREAD_ID", "t"),
+        ("CODEX_TOOL_CALL_ID", "c"),
+        ("CODEX_CI", "1"),
+        ("CODEX_VERSION", "0.163.0"),
+        ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+        ("CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS", "1"),
+        ("CODEX_MANAGED_BY_NPM", "1"),
+        ("CODEX_MANAGED_PACKAGE_ROOT", "/npm/codex"),
+        ("CODEX_API_KEY", "caller-codex-key-123"),
+        ("CODEX_ACCESS_TOKEN", "caller-access-token-123"),
+        ("CODEX_CA_CERTIFICATE", "/etc/ca.pem"),
+    ];
+    for b in backends.iter() {
+        kinds.insert(b.harness_kind());
+        let mut env = base();
+        env.extend(
+            host.iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v))),
+        );
+        let cred = credential(b);
+        let l = build_launch(b, &request(None), &cred, &program(b), env, &[])
+            .unwrap_or_else(|e| panic!("{}: {e}", b.name));
+        let get = |k: &str| {
+            l.env
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        for gone in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CODEX_TOOL_CALL_ID",
+            "CODEX_CI",
+            "CODEX_VERSION",
+            "CODEX_SANDBOX_NETWORK_DISABLED",
+            "CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS",
+            "CODEX_MANAGED_BY_NPM",
+            "CODEX_MANAGED_PACKAGE_ROOT",
+            "CODEX_ACCESS_TOKEN",
+            "AGENT_SIDEKICK_TOKEN",
+        ] {
+            assert_eq!(get(gone), None, "{gone} reached {}", b.name);
+        }
+        assert_eq!(get("CODEX_CA_CERTIFICATE").as_deref(), Some("/etc/ca.pem"));
+        let oauth = get("CLAUDE_CODE_OAUTH_TOKEN");
+        match b.backend_type() {
+            BackendType::ClaudeOauth => {
+                assert_eq!(oauth.as_deref(), Some("sk-ant-oat01-token-of-oauth"))
+            }
+            _ => assert_eq!(oauth, None, "OAuth token reached {}", b.name),
+        }
+        match &b.kind {
+            BackendKind::Codex { base_dir, .. } => {
+                // Its own CODEX_HOME, never the host's.
+                assert_eq!(
+                    get("CODEX_HOME").map(PathBuf::from).as_ref(),
+                    Some(base_dir)
+                );
+                assert_eq!(
+                    get("CODEX_SQLITE_HOME").map(PathBuf::from).as_ref(),
+                    Some(base_dir)
+                );
+                // Only an api-key backend gets a key, and only its own.
+                let key = get("CODEX_API_KEY");
+                if b.needs_provider_key() {
+                    assert_eq!(key.as_deref(), Some("provider-key-of-gptkey-123"));
+                } else {
+                    assert_eq!(key, None);
+                }
+                assert_eq!(get("OPENAI_API_KEY"), None);
+            }
+            _ => {
+                assert_eq!(get("CODEX_HOME"), None, "{}", b.name);
+                assert_eq!(get("CODEX_API_KEY"), None, "{}", b.name);
+            }
+        }
+    }
+    let all: std::collections::HashSet<_> = super::HarnessKind::ALL.into_iter().collect();
+    assert_eq!(kinds, all, "every harness is covered");
+}
+
 #[test]
 fn adapters_refuse_backends_of_another_harness() {
     let harness = resolve_str(&harness()).unwrap();
@@ -483,30 +626,24 @@ fn harness_field_errors() {
     let e = resolve_str(&one("", "")).unwrap_err();
     assert!(e.contains("`type` is required"), "{e}");
     assert!(
-        e.contains("or `harness` (one of: claude, opencode, command)"),
+        e.contains("or `harness` (one of: claude, opencode, codex, command)"),
         "{e}"
     );
     // Unknown harness names are a parse error.
     let e = resolve_str(&one("harness = \"aider\"", "")).unwrap_err();
     assert!(e.starts_with("parse error"), "{e}");
-    // codex is known but a stub: a config error, alone or next to any legacy `type`.
-    for kinds in [
-        "harness = \"codex\"",
-        "type = \"claude-oauth\"
-harness = \"codex\"",
-        "type = \"command\"
-harness = \"codex\"",
-    ] {
-        let e = resolve_str(&one(kinds, "command = [\"codex\", \"{prompt}\"]")).unwrap_err();
-        assert!(
-            e.contains("codex harness is not enabled yet (stub)"),
-            "{kinds}: {e}"
-        );
-        assert!(!e.contains("disagree"), "{kinds}: {e}");
+    // codex next to a legacy `type`: they disagree.
+    for ty in ["claude-oauth", "command"] {
+        let kinds = format!("type = \"{ty}\"\nharness = \"codex\"");
+        let e = resolve_str(&one(&kinds, "auth = \"chatgpt\"\n")).unwrap_err();
+        assert!(e.contains("disagree"), "{kinds}: {e}");
     }
     // ...and the legacy `type` has no codex value.
     let e = resolve_str(&one("type = \"codex\"", "")).unwrap_err();
-    assert!(e.starts_with("parse error"), "{e}");
+    assert!(
+        e.contains("`type = \"codex\"` is not supported; write `harness = \"codex\"`"),
+        "{e}"
+    );
     // opencode has no legacy `type`.
     let e = resolve_str(&one("type = \"opencode\"", "")).unwrap_err();
     assert!(e.contains("`type = \"opencode\"` is not supported"), "{e}");

@@ -1,0 +1,15 @@
+
+# OpenAI Codex CLI (`npm install -g @openai/codex`) in its own CODEX_HOME
+# (<config-dir>/codex/codex); your own ~/.codex (login, settings, sessions) is not used.
+# auth = "chatgpt": your ChatGPT plan (Plus, Pro, Business, Edu, Enterprise); log in once:
+#   `agent-sidekick setup --backend codex` shows the `codex login` command for this backend.
+# auth = "api-key": an OpenAI API key (billed per token), stored with
+#   `agent-sidekick setup --backend codex` (keyring user `backend-codex`).
+# Without `model`, Codex uses its default model; to offer a choice add e.g.
+#   models = ["gpt-6.1-sol", "gpt-6-luna"]   # the first one is the default
+# max_concurrent = 1: parallel runs of one ChatGPT login could race on refreshing it.
+[backends.codex]
+harness = "codex"
+auth = {{AUTH}}
+description = "OpenAI Codex agent (GPT models; Codex's default model unless one is given). Strong for code changes, debugging and reviews; edits files and runs commands in cwd inside Codex's sandbox (its shell commands have no network). Uses your ChatGPT plan's Codex quota (auth chatgpt) or your OpenAI API key (auth api-key)."
+max_concurrent = 1

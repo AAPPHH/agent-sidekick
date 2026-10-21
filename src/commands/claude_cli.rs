@@ -171,18 +171,17 @@ pub fn scope_flag(label: &str) -> Option<&'static str> {
         .find(|s| label.starts_with(s))
 }
 
-/// The exact command that removes `entry` (for hints), or a generic instruction
-/// when its scope has no `-s` flag.
+/// How to remove `entry`, as a lowercase clause for hints: "remove it with <the exact
+/// command>", or a generic instruction when its scope has no `-s` flag.
 pub fn remove_hint(entry: &McpEntry) -> String {
-    match entry.scope_flag() {
-        Some("user") => format!("`claude mcp remove {APP_NAME} -s user`"),
-        Some(flag) => format!(
-            "`claude mcp remove {APP_NAME} -s {flag}` (run it in the project directory where it is configured)"
+    match (entry.scope_flag(), entry.scope.as_deref()) {
+        (Some("user"), _) => format!("remove it with `claude mcp remove {APP_NAME} -s user`"),
+        (Some(flag), _) => format!(
+            "remove it with `claude mcp remove {APP_NAME} -s {flag}` (run it in the project \
+             directory where it is configured)"
         ),
-        None => format!(
-            "remove it where it is configured ({})",
-            entry.scope.as_deref().unwrap_or("unknown scope")
-        ),
+        (None, Some(scope)) => format!("remove it where it is configured ({scope})"),
+        (None, None) => "remove it where it is configured".to_owned(),
     }
 }
 
@@ -616,6 +615,10 @@ mod tests {
             }
         }
         assert_eq!(McpEntry::default().scope_flag(), None);
+        assert_eq!(
+            remove_hint(&McpEntry::default()),
+            "remove it where it is configured"
+        );
     }
 
     #[cfg(windows)]

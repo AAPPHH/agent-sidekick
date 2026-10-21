@@ -120,9 +120,6 @@ pub fn format_list(rows: &[Row]) -> String {
             )),
             Some(Ok(path)) => {
                 out.push_str(&format!("{name}: installed\n"));
-                if let Some(note) = stub_note(r.harness) {
-                    out.push_str(note);
-                }
                 out.push_str(&format!("  path:    {path}\n"));
                 match &r.version {
                     Some(Ok(v)) if !v.is_empty() => out.push_str(&format!("  version: {v}\n")),
@@ -135,9 +132,6 @@ pub fn format_list(rows: &[Row]) -> String {
             }
             Some(Err(e)) => {
                 out.push_str(&format!("{name}: not installed ({e})\n"));
-                if let Some(note) = stub_note(r.harness) {
-                    out.push_str(note);
-                }
                 out.push_str(&format!(
                     "  install: `{APP_NAME} harness install {name}` shows the official command\n"
                 ));
@@ -148,16 +142,6 @@ pub fn format_list(rows: &[Row]) -> String {
         }
     }
     redact_all(&out)
-}
-
-/// The extra `harness list` line of a harness no backend can use yet.
-fn stub_note(h: HarnessKind) -> Option<&'static str> {
-    match h {
-        HarnessKind::Codex => Some(
-            "  status:  not enabled yet (stub); backends with harness = \"codex\" are rejected\n",
-        ),
-        _ => None,
-    }
 }
 
 /// What `harness install <name>` prints, or an error for an unknown name.
@@ -222,22 +206,31 @@ mod tests {
             t.contains("  npm (all platforms):   npm install -g @openai/codex\n"),
             "{t}"
         );
+        assert!(
+            t.contains("curl -fsSL https://chatgpt.com/codex/install.sh | sh"),
+            "{t}"
+        );
+        assert!(
+            t.contains("irm https://chatgpt.com/codex/install.ps1 | iex"),
+            "{t}"
+        );
     }
 
     #[test]
-    fn format_list_marks_codex_as_stub() {
-        let note =
-            "  status:  not enabled yet (stub); backends with harness = \"codex\" are rejected\n";
+    fn format_list_shows_codex_like_any_harness() {
         let installed = vec![Row {
             harness: HarnessKind::Codex,
             installed: Some(Ok("C:\\npm\\codex.exe".to_owned())),
             version: Some(Ok("codex-cli 0.163.0".to_owned())),
-            used_by: vec![],
+            used_by: vec!["gpt".to_owned()],
         }];
         let t = format_list(&installed);
-        assert!(t.starts_with("codex: installed\n"), "{t}");
-        assert!(t.contains(note), "{t}");
-        assert!(t.contains("  version: codex-cli 0.163.0\n"), "{t}");
+        assert_eq!(
+            t,
+            "codex: installed\n  path:    C:\\npm\\codex.exe\n  version: codex-cli 0.163.0\n  \
+             used by: gpt\n"
+        );
+        assert!(!t.contains("stub"), "{t}");
 
         let missing = vec![Row {
             harness: HarnessKind::Codex,
@@ -250,17 +243,8 @@ mod tests {
             t.starts_with("codex: not installed (codex not found)\n"),
             "{t}"
         );
-        assert!(t.contains(note), "{t}");
         assert!(t.contains("harness install codex"), "{t}");
-
-        // Other harnesses get no status line.
-        let claude = vec![Row {
-            harness: HarnessKind::Claude,
-            installed: Some(Ok("/usr/bin/claude".into())),
-            version: None,
-            used_by: vec![],
-        }];
-        assert!(!format_list(&claude).contains("status:"));
+        assert!(!t.contains("status:"), "{t}");
     }
 
     #[test]
