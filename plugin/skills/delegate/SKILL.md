@@ -18,7 +18,8 @@ description: When and how to hand work to the agent-sidekick MCP tools (sidekick
 - Write self-contained prompts: the delegated agent does not see this conversation. Name
   the files, the goal and how to verify it (e.g. which test command must pass).
 - Use `fallback` only for tasks that are safe to retry: a failed primary run may already
-  have changed files in `cwd`. Check `git status` after a fallback run.
+  have changed files in `cwd`. Never set a fallback for tasks with side effects outside the
+  working tree (deployments, migrations, pushes). Check `git status` after a fallback run.
 - Never put secrets (tokens, passwords, API keys, customer data) into prompts; prompts and
   output are written to the run log.
 - Do not fan out many parallel runs on a quota-limited backend; check `sidekick_status`.

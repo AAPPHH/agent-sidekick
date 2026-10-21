@@ -31,6 +31,10 @@ agent-sidekick setup --no-register
 agent-sidekick setup --backend <name>   # endpoint keys / command secrets, if configured
 ```
 
+`setup --backend <name>` (0.3.0) ends with "Note: the MCP server `agent-sidekick` is not
+registered with Claude Code; run `agent-sidekick setup --register-only` once to register
+it." With the plugin, ignore that note: following it creates a duplicate server (see below).
+
 ## 3. Install the plugin
 
 In Claude Code:
@@ -40,10 +44,11 @@ In Claude Code:
 /plugin install agent-sidekick@agent-sidekick
 ```
 
-On Claude Code 2.1.275 or later, `/plugin install agent-sidekick --marketplace AAPPHH/agent-sidekick` does both in one step.
 (`/plugin install agent-sidekick` also works as long as no other added marketplace has a
 plugin of that name.) From a shell, the same is `claude plugin marketplace add
-AAPPHH/agent-sidekick` and `claude plugin install agent-sidekick@agent-sidekick`.
+AAPPHH/agent-sidekick` and `claude plugin install agent-sidekick@agent-sidekick`. Recent
+`claude` CLIs (2.1.296 checked) also do both in one step with `claude plugin install
+agent-sidekick --marketplace AAPPHH/agent-sidekick`.
 
 Restart Claude Code (or reload the VS Code window) and check `/mcp`: the server is listed
 as `plugin:agent-sidekick:agent-sidekick` and should be connected.
@@ -62,13 +67,17 @@ twice (`mcp__agent-sidekick__sidekick_run` and
   the registration, so it works with a reduced PATH): do not install the plugin, or
   uninstall it with `/plugin uninstall agent-sidekick@agent-sidekick`.
 
-`agent-sidekick doctor` (0.3.0) only looks at the `setup` registration (`claude mcp get
-agent-sidekick`). With the plugin it reports `[FAIL] MCP registration: agent-sidekick is
-not registered` and suggests `agent-sidekick setup`; ignore that line and hint (following it
-would create the duplicate). Use `/mcp` to check the plugin's server.
+`agent-sidekick doctor` and `agent-sidekick setup --backend <name>` (0.3.0) only look at
+the `setup` registration (`claude mcp get agent-sidekick`). With the plugin, `doctor`
+reports `[FAIL] MCP registration: agent-sidekick is not registered` and suggests
+`agent-sidekick setup`, and `setup --backend` suggests `agent-sidekick setup
+--register-only`; ignore both hints (following them would create the duplicate). Use
+`/mcp` to check the plugin's server.
 
-Permission rules and hooks must use the plugin's tool names, e.g.
-`mcp__plugin_agent-sidekick_agent-sidekick__sidekick_run`.
+Permission rules and hooks must use the plugin's tool names, which follow the documented
+pattern `mcp__plugin_<plugin>_<server>__<tool>`, e.g.
+`mcp__plugin_agent-sidekick_agent-sidekick__sidekick_run` (check the exact name in `/mcp`
+or `/permissions` if a rule does not match).
 
 ## When `agent-sidekick` is not found (VS Code, GUI apps)
 
@@ -83,17 +92,26 @@ first:
 
 1. Quit the app completely and start it again (on Windows from the Start menu or a new
    terminal, after the install finished).
-2. Set the plugin option **agent-sidekick executable** to the absolute path of the binary:
-   `/plugin configure agent-sidekick@agent-sidekick` in Claude Code, or from a shell
-   (example for the Windows default location, adjust the user name):
+2. Set the plugin option **agent-sidekick executable** (`binary`) to the absolute path of
+   the binary. In Claude Code: `/plugin configure agent-sidekick@agent-sidekick`. From a
+   shell (works at install time and again on an already installed plugin; keep the
+   quotes, the path may contain spaces):
 
-   ```sh
-   echo '{"binary":"C:\\Users\\<you>\\AppData\\Local\\Programs\\agent-sidekick\\agent-sidekick.exe"}' \
-     | claude plugin configure agent-sidekick@agent-sidekick --values-stdin
+   ```powershell
+   # Windows default location (PowerShell)
+   claude plugin install agent-sidekick@agent-sidekick --config "binary=$env:LOCALAPPDATA\Programs\agent-sidekick\agent-sidekick.exe"
    ```
 
-   On Linux/macOS the default location is `/home/<you>/.local/bin/agent-sidekick` or
-   `/Users/<you>/.local/bin/agent-sidekick`. Restart Claude Code afterwards.
+   ```sh
+   # Linux / macOS default location
+   claude plugin install agent-sidekick@agent-sidekick --config "binary=$HOME/.local/bin/agent-sidekick"
+   ```
+
+   (In cmd, write `%LOCALAPPDATA%` instead of `$env:LOCALAPPDATA`.) Alternatively save a
+   JSON file such as `{"binary": "C:\\Users\\<you>\\...\\agent-sidekick.exe"}` and run
+   `claude plugin configure agent-sidekick@agent-sidekick --values-stdin < values.json`
+   (sh, bash or cmd; in PowerShell wrap it as `cmd /c "claude ... --values-stdin < values.json"`,
+   because claude rejects JSON piped from PowerShell). Restart Claude Code afterwards.
 
 The server also has to find `claude` for the `claude-*` backends. `setup` stores its path
 in the registration; with the plugin, the server looks at `claude_path` in agent-sidekick's
