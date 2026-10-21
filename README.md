@@ -110,7 +110,7 @@ Notes for the `local` backend:
 
 - **Ollama** (0.14 or later serves the Anthropic Messages API): `ollama pull qwen3-coder`, base URL `http://localhost:11434`. A local Ollama ignores the key, so any value works. Keys shorter than 8 characters (such as `ollama`) are not redacted from the agent's output, so a placeholder never mangles it; `setup` warns about this.
 - **Ollama's cloud** (`https://ollama.com`) needs a real key and `auth = "bearer"`.
-- **LM Studio**: `base_url = "http://localhost:1234"`, `auth = "bearer"` (LM Studio's documentation uses the Bearer form), `model` = the model identifier shown in LM Studio. Optionally `env = { CLAUDE_CODE_ATTRIBUTION_HEADER = "0" }`, which LM Studio recommends so that its prompt cache is not invalidated on every request.
+- **LM Studio**: `base_url = "http://localhost:1234"`, `auth = "bearer"` (LM Studio's documentation uses the Bearer form), `model` = the model identifier shown in LM Studio. Optionally `env = { CLAUDE_CODE_ATTRIBUTION_HEADER = "0" }`, as in LM Studio's Claude Code docs (helps its prompt caching).
 - The model has to handle Claude Code's long system prompt and tool calls; give the server a large context window (e.g. `OLLAMA_CONTEXT_LENGTH`).
 
 ### How the backend is chosen
@@ -193,7 +193,7 @@ Each run's environment is built from the server's environment, so one backend's 
 - Placeholders `{prompt}`, `{cwd}` and `{max_turns}` are replaced inside each element in a single pass. The replacement is never scanned again, so a prompt that contains `{cwd}` stays literal, and `{prompt}` always ends up in **one** argument, whatever it contains. Unknown `{...}` are left as is.
 - `command` must contain `{prompt}`, unless `prompt_via_stdin = true`: then the prompt is written to the program's stdin and `{prompt}` must not appear.
 - A bare program name is looked up in the absolute `PATH` entries (on Windows with `PATHEXT`); empty or relative `PATH` entries are ignored, and a relative path with a directory separator is rejected. An absolute path must exist.
-- On Windows, `.cmd`/`.bat` programs require `prompt_via_stdin = true`: `cmd.exe` cannot pass arbitrary prompt text safely as an argument. Point `command[0]` at an `.exe` otherwise (pip installs Aider as `aider.exe`).
+- On Windows, `.cmd`/`.bat` programs require `prompt_via_stdin = true` (otherwise the run fails with an error): `cmd.exe` cannot pass arbitrary prompt text safely as an argument. Point `command[0]` at an `.exe` otherwise (pip installs Aider as `aider.exe`).
 - The prompt is always an argument unless `prompt_via_stdin` is set; very long prompts can exceed the OS command-line limit (about 32 000 characters on Windows), so prefer `prompt_via_stdin` for tools that support it.
 - The `model` and `allowed_tools` parameters of `sidekick_run` are ignored for command backends (the log notes it); `model` in the backend's config is a config error. Put the model into the command instead.
 - Command backends are configured only in `config.toml`. `sidekick_run` can select one by name but can never supply or change a command.
