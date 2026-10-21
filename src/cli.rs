@@ -64,6 +64,14 @@ where
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(fut)?;
+    let result = rt.block_on(fut);
+    // Dropping the runtime drops every task that is still alive (in-flight runs, whose drop
+    // kills their process trees), but a plain drop would wait forever for blocking threads,
+    // e.g. tokio's stdin reader stuck in a read after a signal. Bound that wait.
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    result?;
     Ok(ExitCode::SUCCESS)
 }
+
+/// Upper bound for blocking threads (stdin reader, keyring access) at exit.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
