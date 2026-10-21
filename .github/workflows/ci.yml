@@ -39,3 +39,158 @@ jobs:
 
       - name: cargo test
         run: cargo test --locked --all-targets
+
+  lint-scripts:
+    name: lint install scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # shellcheck is preinstalled on the ubuntu runner images.
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          # install.sh must stay POSIX sh (it runs as `curl ... | sh`, often dash).
+          shellcheck --shell=sh install.sh
+          shellcheck scripts/*.sh
+          # The release copy (repository filled in) must stay clean too.
+          scripts/render-installers.sh "$RUNNER_TEMP/rendered"
+          shellcheck --shell=sh "$RUNNER_TEMP/rendered/install.sh"
+
+  lint-powershell:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Windows PowerShell 5.1: what a fresh machine runs `irm ... | iex` with.
+      - name: Invoke-ScriptAnalyzer
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          Import-Module PSScriptAnalyzer
+          # Suppressions must be in the scripts themselves, each with a Justification.
+          # -Path takes a single string in PSSA 1.25 (an array fails parameter binding): one call per file.
+          $findings = @()
+          foreach ($p in 'install.ps1', 'scripts/package.ps1') {
+            $findings += @(Invoke-ScriptAnalyzer -Path $p -Severity Error, Warning)
+          }
+          $findings | Format-Table -AutoSize -Wrap ScriptName, Line, Severity, RuleName, Message
+          if ($findings.Count -gt 0) { throw "PSScriptAnalyzer reported $($findings.Count) finding(s)" }
+
+  # Build the release binary, package it exactly like release.yml (same scripts), and install it
+  # with the release copy of the install script from that local directory: temporary install
+  # dir, setup skipped, PATH and shell profiles untouched.
+  install-dry-run:
+    name: install dry-run (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    env:
+      TARGET: ${{ matrix.target }}
+      AGENT_SIDEKICK_NO_SETUP: "1"
+      AGENT_SIDEKICK_NO_MODIFY_PATH: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install musl-tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build and package (unix)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          export "CC_${TARGET//-/_}=musl-gcc"
+          cargo build --release --locked --target "$TARGET"
+          scripts/package.sh "$TARGET" "target/$TARGET/release/agent-sidekick" "$RUNNER_TEMP/dist"
+          scripts/render-installers.sh "$RUNNER_TEMP/dist"
+          ls -l "$RUNNER_TEMP/dist"; cat "$RUNNER_TEMP/dist/SHA256SUMS"
+
+      - name: Install from the local artifact dir (unix)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          export AGENT_SIDEKICK_INSTALL_BASE_URL="$RUNNER_TEMP/dist"
+          export AGENT_SIDEKICK_INSTALL_DIR="$RUNNER_TEMP/install"
+          # stdin is the script, as with `curl ... | sh`; run twice to cover the upgrade in place.
+          sh < "$RUNNER_TEMP/dist/install.sh"
+          sh < "$RUNNER_TEMP/dist/install.sh"
+          expected="agent-sidekick $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          actual=$("$AGENT_SIDEKICK_INSTALL_DIR/agent-sidekick" --version)
+          echo "$actual"
+          [ "$actual" = "$expected" ] || { echo "::error::expected '$expected', got '$actual'"; exit 1; }
+          # A tampered archive must be rejected.
+          cp -r "$RUNNER_TEMP/dist" "$RUNNER_TEMP/bad"
+          sed -i 's/^[0-9a-f]\{64\}/0000000000000000000000000000000000000000000000000000000000000000/' "$RUNNER_TEMP/bad/SHA256SUMS"
+          if AGENT_SIDEKICK_INSTALL_BASE_URL="$RUNNER_TEMP/bad" AGENT_SIDEKICK_INSTALL_DIR="$RUNNER_TEMP/install-bad" \
+               sh < "$RUNNER_TEMP/dist/install.sh"; then
+            echo "::error::install.sh accepted a checksum mismatch"; exit 1
+          fi
+          [ ! -e "$RUNNER_TEMP/install-bad/agent-sidekick" ]
+
+      - name: Build and package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+          ./scripts/package.ps1 $env:TARGET "target/$env:TARGET/release/agent-sidekick.exe" "$env:RUNNER_TEMP/dist"
+
+      # Own step with `shell: bash` (Git Bash on the Windows runners): a plain `bash` call from pwsh
+      # depends on PATH order and could pick another bash (e.g. the WSL launcher).
+      - name: Render installers (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="$(cygpath -u "$RUNNER_TEMP")/dist"
+          scripts/render-installers.sh "$dist"
+          ls -l "$dist"; cat "$dist/SHA256SUMS"
+
+      # Windows PowerShell 5.1, the way `irm ... | iex` runs it on a fresh machine.
+      - name: Install from the local artifact dir (windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $userPathBefore = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $env:AGENT_SIDEKICK_INSTALL_BASE_URL = "$env:RUNNER_TEMP\dist"
+          $env:AGENT_SIDEKICK_INSTALL_DIR = "$env:RUNNER_TEMP\install"
+          $script = Get-Content -Raw "$env:RUNNER_TEMP\dist\install.ps1"
+          # Twice: the second run upgrades in place.
+          $script | Invoke-Expression
+          $script | Invoke-Expression
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $actual = & "$env:RUNNER_TEMP\install\agent-sidekick.exe" --version
+          Write-Output $actual
+          if ($actual -ne "agent-sidekick $version") { throw "expected 'agent-sidekick $version', got '$actual'" }
+          if ([Environment]::GetEnvironmentVariable('Path', 'User') -ne $userPathBefore) { throw 'user PATH was modified' }
+          # A tampered archive must be rejected.
+          Copy-Item -Recurse "$env:RUNNER_TEMP\dist" "$env:RUNNER_TEMP\bad"
+          $sums = "$env:RUNNER_TEMP\bad\SHA256SUMS"
+          $bad = ([IO.File]::ReadAllText($sums)) -replace '(?m)^[0-9a-f]{64}', ('0' * 64)
+          [IO.File]::WriteAllText($sums, $bad)
+          $env:AGENT_SIDEKICK_INSTALL_BASE_URL = "$env:RUNNER_TEMP\bad"
+          $env:AGENT_SIDEKICK_INSTALL_DIR = "$env:RUNNER_TEMP\install-bad"
+          $rejected = $false
+          try { $script | Invoke-Expression } catch { $rejected = $true; Write-Output "rejected as expected: $($_.Exception.Message)" }
+          if (-not $rejected) { throw 'install.ps1 accepted a checksum mismatch' }
+          if (Test-Path "$env:RUNNER_TEMP\install-bad\agent-sidekick.exe") { throw 'binary installed despite checksum mismatch' }

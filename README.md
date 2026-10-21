@@ -10,18 +10,20 @@ It is a single binary with no runtime dependencies besides the official `claude`
 1. **Install** the binary (release archives are verified against `SHA256SUMS`):
 
    ```sh
-   # Linux / macOS (installs to ~/.local/bin)
-   curl -fsSL https://github.com/OWNER/agent-sidekick/releases/latest/download/install.sh | sh
+   # Linux x86_64 / aarch64 (static binary, installs to ~/.local/bin)
+   curl -fsSL https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.sh | sh
    ```
 
    ```powershell
    # Windows (installs to %LOCALAPPDATA%\Programs\agent-sidekick and adds it to the user PATH)
-   irm https://github.com/OWNER/agent-sidekick/releases/latest/download/install.ps1 | iex
+   irm https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.ps1 | iex
    ```
 
-   Or build from source: `cargo install --path .`
+   Or build from source (also the way to go on macOS for now): `cargo install --locked --git https://github.com/AAPPHH/agent-sidekick`
 
-   > `OWNER/agent-sidekick` is a placeholder until the repository is published; set `REPO=owner/name` for the install scripts.
+   Pin a version with `VERSION=v0.3.0` (PowerShell: `$env:VERSION = 'v0.3.0'`). Re-running the installer upgrades
+   in place. When the terminal is interactive the installer finishes by running `agent-sidekick setup`; set
+   `AGENT_SIDEKICK_NO_SETUP=1` to skip that. More options are listed at the top of `install.sh` / `install.ps1`.
 
 2. **Create a token for the agent account.** Log in with the account the sidekick should use:
 

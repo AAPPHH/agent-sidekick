@@ -1,38 +1,68 @@
 name: Release
 
-# Manual build matrix (see NOTES.md for why cargo-dist is not used).
+# Manual build matrix (see NOTES.md for why cargo-dist is not used, and the section
+# "Distribution (release, install, plugin, update)" for targets, asset names and checksums).
+#
+# Assets of a release:
+#   agent-sidekick-x86_64-unknown-linux-musl.tar.gz    static Linux x86_64
+#   agent-sidekick-aarch64-unknown-linux-musl.tar.gz   static Linux arm64
+#   agent-sidekick-x86_64-pc-windows-msvc.zip          Windows x86_64 (static CRT)
+#   install.sh, install.ps1                            repository filled in from Cargo.toml
+#   SHA256SUMS                                         "<sha256>  <file>" for all of the above
+# Archives are built by scripts/package.sh / scripts/package.ps1, the same scripts ci.yml uses
+# for the install dry-run. macOS is built (non-blocking) but not published yet.
 on:
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   BIN: agent-sidekick
 
 jobs:
+  check:
+    name: tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare tag and package version
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == env.BIN) | .version')
+          tag="${GITHUB_REF_NAME}"
+          if [ "v$version" != "$tag" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $version (expected tag v$version)"
+            exit 1
+          fi
+          echo "version $version matches tag $tag"
+
+      - name: Repository in Cargo.toml is usable for the install scripts
+        run: scripts/render-installers.sh "$RUNNER_TEMP/rendered"
+
   build:
     name: build (${{ matrix.target }})
+    needs: check
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # Static musl builds run on any Linux regardless of the glibc version. keyring's
+          # Secret Service store uses zbus (pure Rust D-Bus), so no libdbus is needed.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
           # Native arm64 runner (free for public repositories).
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
+          # Static CRT via .cargo/config.toml: no Visual C++ Redistributable needed.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-          # macos-latest is arm64; x86_64 is cross-compiled via the added target.
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -45,58 +75,115 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install musl-tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET" == *musl ]]; then
+            # ring (via rustls) compiles C code; use the musl toolchain for it.
+            export "CC_${TARGET//-/_}=musl-gcc"
+          fi
+          cargo build --release --locked --target "$TARGET"
 
       - name: Package (unix)
         if: runner.os != 'Windows'
-        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          name="$BIN-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/$BIN" "dist/$name/"
-          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
-          # Files at the archive root so install.sh can find the binary directly.
-          tar -C "dist/$name" -czf "dist/$name.tar.gz" .
-          echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
+          exe="target/$TARGET/release/$BIN"
+          "$exe" --version
+          scripts/package.sh "$TARGET" "$exe" dist
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $name = "$env:BIN-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/$env:BIN.exe" "dist/$name/"
-          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE "dist/$name/"
-          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
-          "ASSET=dist/$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $exe = "target/$env:TARGET/release/$env:BIN.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "$exe --version failed" }
+          ./scripts/package.ps1 $env:TARGET $exe dist
 
+      # Only the archive: SHA256SUMS is recomputed over all assets in the publish job.
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BIN }}-${{ matrix.target }}
-          path: ${{ env.ASSET }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  # Build-only, not required for the release and not published (no macOS asset yet; install.sh
+  # points macOS users to `cargo install`). Kept so a breaking change on macOS is noticed.
+  build-macos:
+    name: build (aarch64-apple-darwin, non-blocking)
+    needs: check
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-darwin
+          exe="target/aarch64-apple-darwin/release/$BIN"
+          "$exe" --version
+          scripts/package.sh aarch64-apple-darwin "$exe" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-aarch64-apple-darwin
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   release:
     name: publish release
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: ${{ env.BIN }}-*
           merge-multiple: true
+
+      - name: Install scripts with the repository filled in
+        run: scripts/render-installers.sh dist
 
       - name: Create SHA256SUMS
         working-directory: dist
         run: |
           set -euo pipefail
+          # The macOS build is not published (it may or may not have finished by now).
+          rm -f ./*apple-darwin*
+          for f in "$BIN-x86_64-unknown-linux-musl.tar.gz" "$BIN-aarch64-unknown-linux-musl.tar.gz" \
+                   "$BIN-x86_64-pc-windows-msvc.zip" install.sh install.ps1; do
+            [ -f "$f" ] || { echo "::error::missing release asset $f"; exit 1; }
+          done
           # Bare file names: the install scripts look up "<hash>  <archive>".
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          sha256sum ./*.tar.gz ./*.zip install.sh install.ps1 | sed 's#  \./#  #' > SHA256SUMS
           cat SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
@@ -106,6 +193,6 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/install.sh
+            dist/install.ps1
             dist/SHA256SUMS
-            install.sh
-            install.ps1
