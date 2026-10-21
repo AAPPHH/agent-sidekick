@@ -18,13 +18,16 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Store the agent account's OAuth token and register the MCP server with Claude Code.
+    /// Store the backends' tokens and register the MCP server with Claude Code
+    /// (`--backend <name>`: set up only that backend).
     Setup(commands::setup::SetupArgs),
     /// Run the MCP server over stdio (started by Claude Code, not by hand).
     Serve,
-    /// Check the installation and print next steps for anything that is missing.
+    /// Check the installation and all backends; print next steps for anything that is missing.
     Doctor,
-    /// Remove the stored token and the MCP registration.
+    /// List or test the configured backends.
+    Backends(commands::backends::BackendsArgs),
+    /// Remove the stored tokens/API keys of all backends and the MCP registration.
     Uninstall(commands::uninstall::UninstallArgs),
 }
 
@@ -42,6 +45,10 @@ pub fn main() -> ExitCode {
         Command::Doctor => {
             let _guard = logging::init(logging::Mode::Cli);
             commands::doctor::run()
+        }
+        Command::Backends(args) => {
+            let _guard = logging::init(logging::Mode::Cli);
+            commands::backends::run(args)
         }
         Command::Uninstall(args) => {
             let _guard = logging::init(logging::Mode::Cli);
