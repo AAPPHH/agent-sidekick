@@ -348,11 +348,12 @@ claude_path = "/abs/path/to/claude"  # optional, used by claude-* backends
 pass_env = []             # inherited variables to keep for every backend, see above
 ```
 
-`[backends.<name>]` keys (names: 1-32 characters `a-z`, `0-9`, `_`, `-`, starting with a letter or digit; keys not valid for the type are a config error):
+`[backends.<name>]` keys (names: 1-32 characters `a-z`, `0-9`, `_`, `-`, starting with a letter or digit; keys not valid for the type or harness are a config error):
 
 | Key | Types | Default | Meaning |
 |-----|-------|---------|---------|
-| `type` | all | (required) | `claude-oauth`, `claude-endpoint` or `command`. |
+| `type` | all | (required, or `harness`) | `claude-oauth`, `claude-endpoint` or `command`. |
+| `harness` | all | (required, or `type`) | `claude` (claude-oauth without `base_url`, claude-endpoint with it) or `command`. If both `type` and `harness` are set they must agree. |
 | `description` | all | (required) | What the backend is good for; read by the calling session. |
 | `default` | all | `false` | Exactly one backend must have `default = true`. |
 | `cost` | all | `quota` (claude-oauth), `paid` (claude-endpoint), `free` (command) | `free`, `quota` or `paid`; informs the caller. |

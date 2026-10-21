@@ -70,7 +70,19 @@ fn list() -> String {
         }
     };
     let claude_path = cfg.as_ref().and_then(|c| c.claude_path.clone());
-    let backends = cfg.as_ref().and_then(|c| crate::backends::resolve(c).ok());
+    let backends = cfg
+        .as_ref()
+        .and_then(|c| match crate::backends::resolve(c) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!(
+                    "warning: [backends] is invalid ({}); \"used by\" is left empty \
+                     (run `agent-sidekick backends list` for details)",
+                    redact_all(&e)
+                );
+                None
+            }
+        });
     let rows: Vec<Row> = HarnessKind::ALL
         .into_iter()
         .map(|h| {

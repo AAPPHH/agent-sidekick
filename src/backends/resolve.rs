@@ -275,7 +275,12 @@ fn resolve_one(
         BackendType::Command => SECRET_PASS_ENV_COMMAND,
         _ => SECRET_PASS_ENV_CLAUDE,
     };
-    for e in check_pass_env(&pass_env, denied, &format!("a {kind} backend")) {
+    // Legacy `type` configs keep the v0.3 wording; `harness` configs name what was written.
+    let pass_env_scope = match raw.kind {
+        Some(_) => format!("a {kind} backend"),
+        None => format!("a backend with {written_as}"),
+    };
+    for e in check_pass_env(&pass_env, denied, &pass_env_scope) {
         errs.push(format!("pass_env: {e}"));
     }
 

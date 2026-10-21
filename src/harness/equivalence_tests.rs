@@ -453,6 +453,28 @@ fn harness_field_errors() {
         e.contains("field `base_url` is not allowed for harness `command`"),
         "{e}"
     );
+    // pass_env refusals name the harness as written; legacy `type` keeps the v0.3 text.
+    let e = resolve_str(&one(
+        "harness = \"claude\"",
+        "pass_env = [\"CLAUDE_CODE_OAUTH_TOKEN\"]\n",
+    ))
+    .unwrap_err();
+    assert!(
+        e.contains(
+            "pass_env: `CLAUDE_CODE_OAUTH_TOKEN` must not be passed through to a backend with \
+             harness `claude` without `base_url` (claude-oauth mode)"
+        ),
+        "{e}"
+    );
+    let e = resolve_str(&one(
+        "type = \"claude-oauth\"",
+        "pass_env = [\"CLAUDE_CODE_OAUTH_TOKEN\"]\n",
+    ))
+    .unwrap_err();
+    assert!(
+        e.contains("must not be passed through to a claude-oauth backend"),
+        "{e}"
+    );
     // Neither harness nor type.
     let e = resolve_str(&one("", "")).unwrap_err();
     assert!(e.contains("`type` is required"), "{e}");
