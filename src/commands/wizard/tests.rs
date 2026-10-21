@@ -360,7 +360,7 @@ fn fresh_kiconnect_only() {
     let b = fake.resolved();
     assert_eq!(b.names(), ["kiconnect"]);
     assert_eq!(b.default_backend().name, "kiconnect");
-    assert!(fake.written().starts_with(templates::HEADER));
+    assert!(fake.written().starts_with(&templates::header()));
     assert_eq!(
         fake.secret(&SecretId::Backend("kiconnect".into()))
             .as_deref(),
@@ -447,6 +447,9 @@ fn fresh_all_three_with_gemini_as_default() {
     assert!(out.contains("ZWEITE"), "{out}");
     assert!(out.contains(EXPECTED_PREFIX), "{out}");
     assert!(out.contains("https://aistudio.google.com/apikey"), "{out}");
+    // The --skip-trust risk is named when Gemini is set up.
+    assert!(out.contains(super::GEMINI_WARNING), "{out}");
+    assert!(out.contains(".gemini/settings.json"), "{out}");
 }
 
 #[test]
@@ -474,6 +477,7 @@ fn fresh_claude_only_needs_no_node() {
         "{out}"
     );
     assert!(!out.contains("verlängert sich bei jeder"), "{out}");
+    assert!(!out.contains("Achtung, Gemini"), "{out}");
 }
 
 #[test]
@@ -536,12 +540,38 @@ fn nothing_selected_is_asked_again_then_aborts() {
 
 #[test]
 fn claude_code_missing_aborts() {
-    let mut fake = Fake::new();
-    fake.claude = None;
-    let (err, _) = run_err(&fake, vec![]);
-    assert!(err.contains("Claude Code wurde nicht gefunden"), "{err}");
-    assert!(err.contains("setup` erneut"), "{err}");
-    assert_nothing_written(&fake);
+    for os in [Os::Windows, Os::Unix] {
+        let mut fake = Fake::new();
+        fake.os = os;
+        fake.claude = None;
+        let (err, _) = run_err(&fake, vec![]);
+        assert!(err.contains("Claude Code wurde nicht gefunden"), "{err}");
+        assert!(
+            err.contains("VS-Code-Erweiterung allein reicht nicht"),
+            "{err}"
+        );
+        assert!(err.contains(super::claude_install_command(os)), "{err}");
+        assert!(err.contains("neues Terminal"), "{err}");
+        assert!(err.contains("VS Code komplett neu"), "{err}");
+        assert!(err.contains("setup` erneut"), "{err}");
+        assert_nothing_written(&fake);
+    }
+    assert_eq!(
+        super::claude_install_command(Os::Windows),
+        "irm https://claude.ai/install.ps1 | iex"
+    );
+    assert_eq!(
+        super::claude_install_command(Os::Unix),
+        "curl -fsSL https://claude.ai/install.sh | bash"
+    );
+    // The same commands as the `claude` harness's install hint (checked against the docs).
+    let hint = crate::harness::HarnessKind::Claude
+        .adapter()
+        .install_hint()
+        .unwrap();
+    for os in [Os::Windows, Os::Unix] {
+        assert!(hint.contains(super::claude_install_command(os)), "{hint}");
+    }
 }
 
 // ----- Node.js and installs -----
@@ -556,6 +586,9 @@ fn node_missing_aborts_with_instructions_and_writes_nothing() {
         let (err, out) = run_err(&fake, vec![A::Many(vec![0])]);
         assert!(err.contains("Node.js fehlt"), "{err}");
         assert!(err.contains("`agent-sidekick setup` erneut"), "{err}");
+        // A new VS Code terminal keeps VS Code's old PATH.
+        assert!(err.contains("VS Code komplett neu"), "{err}");
+        assert!(out.contains("VS Code komplett neu"), "{out}");
         assert!(out.contains("https://nodejs.org/en/download"), "{out}");
         match os {
             Os::Windows => assert!(out.contains("winget install OpenJS.NodeJS.LTS"), "{out}"),
@@ -738,7 +771,7 @@ fn existing_config_backup_and_rewrite() {
         .to_string_lossy()
         .ends_with("config.toml.bak-20261021-120000"));
     assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), EXAMPLE);
-    assert!(fake.written().starts_with(templates::HEADER));
+    assert!(fake.written().starts_with(&templates::header()));
     assert_eq!(fake.resolved().names(), ["kiconnect"]);
 
     // A second backup in the same second does not overwrite the first.
