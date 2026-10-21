@@ -679,6 +679,25 @@ fn gemini_declined_drops_the_profile() {
     assert_nothing_written(&fake);
 }
 
+#[test]
+fn gemini_without_npm_is_skipped_with_one_hint() {
+    let mut fake = Fake::new();
+    fake.npm = None;
+    *fake.gemini.borrow_mut() = None;
+    let (_, out) = run_ok(&fake, vec![A::Many(vec![1, 2]), A::Secret(CLAUDE_TOKEN)]);
+    assert!(out.contains("npm wurde neben Node.js nicht gefunden"), "{out}");
+    assert!(out.contains("Gemini wird übersprungen"), "{out}");
+    // The manual command is named once, and the wizard does not tell the user to start
+    // over while it keeps going.
+    assert_eq!(
+        out.matches("npm install -g @google/gemini-cli").count(),
+        1,
+        "{out}"
+    );
+    assert!(!out.contains(RESUME), "{out}");
+    assert_eq!(fake.resolved().names(), ["sidekick"]);
+}
+
 // ----- existing config -----
 
 const EXAMPLE: &str = include_str!("../../../examples/config.toml");

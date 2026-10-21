@@ -208,11 +208,6 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
                 gemini_entry = Some((node.to_path_buf(), e));
             }
             None => {
-                p.say(&format!(
-                    "Gemini wird übersprungen, weil die Gemini CLI fehlt. Installiere sie mit \
-                     `npm install -g {}`. {RESUME}",
-                    npm::GEMINI_PACKAGE
-                ));
                 profiles.retain(|&x| x != Profile::Gemini);
                 if profiles.is_empty() {
                     bail!(
@@ -221,6 +216,12 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
                         npm::GEMINI_PACKAGE
                     );
                 }
+                p.say(&format!(
+                    "Gemini wird übersprungen; die übrigen Profile werden jetzt eingerichtet. \
+                     Gemini später hinzufügen: `npm install -g {}`, dann `agent-sidekick setup` \
+                     noch einmal ausführen.",
+                    npm::GEMINI_PACKAGE
+                ));
             }
         }
     }
@@ -464,9 +465,9 @@ fn offer_install(
     what: &str,
 ) -> Result<bool> {
     let Some(base) = s.npm(node) else {
+        // The caller names the manual `npm install -g` command next; not repeated here.
         p.say(&format!(
-            "{what} ist nicht installiert, und npm wurde neben Node.js nicht gefunden. \
-             Installiere es selbst mit: npm install -g {package}"
+            "{what} ist nicht installiert, und npm wurde neben Node.js nicht gefunden."
         ));
         return Ok(false);
     };
