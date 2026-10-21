@@ -95,3 +95,48 @@ Probed against a local fake Anthropic API (no quota used):
 ## Verification status
 
 TODO: filled in by the orchestrator at the end.
+
+## OpenAI-compatible providers (KI:connect.nrw) and the LiteLLM proxy
+
+Probed on 2026-10-21 (no agent runs).
+
+**KI:connect.nrw** (`https://chat.kiconnect.nrw/api/v1`, vLLM 0.31 behind a gateway):
+- OpenAI-compatible only: `GET /models` and `POST /chat/completions` work with `Authorization: Bearer`.
+- No Anthropic Messages API: `POST …/messages` returns the web app's HTML 404 with Bearer, and 401
+  "No API key provided" with `x-api-key`. So it can NOT be used directly as a `claude-endpoint` backend.
+- Models seen: `openai-gpt-oss-120b`, `qwen-qwen3-8-27b`, `Mistral Small 3.2 24B Instruct 2506`
+  (id contains spaces), plus embedding models.
+- gpt-oss is a reasoning model: a 40-token answer was used up by reasoning (`finish_reason: length`),
+  so budgets must be generous (the requested `max_tokens 2000` for probes).
+
+**Option A: `command` backend with aider.** aider 0.86.2 via `uvx --python 3.12 --from aider-chat aider`
+works (`--model openai/<id>`, `OPENAI_API_BASE`, `OPENAI_API_KEY`). On Windows it crashes on cp1252
+consoles unless `PYTHONUTF8=1` is set. A full aider run against KI:connect was not verified here
+(the harness refused to start an autonomous agent with `--yes-always`). The user runs it manually
+(see the test kit in `C:\clones\aider-kiconnect-test`).
+
+**Option B: `claude-endpoint` via a LiteLLM proxy** (`uvx --from 'litellm[proxy]' litellm`):
+- Use the provider prefix `hosted_vllm/<model>`, NOT `openai/<model>`: with `openai/`, LiteLLM forwards
+  Anthropic `/v1/messages` to the OpenAI **Responses API** (`/v1/responses`), which an OpenAI-compatible
+  vLLM gateway may not offer. With `hosted_vllm/` it uses `/chat/completions`.
+- Verified: the proxy starts (about 20 s on first `uvx` download, then a few seconds). `POST /v1/messages` with
+  `max_tokens 2000` is routed to KI:connect. With the rotated (invalid) key the upstream answered 401
+  `invalid_auth_header`, passed through as an Anthropic `authentication_error`.
+- **Tool use through the proxy: works (verified against a local fake OpenAI upstream)**, both
+  non-streaming and streaming (Claude Code always streams):
+  - Anthropic `tools` become OpenAI `tools` (`type: function`), and `max_tokens` is passed through.
+  - The upstream's `tool_calls`, also when streamed in argument fragments, become one `tool_use` block
+    with correct `input`, and `stop_reason: tool_use`. The SSE sequence is `message_start`,
+    `content_block_start`, `content_block_delta`×n (`input_json_delta`), `content_block_stop`,
+    `message_delta`, `message_stop`.
+  - The follow-up `tool_result` becomes a `role: tool` message, and the final text ends with `end_turn`.
+- **Not verified: whether KI:connect's models actually emit tool calls.** vLLM only does that when the
+  operator enables `--enable-auto-tool-choice` with a tool-call parser. Checking it needs a valid key,
+  so the user runs `tooltest.py` / `streamtest.py` from `C:\clones\aider-kiconnect-test\litellm`.
+- Backend config: `base_url = "http://127.0.0.1:4000"`, `model = "<litellm model_name>"`, API key =
+  LiteLLM master key (`setup --backend`). Map Claude Code's aliases to the same model via the backend `env`
+  table: `ANTHROPIC_DEFAULT_HAIKU_MODEL` (background tasks), `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+  `ANTHROPIC_DEFAULT_OPUS_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL`, names verified in the Claude Code docs.
+  The `env` table is applied after session isolation, so these `CLAUDE_CODE_*` and `ANTHROPIC_*` names
+  are allowed there. The provider key stays in the proxy's environment only.
+- The proxy is an extra runtime process (Python via uvx). agent-sidekick does not start or manage it.
