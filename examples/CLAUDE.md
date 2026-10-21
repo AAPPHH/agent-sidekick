@@ -1,7 +1,9 @@
 # Delegation with agent-sidekick
 
 These rules are for the main Claude Code session. Adapt the backend names to your
-`config.toml` (this example matches `examples/config.toml`: `sidekick`, `local`, `aider`).
+`config.toml` (this example covers all four backends of `examples/config.toml`: `sidekick`,
+`local`, `aider` and the optional `kiconnect`; drop the rules for backends you do not
+configure and add one for every other backend you do).
 
 - Before the first delegation in a session, call `sidekick_backends` and read each backend's
   `description`, `cost` and `reachable`. Do not delegate to a backend that is not reachable.
@@ -13,6 +15,11 @@ These rules are for the main Claude Code session. Adapt the backend names to you
     debugging, anything that needs real reasoning about the codebase.
   - `aider` (free, edits files directly without asking): small, well-specified edits to
     files you name in the prompt. Review the diff afterwards; its changes are not committed.
+  - `kiconnect` (free university quota, hosted model via Aider, edits files directly
+    without asking and without git): boilerplate, tests and small, well-specified changes
+    when `local` is unavailable or too slow. Only reachable once its key is stored. The
+    prompt goes to a hosted service, so do not use it for confidential code. Review the diff
+    afterwards.
   - Keep work you need to judge carefully (security, data migrations, public APIs) in this
     session.
 - Always pass `cwd` (absolute path of the project). The server's own working directory is
@@ -25,7 +32,7 @@ These rules are for the main Claude Code session. Adapt the backend names to you
   fallback run.
 - Never put secrets (tokens, passwords, API keys, customer data) into prompts. Prompts and
   output are written to the run log.
-- Prefer `local`/`aider` when the `sidekick` account is busy (see `sidekick_status`) or for
+- Prefer `local`/`aider`/`kiconnect` when the `sidekick` account is busy (see `sidekick_status`) or for
   bulk work; do not fan out many parallel `sidekick` runs.
 - After a delegated run, read the result (exit code, output tail) and verify the change
   yourself (diff, tests) before building on it. The first line of the result names the

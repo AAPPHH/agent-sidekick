@@ -1,4 +1,6 @@
-# agent-sidekick config.toml with four backends.
+# agent-sidekick config.toml with four backends: sidekick, local and aider (the example in the
+# README) plus the optional kiconnect (section 4), which needs a stored key. The routing
+# rules in examples/CLAUDE.md cover the same four backends.
 #
 # Copy to the config directory:
 #   Linux:   ~/.config/agent-sidekick/config.toml
@@ -50,13 +52,17 @@ cost = "free"
 base_url = "http://localhost:11434"
 model = "qwen3-coder"
 # auth = "x-api-key"        # default: ANTHROPIC_API_KEY (x-api-key header); "bearer": ANTHROPIC_AUTH_TOKEN
-# api_key_env = "OLLAMA_API_KEY"   # read the key from this variable of the MCP server's environment instead
+# api_key_env = "OLLAMA_API_KEY"   # read the key from this variable of the MCP server's environment instead;
+#                                  # it is then removed from the environment of every other backend
+#    base_url must not contain credentials (user:password@; config error), and its host must be
+#    ASCII (xn-- form for internationalised names) with a valid port.
 # config_dir = "~/.claude-sidekick-local"   # default ~/.claude-sidekick-<name>; must differ from every claude-oauth dir
 # max_concurrent = 1        # a local GPU usually serves one request at a time well
 
 # 3) Aider (https://aider.chat) with the same local model, as a command backend.
 #    No shell is involved: every array element is one argument, and {prompt} is replaced by
-#    the whole prompt as a single argument. Placeholders: {prompt}, {cwd}, {max_turns}.
+#    the whole prompt as a single argument. Placeholders: {prompt}, {cwd}, {max_turns}; they
+#    are replaced only after command[0] (a placeholder in the program name is a config error).
 #    Aider has no turn limit flag, so {max_turns} is not used here.
 #    --message: process one message, then exit. --yes-always: answer every confirmation
 #    with yes. --no-auto-commits: leave the changes uncommitted for review.
@@ -71,7 +77,9 @@ max_concurrent = 1
 # pass_env = ["ANTHROPIC_API_KEY"]   # a command backend may keep an inherited variable that is normally removed
 # secret_env = "ANTHROPIC_API_KEY"   # or hand it a stored secret instead, see 4)
 
-# 4) Aider against a hosted OpenAI-compatible API that needs a key (here the KI:connect.nrw
+# 4) Optional: delete this section if you do not use it. It is not reachable (and runs on it
+#    fail) until its key is stored.
+#    Aider against a hosted OpenAI-compatible API that needs a key (here the KI:connect.nrw
 #    gateway of German universities; any OpenAI-compatible endpoint works the same way).
 #    secret_env names the variable that receives the backend's stored secret. Store it with
 #    `agent-sidekick setup --backend kiconnect` (hidden prompt; OS keyring user

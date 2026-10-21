@@ -69,7 +69,7 @@ As soon as `[backends]` exists, only the backends listed there are available.
 
 ### Example
 
-Three backends: the second Claude account (default), Claude Code against a local `qwen3-coder` in Ollama, and Aider with the same model. The commented version is [`examples/config.toml`](examples/config.toml).
+Three backends: the second Claude account (default), Claude Code against a local `qwen3-coder` in Ollama, and Aider with the same model. The commented version is [`examples/config.toml`](examples/config.toml); it adds a fourth, optional backend `kiconnect` (see [Command backend with a stored key](#command-backend-with-a-stored-key)), which is reachable only after its key is stored.
 
 ```toml
 max_concurrent = 2          # global limit over all backends
@@ -167,7 +167,7 @@ A run waits for a slot of its backend first, then for a global slot; queued runs
 - `claude-endpoint`: `claude` is found, the key is available (stored, or the `api_key_env` variable is set), and an HTTP `GET` of `base_url` answers within 2 seconds. Any HTTP response counts, also 4xx/5xx; connection errors and timeouts do not.
 - `command`: the program (`command[0]`) is found, and with `secret_env` a secret is stored for the backend.
 
-The HTTP probe is the only network request agent-sidekick makes itself. It goes only to the configured `base_url`, carries no credentials (user info in the URL is stripped), follows no redirects, has a 2 s timeout and runs only for `sidekick_backends`, `agent-sidekick backends list --check` / `backends test`, `doctor`, and right before a run on a `claude-endpoint` backend.
+The HTTP probe is the only network request agent-sidekick makes itself. It goes only to the configured `base_url` (which must not contain credentials, see [claude-endpoint backends](#claude-endpoint-backends)), carries no credentials, follows no redirects, has a 2 s timeout and runs only for `sidekick_backends`, `agent-sidekick backends list --check` / `backends test`, `doctor`, and right before a run on a `claude-endpoint` backend.
 Loopback hosts are probed directly; other hosts go through the proxy from `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (honouring `NO_PROXY`), as `claude` itself would. A proxy that answers for an unreachable upstream makes the endpoint look reachable.
 
 ### Secrets per backend
@@ -181,15 +181,19 @@ Loopback hosts are probed directly; other hosts go through the proxy from `HTTPS
 | `command` without `secret_env` | none | none | none |
 
 A backend named `sidekick` therefore keeps using the token of a v0.1 installation. Files are created with mode 0600 (Unix) or a user-only ACL (Windows).
-`api_key_env` is read from the environment of the MCP server, i.e. what Claude Code passes to it; set the variable globally or add it to the registration (`claude mcp add ... -e NAME=value`).
+`api_key_env` is read from the environment of the MCP server, i.e. what Claude Code passes to it; set the variable in the user or OS environment that Claude Code inherits, or add it to the registration (`claude mcp add ... -e NAME=value`). Re-running `agent-sidekick setup` keeps such extra `-e` variables of the user-scope registration (it prints their names, never their values), see [CLI reference](#cli-reference).
+The variable is removed from the environment of every other backend's runs, see [session isolation](#child-environment-and-session-isolation).
 
 ### Child environment and session isolation
 
 Every child inherits the MCP server's environment, minus:
 
-- every variable starting with `CLAUDE_CODE_` or `CLAUDE_AGENT_SDK_`, and `CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `CLAUDE_CONFIG_DIR`, `AI_AGENT`, `MCP_CONNECTION_NONBLOCKING`;
+- every variable starting with `CLAUDE_CODE_` or `CLAUDE_AGENT_SDK_`, and `CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `CLAUDE_CONFIG_DIR`, `AI_AGENT`, `MCP_CONNECTION_NONBLOCKING`. Exception: `CLAUDE_CODE_GIT_BASH_PATH` is kept, because Claude Code on Windows needs it to find Git Bash (it is host configuration, not session state or a credential);
 - competing credentials: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `AGENT_SIDEKICK_TOKEN` (and `CLAUDE_CODE_OAUTH_TOKEN` via the prefix rule);
-- `ANTHROPIC_BASE_URL` for `claude-endpoint` (which sets its own) and `command` backends. For `claude-oauth` an inherited `ANTHROPIC_BASE_URL` is kept (proxies) and logged as a warning.
+- every variable named in the `api_key_env` of any configured backend, for all other backends, so one endpoint's key never reaches another backend's child (the owning endpoint gets its key as `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` anyway);
+- `ANTHROPIC_BASE_URL` for `claude-endpoint` (which sets its own) and `command` backends. For `claude-oauth` an inherited `ANTHROPIC_BASE_URL` is kept (proxies) and logged as a warning;
+- `ANTHROPIC_CUSTOM_HEADERS` for `claude-endpoint` and `command` backends: Claude Code adds these headers to every API request, so a gateway credential of the caller would otherwise reach a third-party `base_url`. It is kept for `claude-oauth`;
+- inherited model overrides (`ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`) for `claude-endpoint`: the backend configures its own `model`, and the caller's model names usually do not exist on that endpoint. Set them in the backend's `env` table when the endpoint needs them. Other inherited `ANTHROPIC_*` variables of `command` backends are left alone (tools such as Aider may use them).
 
 Why: Claude Code starts the MCP server and passes its session variables on (session id, entrypoint, a messaging socket and token, ...). A child `claude` that sees them identifies as part of the parent session, receives the parent's messaging socket and token, and in API-key mode refuses to start ("Not logged in"). The prefix rule also removes provider switches such as `CLAUDE_CODE_USE_BEDROCK`.
 
@@ -201,19 +205,20 @@ Then the backend's `env` table is applied (it may set `CLAUDE_CODE_*` variables;
 | `claude-endpoint` | `CLAUDE_CONFIG_DIR`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` (`auth = "x-api-key"`) or `ANTHROPIC_AUTH_TOKEN` (`auth = "bearer"`). `CLAUDE_CODE_OAUTH_TOKEN` is never set. |
 | `command` | nothing; with `secret_env`, that variable is set to the backend's stored secret (last, so it replaces an inherited value or a `pass_env` exception of the same name) |
 
-Each run's environment is built from the server's environment, so one backend's key never reaches another backend.
+Each run's environment is built from the server's environment, so one backend's stored key never reaches another backend, and a key read through `api_key_env` is removed from the other backends as described above.
 
 `pass_env` (top level for all backends, or per backend) re-allows inherited variables that the rules above would remove, e.g. `pass_env = ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]`. Variables that are not removed anyway (such as `OLLAMA_API_BASE`) need no `pass_env`. Limits:
 
 - `CLAUDE_CODE_OAUTH_TOKEN` and `AGENT_SIDEKICK_TOKEN` can never be passed (config error).
 - `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` can only be passed to `command` backends (config error in the top-level `pass_env` and for `claude-*` backends).
 - `CLAUDE_CONFIG_DIR` is not passed to `claude-*` backends, and `ANTHROPIC_BASE_URL` not to `claude-endpoint` backends (they set their own).
+- A variable named in another backend's `api_key_env` reaches a backend only if that backend's own `pass_env` names it (or its `env` table sets it).
 
 ### Command backends
 
 - `command` is an argument array; the first element is the program. **No shell** is involved: pipes, redirections, `$VAR` or `%VAR%` in the array are passed literally.
 - Placeholders `{prompt}`, `{cwd}` and `{max_turns}` are replaced inside each element in a single pass. The replacement is never scanned again, so a prompt that contains `{cwd}` stays literal, and `{prompt}` always ends up in **one** argument, whatever it contains. Unknown `{...}` are left as is.
-- `command` must contain `{prompt}`, unless `prompt_via_stdin = true`: then the prompt is written to the program's stdin and `{prompt}` must not appear.
+- `command` must contain `{prompt}` in an argument after `command[0]`, unless `prompt_via_stdin = true`: then the prompt is written to the program's stdin and `{prompt}` must not appear. `command[0]` (the program) is never substituted, so a placeholder there is a config error.
 - A bare program name is looked up in the absolute `PATH` entries (on Windows with `PATHEXT`); empty or relative `PATH` entries are ignored, and a relative path with a directory separator is rejected. An absolute path must exist.
 - On Windows, `.cmd`/`.bat` programs require `prompt_via_stdin = true` (otherwise the run fails with an error): `cmd.exe` cannot pass arbitrary prompt text safely as an argument. Point `command[0]` at an `.exe` otherwise (pip installs Aider as `aider.exe`).
 - The prompt is always an argument unless `prompt_via_stdin` is set; very long prompts can exceed the OS command-line limit (about 32 000 characters on Windows), so prefer `prompt_via_stdin` for tools that support it.
@@ -225,6 +230,8 @@ Each run's environment is built from the server's environment, so one backend's 
 ### claude-endpoint backends
 
 - `base_url` is required (`http://` or `https://`), `model` is passed as `--model`.
+- `base_url` must not contain credentials (`user:password@`); that is a config error. Store the key with `agent-sidekick setup --backend <name>` or set `api_key_env`.
+- The host of `base_url` must be ASCII (write an internationalised host in its `xn--` punycode form) and a port must be a valid number (1-65535). A URL the reachability probe could not parse is rejected when `config.toml` is loaded, not at run time.
 - Each endpoint backend has its own `CLAUDE_CONFIG_DIR` (default `~/.claude-sidekick-<name>`). It must differ from the config dir of every `claude-oauth` backend (config error otherwise): a claude.ai login saved there would stay active and could be used instead of the endpoint.
 - `CLAUDE_CODE_OAUTH_TOKEN` is never set for an endpoint backend, also not via `pass_env` or `env`, and `api_key_env` may not name it.
 
@@ -257,30 +264,46 @@ Put rules like these into the `CLAUDE.md` of your projects (or `~/.claude/CLAUDE
 | `backend`       | the default backend  | Name of a configured backend. |
 | `fallback`      | none                 | Backend used if the primary fails, see [Fallback](#fallback). |
 | `max_turns`     | 30                   | Maximum 200. Passed as `--max-turns` (claude-*) or `{max_turns}` (command). |
-| `timeout_s`     | 1800                 | Maximum 7200. The whole process tree is killed on timeout. |
+| `timeout_s`     | 1800                 | Maximum 7200. The whole process tree is killed on timeout. Applies per attempt: a fallback gets its own full `timeout_s`. |
 | `model`         | backend's `model` / CLI default | Passed as `--model` (claude-* only). |
 | `allowed_tools` | none                 | List passed as `--allowedTools` (claude-* only). |
 
-The result starts with the backend that actually ran, `backend: <name> (<type>)`. After a fallback that line also names the failed primary backend and the reason, and, if the primary ran, its exit code and log path.
-Then follow the exit code, the path of the full run log and the last 4000 characters of output.
+The result starts with the backend that actually ran, `backend: <name> (<type>)`. After a fallback that line also names the failed primary backend and the reason; if the primary ran, a separate line `primary: exit_code N, log <path> — it ran and may have left changes in cwd` follows.
+Then follow `exit_code:`, `log:` (the path of the full run log), `duration_s:` and the last 4000 characters of output.
 
 - **Cancellation:** cancelling the tool call in Claude Code (Esc) kills the delegated run's whole process tree; a cancelled run that is still queued never starts.
-- **Long runs:** the server sends a progress notification every 30 s while a run is active. This keeps the call alive with respect to Claude Code's MCP tool idle timeout (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, 30 minutes for stdio servers by default). If you have lowered the overall `MCP_TOOL_TIMEOUT` (default about 28 hours), keep it above `timeout_s`.
+- **Long runs:** the server sends a progress notification every 30 s while a run is active. This keeps the call alive with respect to Claude Code's MCP tool idle timeout (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, 30 minutes for stdio servers by default). If you have lowered the overall `MCP_TOOL_TIMEOUT` (default about 28 hours), keep it above the longest call: with `fallback` that is up to about 2 x `timeout_s` plus queue time, because the fallback gets its own `timeout_s`. While the fallback waits for a slot, progress reports it as queued.
 
 ### `sidekick_backends`
 
-No parameters. Returns a JSON array with one entry per backend: `name`, `type`, `description`, `cost`, `default`, `reachable`, `detail` (why it is or is not reachable), `max_concurrent` and `running`.
+No parameters. Returns a JSON object:
+
+```json
+{
+  "config_error": null,
+  "backends": [
+    { "name": "local", "type": "claude-endpoint", "description": "...", "cost": "free", "default": false,
+      "reachable": true, "detail": "...", "max_concurrent": null, "running": 0, "queued": 0 }
+  ]
+}
+```
+
+- `config_error`: `null`, or the problem with `config.toml`. Then `backends` is empty and `sidekick_run` fails until the file is fixed.
+- Per backend: `name`, `type`, `description`, `cost`, `default`, `reachable`, `detail` (why it is or is not reachable), `max_concurrent` (`null` without a per-backend limit), `running` and `queued`.
+
 It never contains secrets or environment values.
 
 ### `sidekick_status`
 
 Shows running and queued runs, per backend and in total, with the global and per-backend limits.
+Without a `[backends]` section it also shows the global `default model` and the agent's Claude config dir. With `[backends]`, the line of each `claude-oauth` and `claude-endpoint` backend shows that backend's effective `model` and `config_dir` instead (the top-level `default_model` is not used then).
 
 ## CLI reference
 
 | Command | Purpose |
 |---------|---------|
-| `agent-sidekick setup [--token-stdin] [--no-register] [--claude PATH]` | Ask for the token of every `claude-oauth` backend and register the MCP server. Endpoint keys and command secrets are not asked here (a hint names the `setup --backend` call). |
+| `agent-sidekick setup [--token-stdin] [--no-register] [--claude PATH]` | Ask for the token of every `claude-oauth` backend that has none yet (backends with a stored token are skipped) and register the MCP server. Endpoint keys and command secrets are not asked here (a hint names the `setup --backend` call). Re-registering keeps the extra `-e` variables of the existing user-scope registration and prints their names (never their values); `CLAUDE_CODE_OAUTH_TOKEN` and `AGENT_SIDEKICK_TOKEN` found there are dropped with a warning. |
+| `agent-sidekick setup --register-only [--claude PATH]` | Only (re-)register the MCP server: no token prompts and no terminal needed, e.g. after storing each token with `setup --backend <name> --token-stdin`. |
 | `agent-sidekick setup --backend <name> [--token-stdin]` | Set up one backend only: `claude-oauth` token, `claude-endpoint` API key (or a note that `api_key_env` is used), the `secret_env` value of a `command` backend (nothing to store without `secret_env`). The MCP registration is not changed. |
 | `agent-sidekick backends list [--check]` | Table of name, type, cost, default and description; `--check` adds reachability. |
 | `agent-sidekick backends test <name>` | Reachability with details (claude version, resolved program, HTTP status). Exit code 0 if reachable, 1 otherwise. |
@@ -313,10 +336,10 @@ pass_env = []             # inherited variables to keep for every backend, see a
 | `pass_env` | all | none | Inherited variables to keep for this backend, see [session isolation](#child-environment-and-session-isolation). |
 | `model` | claude-oauth, claude-endpoint | CLI default | Default `--model`; the `model` parameter of `sidekick_run` overrides it. |
 | `config_dir` | claude-oauth, claude-endpoint | `sidekick`: `AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` or `~/.claude-sidekick`; others: `~/.claude-sidekick-<name>` | `CLAUDE_CONFIG_DIR` of the agent; absolute or starting with `~`. |
-| `base_url` | claude-endpoint | (required) | `http://` or `https://` URL of the Anthropic-compatible API. |
+| `base_url` | claude-endpoint | (required) | `http://` or `https://` URL of the Anthropic-compatible API. Must not contain `user:password@` (config error; store the key with `agent-sidekick setup --backend <name>` or set `api_key_env`); ASCII host (`xn--` form for internationalised names) and a valid port. |
 | `auth` | claude-endpoint | `x-api-key` | `x-api-key` (`ANTHROPIC_API_KEY`) or `bearer` (`ANTHROPIC_AUTH_TOKEN`). |
-| `api_key_env` | claude-endpoint | none (stored key) | Name of an environment variable with the key. |
-| `command` | command | (required) | Program and arguments with `{prompt}`, `{cwd}`, `{max_turns}`. |
+| `api_key_env` | claude-endpoint | none (stored key) | Name of an environment variable with the key. It is removed from every other backend's environment. |
+| `command` | command | (required) | Program and arguments with `{prompt}`, `{cwd}`, `{max_turns}` (placeholders only after `command[0]`). |
 | `prompt_via_stdin` | command | `false` | Send the prompt on stdin instead of `{prompt}`. |
 | `secret_env` | command | none | Variable that receives the backend's stored secret (`setup --backend <name>`), e.g. `OPENAI_API_KEY`. Not allowed: `CLAUDE_CODE_OAUTH_TOKEN`, `AGENT_SIDEKICK_*`, or a key that is also in `env`. Values shorter than 8 characters are not redacted. |
 
@@ -363,7 +386,8 @@ On SIGTERM (sent by Claude Code when it stops the server) running process trees 
 - `sidekick_backends`, `backends list/test` and `doctor` never print secrets or environment values.
 - Network: agent-sidekick itself only makes the reachability probe described in [Reachability](#reachability) (configured `base_url` only, no credentials, 2 s timeout). All model traffic is made by `claude` or the configured command.
 - Prompts are written to the run log in `<config-dir>/logs`; do not put secrets into prompts.
-- To rotate or revoke a Claude token: revoke it in the Claude account settings, then run `claude setup-token` again (Quickstart step 2) and `agent-sidekick setup` (or `setup --backend <name>`).
+- Run logs can contain the full prompt and the agent's complete output. On Unix the logs directory is created with mode 0700 and each run log with mode 0600; on Windows they keep the user-profile ACL.
+- To rotate or revoke a Claude token: revoke it in the Claude account settings, then run `claude setup-token` again (Quickstart step 2) and `agent-sidekick setup --backend <name>` (plain `setup` skips backends that already have a token).
 - Never commit tokens or keys to Git.
 - The delegated agent runs with the permissions you grant via `allowed_tools`. In `-p` mode the workspace trust dialog is skipped, so only point `cwd` at directories you trust. Command backends run with the server's permissions and their own permission model.
 
@@ -381,8 +405,8 @@ You are responsible for complying with Anthropic's terms for each account you us
 
 Run `agent-sidekick doctor` first; it checks the installation and every backend and prints next steps.
 
-- **`claude` not found**: install Claude Code, or set `AGENT_SIDEKICK_CLAUDE` / `claude_path` to its absolute path, then re-run `agent-sidekick setup`.
-- **Token missing**: repeat Quickstart steps 2 and 3 (`agent-sidekick setup --backend <name>` for a single backend).
+- **`claude` not found**: install Claude Code, or set `AGENT_SIDEKICK_CLAUDE` / `claude_path` to its absolute path, then re-run `agent-sidekick setup --register-only`.
+- **Token missing**: repeat Quickstart steps 2 and 3 (`agent-sidekick setup --backend <name>` for a single backend; `setup --register-only` registers without asking for tokens).
 - **Endpoint not reachable**: start the local server (`ollama serve`, LM Studio's server), then `agent-sidekick backends test <name>`.
 - **Endpoint run fails with "Not logged in"**: check that the key is stored (`backends test`) and that `config_dir` is the backend's own directory.
 - **Config error in `sidekick_run`**: fix `config.toml`; `agent-sidekick backends list` shows the problem.

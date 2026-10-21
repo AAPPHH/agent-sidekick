@@ -17,21 +17,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `command`: any agent CLI as an argument array with `{prompt}`, `{cwd}`, `{max_turns}` placeholders, started without a shell; optional `prompt_via_stdin`.
   - Without `[backends]`: an implicit `claude-oauth` backend `sidekick`, so existing installations keep working unchanged.
 - Per-backend secrets: keyring users `oauth-token-<name>` / `endpoint-<name>`, files `token-<name>` / `endpoint-<name>.key`; a `claude-oauth` backend named `sidekick` keeps the v0.1 `oauth-token` / `token` / `AGENT_SIDEKICK_TOKEN`.
-- Tool `sidekick_backends`: name, type, description, cost, default and reachability of every backend (no secrets).
+- Tool `sidekick_backends`: a JSON object `{config_error, backends: [...]}` with name, type, description, cost, default, reachability, `max_concurrent`, `running` and `queued` of every backend (no secrets).
 - `sidekick_run` parameters `backend` and `fallback`; the result names the backend that actually ran. A fallback from one `claude-oauth` backend to another is rejected.
 - `sidekick_status` shows running and queued runs per backend; optional per-backend `max_concurrent` in addition to the global limit.
 - Reachability probe for `claude-endpoint` backends: HTTP GET of `base_url` without credentials, 2 s timeout.
-- CLI: `backends list [--check]`, `backends test <name>`, `setup --backend <name>`; `setup` asks for the token of every `claude-oauth` backend; `doctor` checks all backends.
+- CLI: `backends list [--check]`, `backends test <name>`, `setup --backend <name>`; `setup` asks for the token of every `claude-oauth` backend that has none yet; `doctor` checks all backends.
+- `setup --register-only`: (re-)registers the MCP server without asking for tokens and without a terminal, e.g. after storing several tokens with `setup --backend <name> --token-stdin`.
 - Top-level and per-backend `pass_env` to keep specific inherited variables that session isolation would remove.
 - `secret_env` for `command` backends: a secret stored with `setup --backend <name>` (keyring user `cmd-<name>`, file `cmd-<name>.key`) is set in that variable for the backend's runs only, e.g. `OPENAI_API_KEY` for Aider against a hosted OpenAI-compatible API. It is redacted from output and logs and never shown by status, `sidekick_backends`, `backends test` or `doctor`; reachability requires it; `uninstall` removes it.
-- `examples/config.toml` and `examples/CLAUDE.md` (routing rules for the calling session).
+- `examples/config.toml` and `examples/CLAUDE.md` (routing rules for the calling session), both covering the same four backends (`sidekick`, `local`, `aider` and the optional `kiconnect`).
 
 ### Changed
 
 - An invalid `config.toml` now makes `sidekick_run` fail with an error naming the problem instead of silently running with default settings; `sidekick_backends` and `sidekick_status` show the error.
 - Secrets shorter than 8 characters (e.g. placeholder keys like `ollama`) are no longer redacted from output; `sk-ant-…` patterns are always redacted.
-- The list of variables removed from the child environment is extended for session isolation: every `CLAUDE_CODE_*` and `CLAUDE_AGENT_SDK_*` variable, `CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `AI_AGENT`, `MCP_CONNECTION_NONBLOCKING` (in addition to the credentials removed before). An inherited `ANTHROPIC_BASE_URL` is only kept for `claude-oauth` backends.
-- `default_model` applies only to the implicit backend; explicit backends use their own `model`.
+- The list of variables removed from the child environment is extended for session isolation: every `CLAUDE_CODE_*` and `CLAUDE_AGENT_SDK_*` variable, `CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `AI_AGENT`, `MCP_CONNECTION_NONBLOCKING` (in addition to the credentials removed before). An inherited `ANTHROPIC_BASE_URL` is only kept for `claude-oauth` backends. `CLAUDE_CODE_GIT_BASH_PATH` is exempt from the prefix rule and kept (Claude Code on Windows needs it to find Git Bash).
+- Further removals from the child environment: `ANTHROPIC_CUSTOM_HEADERS` for `claude-endpoint` and `command` backends, the inherited model overrides (`ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`) for `claude-endpoint` backends, and every variable named in a backend's `api_key_env` for all other backends. A backend's own `pass_env` re-allows them.
+- `default_model` applies only to the implicit backend; explicit backends use their own `model`. `sidekick_status` shows the global `default model` and agent config dir only for the implicit backend; with `[backends]` each `claude-*` backend's line shows its own effective `model` and `config_dir`.
+- `setup` skips `claude-oauth` backends that already have a stored token (use `setup --backend <name>` to replace one), and re-registering keeps the extra `-e` variables of the existing user-scope MCP registration (names printed, values never; `CLAUDE_CODE_OAUTH_TOKEN`/`AGENT_SIDEKICK_TOKEN` are dropped with a warning).
+- A fallback gets its own full `timeout_s`, so a `sidekick_run` call with `fallback` can take up to about 2 x `timeout_s` plus queue time; progress reports the fallback as queued while it waits for a slot.
 
 ### Fixed
 
@@ -46,7 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Logging no longer panics when the log file cannot be created (stderr only, with a warning).
 - `doctor` checks the `claude` path stored in the MCP registration and no longer creates the logs directory; `setup` without `--token-stdin` stops with a hint when stdin is not a terminal; re-registration respects the scope of an existing entry.
 - `install.ps1` keeps `%VAR%` references in the user PATH; CI runs clippy and tests with `--locked`.
-
+- A caller's `ANTHROPIC_CUSTOM_HEADERS` (e.g. a gateway credential) was sent to the third-party `base_url` of a `claude-endpoint` backend; it is now removed for `claude-endpoint` and `command` backends.
+- The key read through an endpoint's `api_key_env` was inherited by every other backend's child (and not redacted there); it is now removed from all other backends.
+- Re-running `setup` dropped variables added to the MCP registration with `-e` (such as an `api_key_env` key); they are now carried over.
+- With several `claude-oauth` backends there was no non-interactive way to re-register, and an interactive re-register asked for every token again; see `setup --register-only` and the skipping of backends with a stored token.
+- Run logs were created with default permissions; on Unix the logs directory is now 0700 and each run log 0600.
+- `{prompt}` only in `command[0]` passed validation although the prompt was never delivered; placeholders in `command[0]` are now a config error and `{prompt}` must be in a later argument.
+- `base_url` values the reachability probe cannot parse (non-ASCII host, invalid port) passed validation and then failed every run; they are now config errors.
+- `sidekick_status` showed `default model` and `agent claude config dir` values that were not in effect with `[backends]`.
+- After a fallback, progress said "agent running" while the fallback was still queued and could exceed its total.
+- `CLAUDE_CODE_GIT_BASH_PATH` was removed by session isolation, so `claude-*` backends could fail to start on Windows.
 ## [0.1.0] - 2026-10-21
 
 ### Added
