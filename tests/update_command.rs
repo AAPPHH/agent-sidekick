@@ -90,8 +90,11 @@ fn update_prints_install_command_for_a_newer_release() {
     assert!(text.contains("999.0.0 is available"), "{text}");
     let expected = if cfg!(windows) {
         "/releases/latest/download/install.ps1 | iex"
-    } else {
+    } else if cfg!(target_os = "linux") {
         "/releases/latest/download/install.sh | sh"
+    } else {
+        // No prebuilt binary (macOS): build from source.
+        "cargo install --locked --git https://github.com/"
     };
     assert!(text.contains(expected), "{text}");
     assert!(text.contains("reload VS Code"), "{text}");

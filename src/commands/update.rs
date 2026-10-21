@@ -209,13 +209,41 @@ pub fn repo_slug() -> Result<(&'static str, &'static str), CheckError> {
     })
 }
 
-/// The one-liner that installs the latest release (the install scripts replace the binary).
-pub fn install_command(windows: bool, owner: &str, repo: &str) -> String {
+/// Which install command fits the platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPlatform {
+    /// `install.ps1` one-liner.
+    Windows,
+    /// `install.sh` one-liner (Linux; the script also checks the architecture).
+    Linux,
+    /// No prebuilt binary is published (macOS, other Unix): build from source with cargo.
+    Source,
+}
+
+impl InstallPlatform {
+    /// The platform this binary was built for.
+    pub fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            Self::Source
+        }
+    }
+}
+
+/// The command that installs the latest release: the install scripts replace the binary;
+/// where no prebuilt binary exists (install.sh stops on macOS), `cargo install` from the
+/// repository.
+pub fn install_command(platform: InstallPlatform, owner: &str, repo: &str) -> String {
     let base = format!("https://github.com/{owner}/{repo}/releases/latest/download");
-    if windows {
-        format!("irm {base}/install.ps1 | iex")
-    } else {
-        format!("curl -fsSL {base}/install.sh | sh")
+    match platform {
+        InstallPlatform::Windows => format!("irm {base}/install.ps1 | iex"),
+        InstallPlatform::Linux => format!("curl -fsSL {base}/install.sh | sh"),
+        InstallPlatform::Source => {
+            format!("cargo install --locked --git https://github.com/{owner}/{repo}")
+        }
     }
 }
 
@@ -499,7 +527,7 @@ fn io_error_text(io: &std::io::Error, proxy_note: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Text printed for a successful check.
-pub fn format_outcome(outcome: &Outcome, current: &str, windows: bool) -> String {
+pub fn format_outcome(outcome: &Outcome, current: &str, platform: InstallPlatform) -> String {
     match outcome {
         Outcome::UpToDate { .. } => format!("{APP_NAME} {current} is up to date.\n"),
         Outcome::Ahead { latest } => format!(
@@ -510,7 +538,7 @@ pub fn format_outcome(outcome: &Outcome, current: &str, windows: bool) -> String
         ),
         Outcome::Available { latest } => {
             let cmd = match repo_slug() {
-                Ok((o, r)) => install_command(windows, o, r),
+                Ok((o, r)) => install_command(platform, o, r),
                 Err(e) => return format!("{APP_NAME} {latest} is available ({e}).\n"),
             };
             format!(
@@ -526,7 +554,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
         Ok(outcome) => {
             print!(
                 "{}",
-                format_outcome(&outcome, CURRENT_VERSION, cfg!(windows))
+                format_outcome(&outcome, CURRENT_VERSION, InstallPlatform::current())
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -617,9 +645,13 @@ pub fn doctor_hint(offline: bool) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    doctor_hint_at(&dir, now, CURRENT_VERSION, cfg!(windows), &|| {
-        check(&api_base(), CURRENT_VERSION, DOCTOR_TIMEOUT)
-    })
+    doctor_hint_at(
+        &dir,
+        now,
+        CURRENT_VERSION,
+        InstallPlatform::current(),
+        &|| check(&api_base(), CURRENT_VERSION, DOCTOR_TIMEOUT),
+    )
 }
 
 /// Testable core of [`doctor_hint`]: `dir` is the config directory, `now` Unix seconds,
@@ -629,7 +661,7 @@ pub fn doctor_hint_at(
     dir: &Path,
     now: u64,
     current: &str,
-    windows: bool,
+    platform: InstallPlatform,
     fetch: &dyn Fn() -> Result<Outcome, CheckError>,
 ) -> String {
     if !dir.is_dir() {
@@ -653,14 +685,18 @@ pub fn doctor_hint_at(
     if let Ok(json) = serde_json::to_vec_pretty(&rec) {
         let _ = std::fs::write(&file, json);
     }
-    hint_text(&res, current, windows)
+    hint_text(&res, current, platform)
 }
 
-fn hint_text(res: &Result<Outcome, CheckError>, current: &str, windows: bool) -> String {
+fn hint_text(
+    res: &Result<Outcome, CheckError>,
+    current: &str,
+    platform: InstallPlatform,
+) -> String {
     match res {
         Ok(Outcome::Available { latest }) => {
             let cmd = match repo_slug() {
-                Ok((o, r)) => install_command(windows, o, r),
+                Ok((o, r)) => install_command(platform, o, r),
                 Err(_) => format!("{APP_NAME} update"),
             };
             format!(
@@ -787,13 +823,26 @@ mod tests {
     #[test]
     fn install_commands_per_platform() {
         assert_eq!(
-            install_command(true, "o", "r"),
+            install_command(InstallPlatform::Windows, "o", "r"),
             "irm https://github.com/o/r/releases/latest/download/install.ps1 | iex"
         );
         assert_eq!(
-            install_command(false, "o", "r"),
+            install_command(InstallPlatform::Linux, "o", "r"),
             "curl -fsSL https://github.com/o/r/releases/latest/download/install.sh | sh"
         );
+        // install.sh stops on macOS (no prebuilt binary), so the hint builds from source.
+        assert_eq!(
+            install_command(InstallPlatform::Source, "o", "r"),
+            "cargo install --locked --git https://github.com/o/r"
+        );
+        let expected = if cfg!(windows) {
+            InstallPlatform::Windows
+        } else if cfg!(target_os = "linux") {
+            InstallPlatform::Linux
+        } else {
+            InstallPlatform::Source
+        };
+        assert_eq!(InstallPlatform::current(), expected);
     }
 
     #[test]
@@ -803,7 +852,7 @@ mod tests {
                 latest: "9.0.0".into(),
             },
             "0.3.0",
-            false,
+            InstallPlatform::Linux,
         );
         assert!(
             out.contains("9.0.0 is available (installed: 0.3.0)"),
@@ -819,9 +868,21 @@ mod tests {
                 latest: "9.0.0".into(),
             },
             "0.3.0",
-            true,
+            InstallPlatform::Windows,
         );
         assert!(out.contains("install.ps1 | iex"), "{out}");
+        let out = format_outcome(
+            &Outcome::Available {
+                latest: "9.0.0".into(),
+            },
+            "0.3.0",
+            InstallPlatform::Source,
+        );
+        assert!(
+            out.contains("cargo install --locked --git https://github.com/"),
+            "{out}"
+        );
+        assert!(!out.contains("install.sh"), "{out}");
     }
 
     #[test]
@@ -1045,7 +1106,7 @@ mod tests {
             }
         }
         fn hint(&self, dir: &Path, now: u64, current: &str) -> String {
-            doctor_hint_at(dir, now, current, false, &|| {
+            doctor_hint_at(dir, now, current, InstallPlatform::Linux, &|| {
                 self.calls.set(self.calls.get() + 1);
                 self.answer.clone()
             })
