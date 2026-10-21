@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::redact::redact_all;
+use crate::redact::{redact_all, MIN_SECRET_LEN};
 
 /// Keyring service and user.
 pub const KEYRING_SERVICE: &str = crate::APP_NAME;
@@ -109,20 +109,37 @@ impl SecretId {
 
     /// Keyring user name: `oauth-token`, `oauth-token-<name>` or `endpoint-<name>`.
     pub fn keyring_user(&self) -> String {
-        todo!("secrets task")
+        match self {
+            SecretId::Oauth(_) if self.is_legacy() => KEYRING_USER.to_owned(),
+            SecretId::Oauth(n) => format!("{KEYRING_USER}-{n}"),
+            SecretId::Endpoint(n) => format!("endpoint-{n}"),
+        }
     }
 
     /// File name in the config dir: `token`, `token-<name>` or `endpoint-<name>.key`.
     pub fn file_name(&self) -> String {
-        todo!("secrets task")
+        match self {
+            SecretId::Oauth(_) if self.is_legacy() => LEGACY_FILE_NAME.to_owned(),
+            SecretId::Oauth(n) => format!("{LEGACY_FILE_NAME}-{n}"),
+            SecretId::Endpoint(n) => format!("endpoint-{n}.key"),
+        }
     }
 
     /// Environment override (highest priority): only `AGENT_SIDEKICK_TOKEN` for the legacy
     /// secret; `None` otherwise.
     pub fn env_override(&self) -> Option<&'static str> {
-        todo!("secrets task")
+        self.is_legacy().then_some(ENV_TOKEN)
+    }
+
+    /// `true` for the v0.1 secret: any claude-oauth backend named `sidekick`, implicit or
+    /// declared in config.toml.
+    pub fn is_legacy(&self) -> bool {
+        matches!(self, SecretId::Oauth(n) if n == crate::backends::IMPLICIT_BACKEND)
     }
 }
+
+/// File name of the v0.1 token file in the config dir (`paths::token_file`).
+const LEGACY_FILE_NAME: &str = "token";
 
 impl fmt::Display for SecretId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -134,54 +151,75 @@ impl fmt::Display for SecretId {
 }
 
 /// [`load`] for any secret (env override, keyring, file).
-pub fn load_secret(_id: &SecretId) -> Result<(Token, TokenSource), TokenError> {
-    todo!("secrets task")
-}
-
-/// [`store`] for any secret.
-pub fn store_secret(_id: &SecretId, _token: &Token) -> Result<TokenSource, TokenError> {
-    todo!("secrets task")
-}
-
-/// [`delete`] for any secret.
-pub fn delete_secret(_id: &SecretId) -> Result<Vec<String>, TokenError> {
-    todo!("secrets task")
-}
-
-/// Load the token: env, then keyring, then file.
-pub fn load() -> Result<(Token, TokenSource), TokenError> {
-    let keyring = keyring_enabled().then_some(OsKeyring);
-    let file = match crate::paths::token_file() {
-        Ok(p) => Some(p),
+///
+/// Lookup order: [`SecretId::env_override`] (legacy secret only), OS keyring entry
+/// [`SecretId::keyring_user`], file [`SecretId::file_name`] in the config dir.
+/// [`TokenError::Missing`] if none is set; its message is meant for the legacy secret,
+/// callers produce their own hint for other ids.
+pub fn load_secret(id: &SecretId) -> Result<(Token, TokenSource), TokenError> {
+    let keyring = os_keyring(id);
+    let file = match crate::paths::config_dir() {
+        Ok(dir) => Some(dir.join(id.file_name())),
         Err(e) => {
             tracing::warn!("cannot determine token file location: {e:#}");
             None
         }
     };
-    load_with(
+    load_secret_with(
+        id,
         |name| std::env::var(name).ok(),
         keyring.as_ref().map(|k| k as &dyn SecretStore),
         file.as_deref(),
     )
 }
 
-/// Store the token in the keyring, falling back to the file.
-pub fn store(token: &Token) -> Result<TokenSource, TokenError> {
-    let keyring = keyring_enabled().then_some(OsKeyring);
+/// [`store`] for any secret: keyring entry [`SecretId::keyring_user`], falling back to
+/// the file [`SecretId::file_name`] in the config dir.
+pub fn store_secret(id: &SecretId, token: &Token) -> Result<TokenSource, TokenError> {
+    let keyring = os_keyring(id);
     store_with(
         token,
         keyring.as_ref().map(|k| k as &dyn SecretStore),
-        &token_file_path()?,
+        &secret_file(id)?,
     )
+}
+
+/// [`delete`] for any secret (keyring entry and file).
+pub fn delete_secret(id: &SecretId) -> Result<Vec<String>, TokenError> {
+    let keyring = os_keyring(id);
+    delete_with(
+        keyring.as_ref().map(|k| k as &dyn SecretStore),
+        &secret_file(id)?,
+    )
+}
+
+/// Load the token: env, then keyring, then file.
+pub fn load() -> Result<(Token, TokenSource), TokenError> {
+    load_secret(&SecretId::legacy())
+}
+
+/// Store the token in the keyring, falling back to the file.
+pub fn store(token: &Token) -> Result<TokenSource, TokenError> {
+    store_secret(&SecretId::legacy(), token)
 }
 
 /// Delete from keyring and file. Returns human-readable descriptions of what was removed.
 pub fn delete() -> Result<Vec<String>, TokenError> {
-    let keyring = keyring_enabled().then_some(OsKeyring);
-    delete_with(
-        keyring.as_ref().map(|k| k as &dyn SecretStore),
-        &token_file_path()?,
-    )
+    delete_secret(&SecretId::legacy())
+}
+
+/// Format check for the API key of a claude-endpoint backend: any value is accepted
+/// (local servers often ignore it), but keys shorter than [`MIN_SECRET_LEN`] are not
+/// redacted from logs, which is worth a warning.
+pub fn check_endpoint_key_format(key: &str) -> FormatCheck {
+    if key.trim().chars().count() < MIN_SECRET_LEN {
+        FormatCheck::Warn(format!(
+            "key is shorter than {MIN_SECRET_LEN} characters, so it will not be redacted \
+             from logs; fine for placeholder keys of local servers such as 'ollama'"
+        ))
+    } else {
+        FormatCheck::Ok
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,8 +232,16 @@ fn keyring_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn token_file_path() -> Result<PathBuf, TokenError> {
-    crate::paths::token_file().map_err(|e| TokenError::Storage(format!("{e:#}")))
+/// The OS keyring entry for `id`, or `None` if the keyring is disabled.
+fn os_keyring(id: &SecretId) -> Option<OsKeyring> {
+    keyring_enabled().then(|| OsKeyring::for_id(id))
+}
+
+/// `<config-dir>/<file_name>`; for the legacy id this equals `paths::token_file()`.
+fn secret_file(id: &SecretId) -> Result<PathBuf, TokenError> {
+    crate::paths::config_dir()
+        .map(|d| d.join(id.file_name()))
+        .map_err(|e| TokenError::Storage(format!("{e:#}")))
 }
 
 /// Error from a secret store. `unavailable` marks "there is no usable store at all"
@@ -223,11 +269,20 @@ pub(crate) trait SecretStore {
 }
 
 /// The real OS keyring (Credential Manager / Keychain / Secret Service).
-pub(crate) struct OsKeyring;
+pub(crate) struct OsKeyring {
+    /// Keyring user name ([`SecretId::keyring_user`]); the service is [`KEYRING_SERVICE`].
+    user: String,
+}
 
 impl OsKeyring {
+    pub(crate) fn for_id(id: &SecretId) -> Self {
+        Self {
+            user: id.keyring_user(),
+        }
+    }
+
     fn entry(&self) -> Result<keyring::Entry, StoreError> {
-        keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(store_error)
+        keyring::Entry::new(KEYRING_SERVICE, &self.user).map_err(store_error)
     }
 }
 
@@ -263,12 +318,28 @@ impl SecretStore for OsKeyring {
     }
 }
 
+/// [`load_secret_with`] for the legacy secret (kept for the v0.1 tests).
+#[cfg(test)]
 pub(crate) fn load_with(
     env_lookup: impl Fn(&str) -> Option<String>,
     keyring: Option<&dyn SecretStore>,
     file: Option<&Path>,
 ) -> Result<(Token, TokenSource), TokenError> {
-    if let Some(v) = env_lookup(ENV_TOKEN).filter(|v| !v.trim().is_empty()) {
+    load_secret_with(&SecretId::legacy(), env_lookup, keyring, file)
+}
+
+/// Env override (only if `id` has one), then keyring, then file.
+pub(crate) fn load_secret_with(
+    id: &SecretId,
+    env_lookup: impl Fn(&str) -> Option<String>,
+    keyring: Option<&dyn SecretStore>,
+    file: Option<&Path>,
+) -> Result<(Token, TokenSource), TokenError> {
+    if let Some(v) = id
+        .env_override()
+        .and_then(&env_lookup)
+        .filter(|v| !v.trim().is_empty())
+    {
         return Ok((Token::new(v), TokenSource::Env));
     }
     if let Some(k) = keyring {
@@ -692,6 +763,229 @@ mod tests {
             Err(TokenError::Storage(_))
         ));
         assert!(!path.exists());
+    }
+
+    fn oauth(n: &str) -> SecretId {
+        SecretId::Oauth(n.to_owned())
+    }
+
+    fn endpoint(n: &str) -> SecretId {
+        SecretId::Endpoint(n.to_owned())
+    }
+
+    #[test]
+    fn secret_id_names() {
+        let legacy = SecretId::legacy();
+        assert_eq!(legacy, oauth(crate::backends::IMPLICIT_BACKEND));
+        assert_eq!(legacy, oauth("sidekick"));
+        assert!(legacy.is_legacy());
+        assert_eq!(legacy.keyring_user(), KEYRING_USER);
+        assert_eq!(legacy.keyring_user(), "oauth-token");
+        assert_eq!(legacy.file_name(), "token");
+        assert_eq!(legacy.env_override(), Some(ENV_TOKEN));
+
+        let work = oauth("work");
+        assert!(!work.is_legacy());
+        assert_eq!(work.keyring_user(), "oauth-token-work");
+        assert_eq!(work.file_name(), "token-work");
+        assert_eq!(work.env_override(), None);
+
+        let local = endpoint("local");
+        assert!(!local.is_legacy());
+        assert_eq!(local.keyring_user(), "endpoint-local");
+        assert_eq!(local.file_name(), "endpoint-local.key");
+        assert_eq!(local.env_override(), None);
+
+        // An endpoint named `sidekick` is not the legacy OAuth secret.
+        let ep_sidekick = endpoint("sidekick");
+        assert!(!ep_sidekick.is_legacy());
+        assert_eq!(ep_sidekick.keyring_user(), "endpoint-sidekick");
+        assert_eq!(ep_sidekick.file_name(), "endpoint-sidekick.key");
+        assert_eq!(ep_sidekick.env_override(), None);
+
+        // OAuth and endpoint secrets of the same backend name never share a slot.
+        assert_ne!(oauth("local").keyring_user(), local.keyring_user());
+        assert_ne!(oauth("local").file_name(), local.file_name());
+    }
+
+    #[test]
+    fn os_keyring_user_follows_id() {
+        assert_eq!(OsKeyring::for_id(&SecretId::legacy()).user, KEYRING_USER);
+        assert_eq!(OsKeyring::for_id(&oauth("work")).user, "oauth-token-work");
+        assert_eq!(OsKeyring::for_id(&endpoint("local")).user, "endpoint-local");
+    }
+
+    /// The legacy wrappers read and write exactly the v0.1 file.
+    #[test]
+    fn legacy_file_path_is_unchanged() {
+        assert_eq!(
+            secret_file(&SecretId::legacy()).unwrap(),
+            crate::paths::token_file().unwrap()
+        );
+        let dir = crate::paths::config_dir().unwrap();
+        assert_eq!(secret_file(&oauth("work")).unwrap(), dir.join("token-work"));
+        assert_eq!(
+            secret_file(&endpoint("local")).unwrap(),
+            dir.join("endpoint-local.key")
+        );
+    }
+
+    #[test]
+    fn load_with_equals_legacy_load_secret_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SecretId::legacy().file_name());
+        let e = env(&[(ENV_TOKEN, "sk-ant-oat01-env")]);
+        let kr = FakeStore::default();
+        kr.set("sk-ant-oat01-keyring").unwrap();
+        write_token_file(&path, &Token::new("sk-ant-oat01-file")).unwrap();
+
+        let a = load_with(&e, Some(&kr), Some(&path)).unwrap();
+        let b = load_secret_with(&SecretId::legacy(), &e, Some(&kr), Some(&path)).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.1, TokenSource::Env);
+    }
+
+    /// store/load/delete for non-legacy ids, keyring disabled (file only).
+    #[test]
+    fn roundtrip_file_store_per_id() {
+        let dir = tempfile::tempdir().unwrap();
+        for (id, secret) in [
+            (oauth("work"), "sk-ant-oat01-WORKSECRET"),
+            (endpoint("local"), "ollama"),
+        ] {
+            let path = dir.path().join(id.file_name());
+            assert!(matches!(
+                load_secret_with(&id, env(&[]), None, Some(&path)),
+                Err(TokenError::Missing)
+            ));
+            let src = store_with(&Token::new(secret), None, &path).unwrap();
+            assert_eq!(src, TokenSource::File(path.clone()));
+            let (t, src) = load_secret_with(&id, env(&[]), None, Some(&path)).unwrap();
+            assert_eq!(t.expose(), secret);
+            assert_eq!(src, TokenSource::File(path.clone()));
+
+            let removed = delete_with(None, &path).unwrap();
+            assert_eq!(removed.len(), 1);
+            assert!(!path.exists());
+            assert!(matches!(
+                load_secret_with(&id, env(&[]), None, Some(&path)),
+                Err(TokenError::Missing)
+            ));
+        }
+    }
+
+    /// Same with an (in-memory) keyring entry per id.
+    #[test]
+    fn roundtrip_keyring_store_per_id() {
+        let dir = tempfile::tempdir().unwrap();
+        for id in [oauth("work"), endpoint("local")] {
+            let path = dir.path().join(id.file_name());
+            let kr = FakeStore::default();
+            let src = store_with(&Token::new(SAMPLE), Some(&kr), &path).unwrap();
+            assert_eq!(src, TokenSource::Keyring);
+            let (t, src) = load_secret_with(&id, env(&[]), Some(&kr), Some(&path)).unwrap();
+            assert_eq!((t.expose(), src), (SAMPLE, TokenSource::Keyring));
+            assert_eq!(delete_with(Some(&kr), &path).unwrap(), ["OS keyring entry"]);
+            assert!(kr.value.borrow().is_none());
+        }
+    }
+
+    #[test]
+    fn endpoint_key_is_separate_from_oauth_token_of_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = endpoint("local");
+        let oa = oauth("local");
+        let ep_path = dir.path().join(ep.file_name());
+        let oa_path = dir.path().join(oa.file_name());
+        assert_ne!(ep_path, oa_path);
+
+        store_with(&Token::new("endpoint-key-123"), None, &ep_path).unwrap();
+        assert!(matches!(
+            load_secret_with(&oa, env(&[]), None, Some(&oa_path)),
+            Err(TokenError::Missing)
+        ));
+
+        // Storing the OAuth token afterwards leaves the endpoint key alone.
+        store_with(&Token::new(SAMPLE), None, &oa_path).unwrap();
+        let (t, _) = load_secret_with(&ep, env(&[]), None, Some(&ep_path)).unwrap();
+        assert_eq!(t.expose(), "endpoint-key-123");
+        delete_with(None, &oa_path).unwrap();
+        assert!(ep_path.exists());
+    }
+
+    #[test]
+    fn env_override_only_for_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = env(&[(ENV_TOKEN, "sk-ant-oat01-env")]);
+        for id in [oauth("work"), endpoint("local"), endpoint("sidekick")] {
+            let path = dir.path().join(id.file_name());
+            assert!(matches!(
+                load_secret_with(&id, &e, None, Some(&path)),
+                Err(TokenError::Missing)
+            ));
+            write_token_file(&path, &Token::new("from-file-123")).unwrap();
+            let (t, src) = load_secret_with(&id, &e, None, Some(&path)).unwrap();
+            assert_eq!(
+                (t.expose(), src),
+                ("from-file-123", TokenSource::File(path))
+            );
+        }
+        let (_, src) = load_secret_with(&SecretId::legacy(), &e, None, None).unwrap();
+        assert_eq!(src, TokenSource::Env);
+    }
+
+    #[test]
+    fn endpoint_key_format() {
+        assert_eq!(check_endpoint_key_format("12345678"), FormatCheck::Ok);
+        assert_eq!(
+            check_endpoint_key_format("sk-ant-api03-xyz"),
+            FormatCheck::Ok
+        );
+        for short in ["ollama", "", "  abc  ", "1234567"] {
+            match check_endpoint_key_format(short) {
+                FormatCheck::Warn(msg) => {
+                    assert!(msg.contains("shorter than 8 characters"), "{msg}");
+                    assert!(msg.contains("will not be redacted"), "{msg}");
+                }
+                FormatCheck::Ok => panic!("expected warning for {short:?}"),
+            }
+        }
+        // Surrounding whitespace is not counted (tokens are trimmed when stored).
+        assert!(matches!(
+            check_endpoint_key_format(" 1234567 \n"),
+            FormatCheck::Warn(_)
+        ));
+        // The OAuth check is unaffected by endpoint keys.
+        assert!(matches!(check_format("SECRETSECRET"), FormatCheck::Warn(_)));
+    }
+
+    #[test]
+    fn secret_id_texts_do_not_leak() {
+        let secret = "SECRETSECRET-endpoint";
+        let ids = [SecretId::legacy(), oauth("work"), endpoint("local")];
+        let mut texts = vec![
+            format!("{:?}", check_endpoint_key_format(secret)),
+            format!("{:?}", check_endpoint_key_format("short")),
+        ];
+        for id in &ids {
+            texts.push(format!("{id:?}"));
+            texts.push(id.to_string());
+            texts.push(id.keyring_user());
+            texts.push(id.file_name());
+        }
+        // Errors produced by the id-aware paths.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(endpoint("local").file_name());
+        let e = load_secret_with(&endpoint("local"), env(&[]), None, Some(&path)).unwrap_err();
+        texts.push(format!("{e:?}"));
+        texts.push(e.to_string());
+        write_token_file(&path, &Token::new(secret)).unwrap();
+        let e = delete_with(Some(&FakeStore::failing()), &path).unwrap_err();
+        texts.push(format!("{e:?}"));
+        texts.push(e.to_string());
+        for s in texts {
+            assert!(!s.contains("SECRETSECRET"), "leaked in: {s}");
+        }
     }
 
     #[test]
