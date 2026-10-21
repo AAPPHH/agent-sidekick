@@ -61,6 +61,7 @@ fn request(f: &Fake, prompt: &str, timeout: Duration) -> RunRequest {
 #[cfg(unix)]
 const ECHO_SCRIPT: &str = r#"for a in "$@"; do printf 'ARG:%s\n' "$a"; done
 printf 'CFG:%s\n' "$CLAUDE_CONFIG_DIR"
+printf 'APIKEY:%s\n' "$ANTHROPIC_API_KEY"
 if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then echo TOKEN_SET:yes; fi
 echo "TOKEN:$CLAUDE_CODE_OAUTH_TOKEN"
 echo "PWD:$(pwd)"
@@ -71,6 +72,7 @@ exit 3
 #[cfg(windows)]
 const ECHO_SCRIPT: &str = r#"echo ARGS:%*
 echo CFG:%CLAUDE_CONFIG_DIR%
+echo APIKEY:%ANTHROPIC_API_KEY%
 if defined CLAUDE_CODE_OAUTH_TOKEN echo TOKEN_SET:yes
 echo TOKEN:%CLAUDE_CODE_OAUTH_TOKEN%
 echo PWD:%CD%
@@ -127,6 +129,9 @@ async fn propagates_args_env_exit_code_and_redacts() {
         assert_eq!(stdin.trim_end(), prompt);
     }
 
+    // Never inherited (a real check whenever the developer has ANTHROPIC_API_KEY set).
+    let apikey = t.lines().find_map(|l| l.strip_prefix("APIKEY:")).unwrap();
+    assert_eq!(apikey.trim(), "");
     let cfg = t.lines().find_map(|l| l.strip_prefix("CFG:")).unwrap();
     assert_eq!(Path::new(cfg.trim()), f.ctx.agent_config_dir);
     assert!(t.contains("TOKEN_SET:yes"));
