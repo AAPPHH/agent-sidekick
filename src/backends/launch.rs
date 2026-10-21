@@ -106,6 +106,10 @@ fn load_credential_with(
                 Err(TokenError::Missing) | Err(TokenError::Empty) => {
                     Err(missing_oauth_message(name))
                 }
+                Err(TokenError::Invalid) => Err(format!(
+                    "The stored {id} is invalid (it contains line breaks or control \
+                     characters). Run 'agent-sidekick setup --backend {name}' to store it again."
+                )),
                 Err(TokenError::Storage(e)) => Err(format!(
                     "Cannot read the {id}: {e}. Run 'agent-sidekick doctor' or \
                      'agent-sidekick setup --backend {name}' in a terminal."
@@ -141,6 +145,10 @@ fn load_credential_with(
                      ignore keys accept any value such as 'ollama'), or set api_key_env in \
                      config.toml."
                 )),
+                Err(TokenError::Invalid) => Err(format!(
+                    "The stored {id} is invalid (it contains line breaks or control \
+                     characters). Run 'agent-sidekick setup --backend {name}' to store it again."
+                )),
                 Err(TokenError::Storage(e)) => Err(format!(
                     "Cannot read the {id}: {e}. Run 'agent-sidekick doctor' or \
                      'agent-sidekick setup --backend {name}' in a terminal."
@@ -157,6 +165,10 @@ fn load_credential_with(
                 Err(TokenError::Missing) | Err(TokenError::Empty) => Err(format!(
                     "No secret stored for backend '{name}' (secret_env {var}). Run \
                      'agent-sidekick setup --backend {name}' in a terminal."
+                )),
+                Err(TokenError::Invalid) => Err(format!(
+                    "The stored {id} is invalid (it contains line breaks or control \
+                     characters). Run 'agent-sidekick setup --backend {name}' to store it again."
                 )),
                 Err(TokenError::Storage(e)) => Err(format!(
                     "Cannot read the {id}: {e}. Run 'agent-sidekick doctor' or \

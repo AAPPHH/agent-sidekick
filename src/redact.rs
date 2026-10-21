@@ -48,11 +48,17 @@ impl Secrets {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut v: Vec<String> = values
-            .into_iter()
-            .map(|s| s.as_ref().trim().to_owned())
-            .filter(|s| s.chars().count() >= MIN_SECRET_LEN)
-            .collect();
+        let mut v: Vec<String> = Vec::new();
+        for value in values {
+            let value = value.as_ref().trim();
+            v.push(value.to_owned());
+            // Output is redacted line by line: also register every line of a multi-line
+            // value (defence in depth; storing such values is rejected).
+            if value.contains(['\n', '\r']) {
+                v.extend(value.lines().map(|l| l.trim().to_owned()));
+            }
+        }
+        v.retain(|s| s.chars().count() >= MIN_SECRET_LEN);
         // Longest first, so a secret containing another one is replaced as a whole.
         v.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         v.dedup();
@@ -121,6 +127,13 @@ mod tests {
             "ollama says [REDACTED] and [REDACTED] and [REDACTED]"
         );
         assert!(!format!("{s:?}").contains("longsecret"));
+    }
+
+    #[test]
+    fn secrets_multiline_values_are_redacted_per_line() {
+        let s = Secrets::new(["first-line-secret\nsecond-line-secret\r\nab"]);
+        let out = s.redact("A first-line-secret B\nC second-line-secret D ab");
+        assert_eq!(out, "A [REDACTED] B\nC [REDACTED] D ab");
     }
 
     #[test]

@@ -70,6 +70,11 @@ pub enum TokenError {
     Empty,
     #[error("token storage error: {0}")]
     Storage(String),
+    /// The value contains line breaks or other control characters (never shows the value).
+    #[error(
+        "the value contains line breaks or other control characters; paste it as a single line"
+    )]
+    Invalid,
 }
 
 /// Result of a format check: tokens with an unexpected prefix are accepted with a warning.
@@ -388,6 +393,10 @@ pub(crate) fn store_with(
     if token.expose().is_empty() {
         return Err(TokenError::Empty);
     }
+    // A multi-line secret could not be redacted reliably from line-wise output.
+    if token.expose().chars().any(char::is_control) {
+        return Err(TokenError::Invalid);
+    }
     if let Some(k) = keyring {
         // Verify by reading back: some backends accept writes they cannot return.
         match k.set(token.expose()).and_then(|()| k.get()) {
@@ -658,6 +667,28 @@ mod tests {
             store_with(&Token::new(""), None, &path),
             Err(TokenError::Empty)
         ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn store_rejects_multiline_or_control_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        for value in [
+            "line-one-value-1234\nline-two-value-5678",
+            "abc\r\ndef-ghijkl",
+            "tab\tinside-value",
+        ] {
+            let err = store_with(&Token::new(value), None, &path).unwrap_err();
+            assert!(matches!(err, TokenError::Invalid), "{value:?}");
+            let shown = err.to_string();
+            assert!(
+                !shown.contains("line-one")
+                    && !shown.contains("ghijkl")
+                    && !shown.contains("inside"),
+                "{shown}"
+            );
+        }
         assert!(!path.exists());
     }
 

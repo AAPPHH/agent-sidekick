@@ -511,7 +511,7 @@ fn check_secret_env(var: &str, env: &BTreeMap<String, String>) -> Vec<String> {
     }
     if env.keys().any(|k| k.eq_ignore_ascii_case(var)) {
         errs.push(format!(
-            "`secret_env` `{var}` is also set in `env`; remove it there (the stored secret is              set by agent-sidekick)"
+            "`secret_env` `{var}` is also set in `env`; remove it there (the stored secret is set by agent-sidekick)"
         ));
     }
     errs
