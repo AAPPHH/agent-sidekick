@@ -1,0 +1,8 @@
+# agent-sidekick config.toml, written by the setup wizard (`agent-sidekick setup`).
+# Reference with every option: examples/config.toml and the README (section Backends).
+# Secrets are never stored here: they live in the OS keyring (or a file in this directory).
+# Run `agent-sidekick setup` again to add profiles; it never overwrites this file silently.
+
+max_concurrent = 2          # global limit over all backends; further runs are queued
+default_max_turns = 30
+default_timeout_s = 1800

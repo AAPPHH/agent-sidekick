@@ -1,0 +1,15 @@
+
+# Gemini CLI (Google) with a Gemini API key, as a command backend. It runs the npm package's
+# JavaScript entry point with node directly (no .cmd shim, no shell); setup filled in both
+# paths. After moving Node.js or reinstalling the Gemini CLI elsewhere, run
+# `agent-sidekick setup` again or fix the paths here.
+# Key: `agent-sidekick setup --backend gemini` (keyring user `cmd-gemini`), handed to the
+# CLI as GEMINI_API_KEY. Models are the CLI's aliases: auto, pro, flash.
+[backends.gemini]
+harness = "command"
+description = "Gemini CLI (Google) with your Gemini API key. Good quality, large context; edits files and runs commands in cwd without asking (approval mode yolo). Free tier with rate limits, paid with billing enabled. Models: auto (default, the CLI picks), pro, flash."
+cost = "quota"
+command = [{{NODE}}, {{GEMINI_ENTRY}}, "--approval-mode=yolo", "--skip-trust", "--model={model}", "--prompt={prompt}"]
+models = ["auto", "pro", "flash"]
+secret_env = "GEMINI_API_KEY"
+max_concurrent = 1

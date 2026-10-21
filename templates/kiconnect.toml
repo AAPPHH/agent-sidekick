@@ -1,0 +1,12 @@
+
+# KI:connect.nrw (university quota) through the OpenCode agent CLI.
+# Key: `agent-sidekick setup --backend kiconnect` (keyring user `backend-kiconnect`). A
+# KI:connect key expires after one month; the same command stores a new one.
+[backends.kiconnect]
+harness = "opencode"
+provider = "openai-compatible"
+base_url = "https://chat.kiconnect.nrw/api/v1"
+models = ["openai-gpt-oss-120b", "qwen-qwen3-8-27b"]   # the first one is the default
+description = "OpenCode agent via KI:connect.nrw (university quota). Free, medium quality; reads, edits and runs commands in cwd without asking. For boilerplate, tests and small, well-specified changes. Models: openai-gpt-oss-120b (general, default), qwen-qwen3-8-27b (code)."
+cost = "free"
+max_concurrent = 1

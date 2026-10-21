@@ -79,7 +79,7 @@ pub fn run(args: DoctorArgs) -> anyhow::Result<ExitCode> {
     Ok(exit_code(&checks))
 }
 
-fn run_checks() -> Vec<Check> {
+pub(crate) fn run_checks() -> Vec<Check> {
     let mut checks = Vec::new();
 
     let (cfg_check, cfg) = check_config();

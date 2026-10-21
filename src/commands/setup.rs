@@ -41,6 +41,28 @@ pub struct SetupArgs {
     /// Only (re-)register the MCP server with Claude Code; ask for no tokens at all.
     #[arg(long, conflicts_with_all = ["backend", "token_stdin", "no_register"])]
     pub register_only: bool,
+    /// Do not start the guided setup (wizard) in an interactive terminal; run the plain
+    /// setup instead (ask for the claude-oauth tokens of config.toml, then register).
+    #[arg(long)]
+    pub no_wizard: bool,
+}
+
+impl SetupArgs {
+    /// No flag at all: `setup` alone, which starts the wizard in an interactive terminal.
+    pub fn is_bare(&self) -> bool {
+        !self.token_stdin
+            && !self.no_register
+            && self.claude.is_none()
+            && self.backend.is_none()
+            && !self.register_only
+            && !self.no_wizard
+    }
+}
+
+/// The wizard runs for a bare `setup` when both stdin and stdout are terminals; otherwise
+/// (piped, scripted, any flag) the non-interactive setup runs unchanged.
+pub fn wants_wizard(args: &SetupArgs, stdin_tty: bool, stdout_tty: bool) -> bool {
+    args.is_bare() && stdin_tty && stdout_tty
 }
 
 /// One thing setup does for one backend.
@@ -261,6 +283,14 @@ fn step_name(step: &Step) -> &str {
 }
 
 pub fn run(args: SetupArgs) -> Result<ExitCode> {
+    // Before loading config.toml: the wizard can repair a broken one (backup + rewrite).
+    if wants_wizard(
+        &args,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
+        return super::wizard::run_interactive();
+    }
     // The configuration first: a broken config.toml must fail before anything is asked.
     let (cfg, backends) = load_backends().map_err(|e| anyhow!(e))?;
     let single = args.backend.is_some();
@@ -507,7 +537,7 @@ fn resolve_claude(explicit: Option<&Path>, config_claude_path: Option<&Path>) ->
     Ok(locate::find_claude(config_claude_path)?)
 }
 
-fn register(claude: &Path, self_exe: &Path) -> Result<()> {
+pub(crate) fn register(claude: &Path, self_exe: &Path) -> Result<()> {
     // `mcp get` shows only the entry that wins in this directory (local > project > user),
     // so a user entry may exist behind a local one: always try to remove the user entry.
     let (registered, keep) = match claude_cli::mcp_get(claude) {
@@ -707,6 +737,45 @@ mod tests {
             }]
         );
         assert!(check_token_stdin(&local, true, true).is_err());
+    }
+
+    #[test]
+    fn wizard_only_for_bare_setup_in_a_terminal() {
+        let bare = SetupArgs {
+            token_stdin: false,
+            no_register: false,
+            claude: None,
+            backend: None,
+            register_only: false,
+            no_wizard: false,
+        };
+        assert!(wants_wizard(&bare, true, true));
+        assert!(!wants_wizard(&bare, false, true));
+        assert!(!wants_wizard(&bare, true, false));
+        let variants: [fn(&mut SetupArgs); 6] = [
+            |a| a.token_stdin = true,
+            |a| a.no_register = true,
+            |a| a.claude = Some("/x/claude".into()),
+            |a| a.backend = Some("kiconnect".into()),
+            |a| a.register_only = true,
+            |a| a.no_wizard = true,
+        ];
+        for set in variants {
+            let mut args = bare_clone(&bare);
+            set(&mut args);
+            assert!(!wants_wizard(&args, true, true), "{args:?}");
+        }
+    }
+
+    fn bare_clone(a: &SetupArgs) -> SetupArgs {
+        SetupArgs {
+            token_stdin: a.token_stdin,
+            no_register: a.no_register,
+            claude: a.claude.clone(),
+            backend: a.backend.clone(),
+            register_only: a.register_only,
+            no_wizard: a.no_wizard,
+        }
     }
 
     #[test]

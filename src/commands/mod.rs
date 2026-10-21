@@ -7,3 +7,4 @@ pub mod harness;
 pub mod setup;
 pub mod uninstall;
 pub mod update;
+pub mod wizard;
