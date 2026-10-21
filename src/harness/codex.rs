@@ -25,7 +25,7 @@ use crate::runner::Launch;
 /// Official install command (npm package `@openai/codex`). Printed only, never run.
 pub const INSTALL_HINT: &str = "\
 npm (all platforms):   npm install -g @openai/codex
-(see https://developers.openai.com/codex/cli)";
+(see https://www.npmjs.com/package/@openai/codex)";
 
 /// Why a backend cannot use the codex harness (yet).
 pub const NOT_ENABLED: &str = "codex harness is not enabled yet (stub)";
