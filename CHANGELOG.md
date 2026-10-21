@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `agent-sidekick update`: checks the latest GitHub release and prints the platform's install one-liner (no download, no self-install). `AGENT_SIDEKICK_UPDATE_URL` overrides the API base.
 - `doctor` shows an update hint at most once a day (checked and shown once, result kept in `<config-dir>/update-check.json`); `doctor --offline` skips it.
 - Cargo.toml `repository` (https://github.com/AAPPHH/agent-sidekick).
+- `request_timeout_s` for opencode backends: OpenCode's `headerTimeout` (seconds to wait for the response headers before the request is retried; unset keeps OpenCode's 300 s). Never OpenCode's `timeout`, which is a total request limit without retry.
 
 ### Changed
 

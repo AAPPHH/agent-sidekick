@@ -165,11 +165,13 @@ fn kiconnect_example_resolves() {
         api_key_env,
         harness_path,
         read_only,
+        request_timeout_s,
         base_dir,
     } = &b.kind
     else {
         panic!("{b:?}")
     };
+    assert_eq!(*request_timeout_s, None);
     assert_eq!(*provider, OpencodeProvider::OpenaiCompatible);
     assert_eq!(
         base_url.as_deref(),
@@ -347,6 +349,10 @@ fn rendered_config_openai_compatible() {
     assert_eq!(p["npm"], "@ai-sdk/openai-compatible");
     assert_eq!(p["options"]["baseURL"], "https://chat.kiconnect.nrw/api/v1");
     assert_eq!(p["options"]["apiKey"], "{env:AGENT_SIDEKICK_PROVIDER_KEY}");
+    // Unset `request_timeout_s`: OpenCode's own header timeout; `timeout` (a total request
+    // limit without retry) is never set.
+    assert!(p["options"].get("headerTimeout").is_none(), "{p}");
+    assert!(p["options"].get("timeout").is_none(), "{p}");
     assert_eq!(
         p["models"]["qwen-qwen3-8-27b"],
         json!({"name": "qwen-qwen3-8-27b", "tool_call": true})
@@ -387,7 +393,36 @@ fn rendered_config_ollama_and_openrouter() {
     assert_eq!(p["options"]["apiKey"], "{env:AGENT_SIDEKICK_PROVIDER_KEY}");
     assert!(p.get("npm").is_none());
     assert_eq!(p["models"]["qwen/qwen3-coder"], json!({}));
+    assert!(p["options"].get("headerTimeout").is_none(), "{p}");
     assert_eq!(c["permission"], permissions(true));
+}
+
+#[test]
+fn request_timeout_is_configurable_and_bounded() {
+    const OLLAMA: &str =
+        "provider = \"ollama\"\nbase_url = \"http://localhost:11434\"\nmodels = [\"m\"]\n";
+    let bs = resolve_str(&one(&format!("{OLLAMA}request_timeout_s = 900"))).unwrap();
+    let c = render_config(bs.get("x").unwrap()).unwrap();
+    assert_eq!(
+        c["provider"]["sidekick"]["options"]["headerTimeout"],
+        900_000
+    );
+    for bad in ["0", "3601"] {
+        let e = resolve_str(&one(&format!("{OLLAMA}request_timeout_s = {bad}"))).unwrap_err();
+        assert!(
+            e.contains("`request_timeout_s` must be between 1 and 3600"),
+            "{e}"
+        );
+    }
+    let e = resolve_str(
+        "[backends.x]\ntype = \"command\"\ndescription = \"d\"\ncommand = [\"x\", \"{prompt}\"]\n\
+         request_timeout_s = 60\n",
+    )
+    .unwrap_err();
+    assert!(
+        e.contains("field `request_timeout_s` is not allowed"),
+        "{e}"
+    );
 }
 
 #[test]

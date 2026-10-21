@@ -306,6 +306,7 @@ Keys:
 | `api_key_env` | Read the key from this variable of the MCP server's environment instead of the stored one (not for ollama). |
 | `harness_path` | Absolute path (or `~/...`) of the opencode executable. Default: the npm package's real executable (`<npm prefix>/node_modules/opencode-ai/bin/opencode.exe`, found next to an `opencode.cmd` in `PATH` or in `%APPDATA%\npm`; on Unix `<prefix>/lib/node_modules/...`), then `opencode` in `PATH` (on Windows only `opencode.exe`, never the `.cmd` shim), then `~/.opencode/bin/opencode`. A `.cmd`/`.bat` wrapper is accepted only here, with model names restricted to `A-Z a-z 0-9 - _ . / : @ +`. |
 | `read_only` | `true`: the edit, bash and webfetch tools are denied (OpenCode then does not offer them). Default `false`. |
+| `request_timeout_s` | Seconds OpenCode waits for the provider's response headers before it retries the request (OpenCode's `headerTimeout`, 1 to 3600; unset: OpenCode's default of 300). Raise it for slow local models that need long before the first token. A shorter value does not help against a queueing provider: on KI:connect the retries waited just as long. |
 | `cost` | Default `paid` (`free` for ollama). |
 
 `description`, `default`, `max_concurrent`, `env` and `pass_env` work as for every backend; `config_dir`, `auth`, `command`, `prompt_via_stdin` and `secret_env` are not allowed.
@@ -447,6 +448,7 @@ pass_env = []             # inherited variables to keep for every backend, see a
 | `provider` | opencode | (required) | `openai-compatible`, `ollama` or `openrouter`, see [OpenCode backends](#opencode-backends). |
 | `harness_path` | opencode | looked up | Absolute path (or `~/...`) of the opencode executable. |
 | `read_only` | opencode | `false` | Deny OpenCode's edit, bash and webfetch tools. |
+| `request_timeout_s` | opencode | OpenCode's 300 | Header timeout before OpenCode retries a request (1 to 3600). |
 | `command` | command | (required) | Program and arguments with `{prompt}`, `{cwd}`, `{max_turns}`, `{model}` (placeholders only after `command[0]`). |
 | `prompt_via_stdin` | command | `false` | Send the prompt on stdin instead of `{prompt}`. |
 | `secret_env` | command | none | Variable that receives the backend's stored secret (`setup --backend <name>`), e.g. `OPENAI_API_KEY`. Not allowed: `CLAUDE_CODE_OAUTH_TOKEN`, `AGENT_SIDEKICK_*`, or a key that is also in `env`. Values shorter than 8 characters are not redacted. |

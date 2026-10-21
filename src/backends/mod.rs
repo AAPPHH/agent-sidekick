@@ -193,6 +193,9 @@ pub struct RawBackend {
     pub harness_path: Option<PathBuf>,
     /// opencode: deny the edit, bash and webfetch tools (default false).
     pub read_only: Option<bool>,
+    /// opencode: seconds to wait for the provider's response headers before OpenCode retries
+    /// the request (OpenCode's `headerTimeout`; unset: OpenCode's default of 300 s).
+    pub request_timeout_s: Option<u64>,
 }
 
 /// A validated backend.
@@ -251,6 +254,9 @@ pub enum BackendKind {
         /// [`crate::harness::opencode`]).
         harness_path: Option<PathBuf>,
         read_only: bool,
+        /// Header timeout in seconds (OpenCode provider option `headerTimeout`, retried on
+        /// expiry); `None`: OpenCode's default.
+        request_timeout_s: Option<u64>,
         /// Per-backend isolation directory `<config-dir>/opencode/<name>`.
         base_dir: PathBuf,
     },

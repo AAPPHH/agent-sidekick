@@ -551,3 +551,25 @@ User decision: OpenAI/Codex is not wired up yet (model list later), so this step
 ## Version for the first release
 
 The harness work was developed as 0.4.0 but merged before anything was tagged. At the user's request, everything (Cargo.toml, CHANGELOG, plugin.json, VERSION examples, NOTES headings) is unified to **0.3.0** for the first public release; the CHANGELOG merges the former [0.4.0] entries into [0.3.0]. 0.4.0 starts after the first release. Entries above that mention "0.4.0" in a merge context are history. Paths that contained the developer's user name were replaced with placeholders (`~`, `%USERPROFILE%`, `%APPDATA%`).
+
+## KI:connect mini runs through the OpenCode harness (2026-10-21)
+
+Setup: agent-sidekick 0.3.0 (opencode 1.19.3), backend `kiconnect` (`harness = "opencode"`, `provider = "openai-compatible"`, `base_url = https://chat.kiconnect.nrw/api/v1`), key in keyring user `backend-kiconnect`. Runs started through `agent-sidekick serve` (MCP `tools/call sidekick_run`). Test project: a copy of the aider test folder (`calc.py` with three defects: `average` divides by `len + 1`, `average([])` does not raise `ValueError`, `is_even` tests for odd) **without** the `# BUG` hint comments, plus the unchanged `test_calc.py`. Each result was checked by hand; the write runs by running `python -m unittest` myself and diffing `test_calc.py`. Tool calling had been confirmed beforehand with a direct probe (non-stream, stream, and a second turn with a tool result) for both models.
+
+| Run | Model | max_turns | Result | Steps | Tokens in / out | Duration |
+|---|---|---|---|---|---|---|
+| read-only #1 | openai-gpt-oss-120b | 3 | **failed**: first read used the absolute path `/calc.py` (denied as external directory), then `glob`, then the step cap; answer "limit reached", no analysis | 3 | 11,734 / 270 | 5.7 s |
+| read-only | qwen-qwen3-8-27b | 3 | **correct**: all three defects with corrected code | 2 | 9,031 / 230 | 330.5 s |
+| read-only #2 | openai-gpt-oss-120b | 3 | **failed**: read `calc.py`, step cap before reading the tests | 3 | 11,877 / 220 | 5.1 s |
+| read-only #3 (diagnostic) | openai-gpt-oss-120b | 5 | **correct**: all three defects with corrected code | 4 | 15,498 / 240 | 5.4 s |
+| write | openai-gpt-oss-120b | 8 | **correct**: fixed `calc.py`, ran the tests itself, tests unchanged, my run: 4 tests OK | 7 | 42,719 / 123 | 7.4 s |
+| write | qwen-qwen3-8-27b | 8 | **correct**: same, 4 tests OK | 4 | 28,462 / 320 | 325.6 s |
+| write (repeat, `headerTimeout` 120 s) | qwen-qwen3-8-27b | 8 | **correct**, 4 tests OK | 4 | 28,488 / 333 | 397.7 s |
+
+Cost is reported as 0 (KI:connect has no per-token price).
+
+Findings:
+- **Both models solve the read and the write task; `kiconnect` counts as usable.** gpt-oss-120b reads one file per step and needs one step for the answer, so `max_turns` 3 is too tight for it; use at least 5 for small tasks (the doc tasks use 20).
+- **gpt-oss is fast (5 to 8 s per task), Qwen is slow (5.5 to 6.5 min per task)** because one request per run gets no response headers for about 5 minutes. OpenCode's header timeout (300 s) fires and the retry answers in seconds. With `headerTimeout` 120 s the retry waited again, three times in a row, so this looks like queueing at the provider, not a lost request; a shorter timeout does not help. `request_timeout_s` stays an optional setting (unset by default). Prefer gpt-oss as the default model; use Qwen only when its latency is acceptable.
+- **The soft step cap works with both models:** they stop and summarise when the cap is reached instead of looping.
+- The OpenCode harness behaves as designed: isolated state dir, key only via `{env:...}`, read-only mode offered only read tools, `test_calc.py` untouched in the write runs.

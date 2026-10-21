@@ -385,6 +385,7 @@ pub fn describe(backend: &Backend) -> Vec<String> {
             api_key_env,
             harness_path,
             read_only,
+            request_timeout_s,
             base_dir,
         } => {
             lines.push(format!("provider:    {provider}"));
@@ -396,6 +397,10 @@ pub fn describe(backend: &Backend) -> Vec<String> {
                 None => "harness_path: (looked up: npm global package, PATH)".to_owned(),
             });
             lines.push(format!("read_only:   {read_only}"));
+            lines.push(match request_timeout_s {
+                Some(t) => format!("request_timeout_s: {t}"),
+                None => "request_timeout_s: (OpenCode default, 300)".to_owned(),
+            });
             lines.push(match (provider.needs_key(), api_key_env) {
                 (false, _) => "api key:     none needed".to_owned(),
                 (true, Some(var)) => format!("api key:     from environment variable {var}"),
@@ -558,6 +563,7 @@ pub(crate) mod tests {
                 api_key_env: api_key_env.map(Into::into),
                 harness_path: None,
                 read_only: false,
+                request_timeout_s: None,
                 base_dir: abs("cfg").join("opencode").join(name),
             },
             is_default,

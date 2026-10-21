@@ -300,7 +300,7 @@ fn resolve_one(
     }
 
     // Fields that are not allowed for this type.
-    let set_fields: [(&str, bool, &[BackendType]); 10] = [
+    let set_fields: [(&str, bool, &[BackendType]); 11] = [
         (
             "config_dir",
             raw.config_dir.is_some(),
@@ -325,6 +325,11 @@ fn resolve_one(
         (
             "read_only",
             raw.read_only.is_some(),
+            &[BackendType::OpenCode],
+        ),
+        (
+            "request_timeout_s",
+            raw.request_timeout_s.is_some(),
             &[BackendType::OpenCode],
         ),
         ("auth", raw.auth.is_some(), &[BackendType::ClaudeEndpoint]),
@@ -661,6 +666,12 @@ fn opencode_kind(
             return None;
         }
     };
+    let request_timeout_s = raw.request_timeout_s;
+    if let Some(t) = request_timeout_s.filter(|t| !(1..=3600).contains(t)) {
+        errs.push(format!(
+            "`request_timeout_s` must be between 1 and 3600 (got {t})"
+        ));
+    }
     if errs.len() != before {
         return None;
     }
@@ -670,6 +681,7 @@ fn opencode_kind(
         api_key_env: raw.api_key_env.clone(),
         harness_path,
         read_only: raw.read_only.unwrap_or(false),
+        request_timeout_s,
         base_dir,
     })
 }

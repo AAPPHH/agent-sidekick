@@ -255,6 +255,7 @@ pub fn render_config(backend: &Backend) -> Result<Value, String> {
         provider,
         base_url,
         read_only,
+        request_timeout_s,
         ..
     } = &backend.kind
     else {
@@ -286,7 +287,10 @@ pub fn render_config(backend: &Backend) -> Result<Value, String> {
             json!({
                 "npm": "@ai-sdk/openai-compatible",
                 "name": format!("agent-sidekick {}", backend.name),
-                "options": {"baseURL": base_url, "apiKey": api_key},
+                "options": provider_options(
+                    json!({"baseURL": base_url, "apiKey": api_key}),
+                    *request_timeout_s
+                ),
                 "models": model_map
             })
         }
@@ -296,7 +300,7 @@ pub fn render_config(backend: &Backend) -> Result<Value, String> {
                 model_map.insert((*m).to_owned(), json!({}));
             }
             json!({
-                "options": {"apiKey": key_ref},
+                "options": provider_options(json!({"apiKey": key_ref}), *request_timeout_s),
                 "models": model_map
             })
         }
@@ -318,6 +322,15 @@ pub fn render_config(backend: &Backend) -> Result<Value, String> {
         "provider": providers,
         "permission": permissions(*read_only)
     }))
+}
+
+/// Provider options plus `headerTimeout` when the backend sets `request_timeout_s`. Never
+/// OpenCode's `timeout`: that is a total request limit without retry.
+fn provider_options(mut options: Value, request_timeout_s: Option<u64>) -> Value {
+    if let Some(t) = request_timeout_s {
+        options["headerTimeout"] = json!(t.saturating_mul(1000));
+    }
+    options
 }
 
 /// Per-run config layer (`OPENCODE_CONFIG_CONTENT`): `max_turns` as the build agent's step

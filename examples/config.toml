@@ -136,5 +136,6 @@ max_concurrent = 1
 # cost = "free"
 # max_concurrent = 1
 # read_only = true                         # deny edit/bash/webfetch (review-only runs)
+# request_timeout_s = 600                  # header timeout before OpenCode retries (default 300)
 # harness_path = "C:/Users/<you>/AppData/Roaming/npm/node_modules/opencode-ai/bin/opencode.exe"
 # api_key_env = "KICONNECT_API_KEY"        # read the key from the MCP server's environment instead
