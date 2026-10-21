@@ -1,6 +1,7 @@
 //! agent-sidekick: local MCP server (stdio) that delegates prompts to a second,
 //! headless Claude Code instance running with its own credentials.
 
+pub mod backends;
 pub mod cli;
 pub mod commands;
 pub mod config;

@@ -90,6 +90,64 @@ pub fn check_format(token: &str) -> FormatCheck {
     }
 }
 
+/// Which stored secret: the OAuth token of a claude-oauth backend or the API key of a
+/// claude-endpoint backend. A claude-oauth backend named `sidekick` uses the v0.1
+/// locations (keyring user `oauth-token`, file `token`, env `AGENT_SIDEKICK_TOKEN`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SecretId {
+    /// OAuth token of the claude-oauth backend with this name.
+    Oauth(String),
+    /// API key of the claude-endpoint backend with this name.
+    Endpoint(String),
+}
+
+impl SecretId {
+    /// The v0.1 secret (claude-oauth backend `sidekick`).
+    pub fn legacy() -> Self {
+        SecretId::Oauth(crate::backends::IMPLICIT_BACKEND.to_owned())
+    }
+
+    /// Keyring user name: `oauth-token`, `oauth-token-<name>` or `endpoint-<name>`.
+    pub fn keyring_user(&self) -> String {
+        todo!("secrets task")
+    }
+
+    /// File name in the config dir: `token`, `token-<name>` or `endpoint-<name>.key`.
+    pub fn file_name(&self) -> String {
+        todo!("secrets task")
+    }
+
+    /// Environment override (highest priority): only `AGENT_SIDEKICK_TOKEN` for the legacy
+    /// secret; `None` otherwise.
+    pub fn env_override(&self) -> Option<&'static str> {
+        todo!("secrets task")
+    }
+}
+
+impl fmt::Display for SecretId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SecretId::Oauth(n) => write!(f, "OAuth token of backend `{n}`"),
+            SecretId::Endpoint(n) => write!(f, "API key of backend `{n}`"),
+        }
+    }
+}
+
+/// [`load`] for any secret (env override, keyring, file).
+pub fn load_secret(_id: &SecretId) -> Result<(Token, TokenSource), TokenError> {
+    todo!("secrets task")
+}
+
+/// [`store`] for any secret.
+pub fn store_secret(_id: &SecretId, _token: &Token) -> Result<TokenSource, TokenError> {
+    todo!("secrets task")
+}
+
+/// [`delete`] for any secret.
+pub fn delete_secret(_id: &SecretId) -> Result<Vec<String>, TokenError> {
+    todo!("secrets task")
+}
+
 /// Load the token: env, then keyring, then file.
 pub fn load() -> Result<(Token, TokenSource), TokenError> {
     let keyring = keyring_enabled().then_some(OsKeyring);

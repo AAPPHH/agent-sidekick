@@ -1,9 +1,12 @@
 //! Optional `config.toml` with default values.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+pub use crate::backends::RawBackend;
 
 pub const MAX_TURNS_LIMIT: u32 = 200;
 pub const MAX_TIMEOUT_S: u64 = 7200;
@@ -18,6 +21,13 @@ pub struct Config {
     pub default_timeout_s: u64,
     /// Explicit path to the `claude` executable (checked after `AGENT_SIDEKICK_CLAUDE`).
     pub claude_path: Option<PathBuf>,
+    /// Names of inherited environment variables that are passed to every backend even
+    /// though they would normally be removed (see `backends::launch`).
+    pub pass_env: Vec<String>,
+    /// `[backends.<name>]` tables as written. `None`: no `[backends]` section, which means
+    /// the implicit claude-oauth backend `sidekick` (v0.1 behaviour). Validated and turned
+    /// into [`crate::backends::Backends`] by [`crate::backends::resolve`].
+    pub backends: Option<BTreeMap<String, RawBackend>>,
 }
 
 impl Default for Config {
@@ -28,6 +38,8 @@ impl Default for Config {
             default_model: None,
             default_timeout_s: 1800,
             claude_path: None,
+            pass_env: Vec::new(),
+            backends: None,
         }
     }
 }
