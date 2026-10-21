@@ -46,7 +46,25 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_in_env(program, args, None, timeout)
+}
+
+/// [`run`] with `env` as the child's complete environment (`None`: inherited).
+pub fn run_in_env<I, S>(
+    program: &Path,
+    args: I,
+    env: Option<&[(OsString, OsString)]>,
+    timeout: Duration,
+) -> Result<CliOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut cmd = Command::new(program);
+    if let Some(env) = env {
+        cmd.env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_os_str(), v.as_os_str())));
+    }
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

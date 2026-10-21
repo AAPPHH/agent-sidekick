@@ -1,6 +1,7 @@
 # agent-sidekick config.toml with four backends: sidekick, local and aider (the example in the
 # README) plus the optional kiconnect (section 4), which needs a stored key. The routing
-# rules in examples/CLAUDE.md cover the same four backends.
+# rules in examples/CLAUDE.md cover the same four backends. Section 5 shows a commented-out
+# alternative for kiconnect with the OpenCode harness.
 #
 # Copy to the config directory:
 #   Linux:   ~/.config/agent-sidekick/config.toml
@@ -111,3 +112,29 @@ models = ["openai-gpt-oss-120b", "qwen-qwen3-8-27b"]
 env = { OPENAI_API_BASE = "https://chat.kiconnect.nrw/api/v1", PYTHONUTF8 = "1" }
 secret_env = "OPENAI_API_KEY"
 max_concurrent = 1
+
+# 5) Optional, commented out: the same KI:connect.nrw models through the OpenCode agent CLI
+#    (harness = "opencode", since 0.4.0) instead of Aider. OpenCode reads, edits and runs
+#    commands like Claude Code does. Install it first (`agent-sidekick harness install opencode`
+#    prints the official commands, e.g. `npm install -g opencode-ai`), then store the key with
+#    `agent-sidekick setup --backend kiconnect-oc` (OS keyring user `backend-kiconnect-oc`, file
+#    fallback `backend-kiconnect-oc.key`). The key is never written to a file: the generated
+#    opencode.json references it as {env:AGENT_SIDEKICK_PROVIDER_KEY}.
+#    Each opencode backend runs isolated in <config-dir>/opencode/<name>/ (own home, config,
+#    sessions, caches); your own ~/.config/opencode and ~/.opencode are not used.
+#    max_turns is only a soft limit for OpenCode; timeout_s is the hard one.
+#    OpenCode still executes project plugins (.opencode/plugin/*.js|ts in cwd or above, up
+#    to the repository root, or named under "plugin" in the project's opencode.json), and
+#    they see the provider key; only run it in projects you trust (README, OpenCode backends).
+#    Rename it to `kiconnect` if you do not keep section 4.
+# [backends.kiconnect-oc]
+# harness = "opencode"
+# provider = "openai-compatible"           # or "ollama" (no key) or "openrouter" (no base_url)
+# base_url = "https://chat.kiconnect.nrw/api/v1"
+# models = ["openai-gpt-oss-120b", "qwen-qwen3-8-27b"]   # the first one is the default
+# description = "OpenCode agent via KI:connect.nrw (university quota). Free, medium quality; reads, edits and runs commands in cwd without asking. For boilerplate, tests and small, well-specified changes. Models: openai-gpt-oss-120b (general, default), qwen-qwen3-8-27b (code)."
+# cost = "free"
+# max_concurrent = 1
+# read_only = true                         # deny edit/bash/webfetch (review-only runs)
+# harness_path = "C:/Users/<you>/AppData/Roaming/npm/node_modules/opencode-ai/bin/opencode.exe"
+# api_key_env = "KICONNECT_API_KEY"        # read the key from the MCP server's environment instead

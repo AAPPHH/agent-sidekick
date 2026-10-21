@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use ureq::http::Uri;
 
-use super::{Backend, BackendKind};
+use super::Backend;
+use crate::harness::CheckDeps;
 use crate::token::{SecretId, TokenError};
 
 /// Timeout of the HTTP probe of a claude-endpoint `base_url`.
@@ -34,14 +35,14 @@ pub struct Reachability {
 }
 
 impl Reachability {
-    fn ok(detail: impl Into<String>) -> Self {
+    pub(crate) fn ok(detail: impl Into<String>) -> Self {
         Self {
             reachable: true,
             detail: detail.into(),
         }
     }
 
-    fn unreachable(detail: impl Into<String>) -> Self {
+    pub(crate) fn unreachable(detail: impl Into<String>) -> Self {
         Self {
             reachable: false,
             detail: detail.into(),
@@ -52,9 +53,35 @@ impl Reachability {
 /// HTTP GET `base_url` without credentials; any HTTP response (also 4xx/5xx) counts as
 /// reachable, a connection error or timeout does not. Blocking.
 pub fn probe_http(base_url: &str, timeout: Duration) -> Reachability {
-    let target = match ProbeTarget::parse(base_url) {
+    match probe_get(base_url, None, timeout) {
+        ProbeResponse::Status { code, url, millis } => {
+            Reachability::ok(format!("HTTP {code} from {url} in {millis} ms"))
+        }
+        ProbeResponse::Failed(why) => Reachability::unreachable(format!("unreachable: {why}")),
+    }
+}
+
+/// Outcome of [`probe_get`]. Never contains credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeResponse {
+    /// Any HTTP response; `url` without `user:pass@`.
+    Status {
+        code: u16,
+        url: String,
+        millis: u128,
+    },
+    /// No HTTP response (invalid URL, connection error, timeout, TLS, ...).
+    Failed(String),
+}
+
+/// HTTP `GET url` (same rules as [`probe_http`]: no redirects, one global timeout, loopback
+/// without proxy, body never read), optionally with `Authorization: Bearer <bearer>`. The
+/// bearer token is only ever sent to `url` itself (redirects are not followed) and never
+/// appears in the result. Blocking.
+pub fn probe_get(url: &str, bearer: Option<&str>, timeout: Duration) -> ProbeResponse {
+    let target = match ProbeTarget::parse(url) {
         Ok(t) => t,
-        Err(why) => return Reachability::unreachable(format!("unreachable: {why}")),
+        Err(why) => return ProbeResponse::Failed(why),
     };
 
     let mut config = ureq::Agent::config_builder()
@@ -67,15 +94,18 @@ pub fn probe_http(base_url: &str, timeout: Duration) -> Reachability {
     let agent: ureq::Agent = config.build().into();
 
     let start = Instant::now();
+    let mut request = agent.get(&target.url);
+    if let Some(token) = bearer {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
     // `call` returns once the response head is read; the body is dropped unread.
-    match agent.get(&target.url).call() {
-        Ok(resp) => Reachability::ok(format!(
-            "HTTP {} from {} in {} ms",
-            resp.status().as_u16(),
-            target.url,
-            start.elapsed().as_millis()
-        )),
-        Err(e) => Reachability::unreachable(format!("unreachable: {}", error_text(&e, timeout))),
+    match request.call() {
+        Ok(resp) => ProbeResponse::Status {
+            code: resp.status().as_u16(),
+            url: target.url,
+            millis: start.elapsed().as_millis(),
+        },
+        Err(e) => ProbeResponse::Failed(error_text(&e, timeout)),
     }
 }
 
@@ -106,7 +136,8 @@ pub fn check_backend(backend: &Backend, claude_path: Option<&Path>) -> Reachabil
     )
 }
 
-/// Testable core of [`check_backend`]. Checks run in order and the first failure wins.
+/// Testable core of [`check_backend`]: dispatches to the backend's harness adapter
+/// ([`crate::harness::Harness::check`]). Checks run in order and the first failure wins.
 /// - `find_claude`: path of the claude executable or a user-facing error.
 /// - `secret`: the secret's source description (never the value) or the load error.
 /// - `env_lookup`: environment access (for `api_key_env`).
@@ -120,95 +151,19 @@ fn check_backend_with(
     resolve_program: &dyn Fn(&str) -> Result<PathBuf, String>,
     probe: &dyn Fn(&str) -> Reachability,
 ) -> Reachability {
-    match &backend.kind {
-        BackendKind::ClaudeOauth { .. } => {
-            let claude = match find_claude() {
-                Ok(p) => p,
-                Err(e) => return Reachability::unreachable(format!("claude not found: {e}")),
-            };
-            let id = SecretId::Oauth(backend.name.clone());
-            match secret(&id) {
-                Ok(source) => {
-                    Reachability::ok(format!("claude {}; token from {source}", claude.display()))
-                }
-                Err(TokenError::Missing) => Reachability::unreachable(format!(
-                    "no token stored; run `agent-sidekick setup --backend {}`",
-                    backend.name
-                )),
-                Err(e) => Reachability::unreachable(format!("cannot read the {id}: {e}")),
-            }
-        }
-        BackendKind::ClaudeEndpoint {
-            base_url,
-            api_key_env,
-            ..
-        } => {
-            if let Err(e) = find_claude() {
-                return Reachability::unreachable(format!("claude not found: {e}"));
-            }
-            match api_key_env {
-                Some(var) => {
-                    if env_lookup(var).is_none_or(|v| v.trim().is_empty()) {
-                        return Reachability::unreachable(format!(
-                            "env var {var} (api_key_env) is not set"
-                        ));
-                    }
-                }
-                None => {
-                    let id = SecretId::Endpoint(backend.name.clone());
-                    match secret(&id) {
-                        Ok(_) => {}
-                        Err(TokenError::Missing) => {
-                            return Reachability::unreachable(format!(
-                                "no API key stored; run `agent-sidekick setup --backend {}` \
-                                 (for local servers that ignore keys, enter any value, e.g. `ollama`)",
-                                backend.name
-                            ))
-                        }
-                        Err(e) => {
-                            return Reachability::unreachable(format!("cannot read the {id}: {e}"))
-                        }
-                    }
-                }
-            }
-            probe(base_url)
-        }
-        BackendKind::Command {
-            command,
-            secret_env,
-            prompt_via_stdin,
-        } => {
-            let Some(program) = command.first().filter(|p| !p.trim().is_empty()) else {
-                return Reachability::unreachable("command is empty");
-            };
-            let path = match resolve_program(program) {
-                Ok(path) => path,
-                Err(e) => return Reachability::unreachable(e),
-            };
-            if let Some(e) =
-                super::launch::batch_argument_error(&backend.name, &path, *prompt_via_stdin)
-            {
-                return Reachability::unreachable(e);
-            }
-            let Some(var) = secret_env else {
-                return Reachability::ok(format!("program {}", path.display()));
-            };
-            let id = SecretId::Command(backend.name.clone());
-            match secret(&id) {
-                Ok(source) => Reachability::ok(format!(
-                    "program {}; secret_env {var} from {source}",
-                    path.display()
-                )),
-                Err(TokenError::Missing) | Err(TokenError::Empty) => {
-                    Reachability::unreachable(format!(
-                        "no secret stored for secret_env {var}; run `agent-sidekick setup --backend {}`",
-                        backend.name
-                    ))
-                }
-                Err(e) => Reachability::unreachable(format!("cannot read the {id}: {e}")),
-            }
-        }
-    }
+    backend.harness().check(
+        backend,
+        &CheckDeps {
+            find_claude,
+            secret,
+            env_lookup,
+            resolve_program,
+            probe,
+            locate: &|b| b.harness().locate(b, None),
+            secret_value: &|id| crate::token::load_secret(id).map(|(token, _source)| token),
+            probe_get: &|url, bearer| probe_get(url, bearer, PROBE_TIMEOUT),
+        },
+    )
 }
 
 /// A parsed, credential-free probe URL.
@@ -301,6 +256,7 @@ fn io_text(e: &io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::BackendKind;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};

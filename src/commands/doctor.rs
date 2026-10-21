@@ -237,6 +237,7 @@ fn check_backends(cfg_valid: bool, cfg: &Config, claude_found: bool) -> Vec<Chec
         Err(e) => return vec![backends_check(&Err(e))],
     };
     let mut checks = vec![backends_check(&Ok(backends.clone()))];
+    checks.extend(harness_checks(&backends));
     let list: Vec<&Backend> = backends.iter().collect();
     let claude_path = cfg.claude_path.as_deref();
     checks.extend(parallel_map(&list, 8, |b| {
@@ -247,6 +248,66 @@ fn check_backends(cfg_valid: bool, cfg: &Config, claude_found: bool) -> Vec<Chec
         backend_check(b, claude_found, &credential, &reach, dir_exists)
     }));
     checks
+}
+
+/// One check per harness executable the configured backends use, beyond claude (checked
+/// above) and the generic command harness (each backend's program is checked with the
+/// backend): installed (path) and its `--version`.
+fn harness_checks(backends: &Backends) -> Vec<Check> {
+    let mut seen: Vec<(
+        crate::harness::HarnessKind,
+        Result<std::path::PathBuf, String>,
+    )> = Vec::new();
+    let mut users: Vec<Vec<String>> = Vec::new();
+    for b in backends.iter() {
+        let kind = b.harness_kind();
+        if !matches!(kind, crate::harness::HarnessKind::OpenCode) {
+            continue;
+        }
+        let located = backends::resolve_program(b, None);
+        match seen.iter().position(|(k, l)| *k == kind && *l == located) {
+            Some(i) => users[i].push(b.name.clone()),
+            None => {
+                seen.push((kind, located));
+                users.push(vec![b.name.clone()]);
+            }
+        }
+    }
+    seen.into_iter()
+        .zip(users)
+        .map(|((kind, located), users)| {
+            harness_check(kind, &located, &users, |p| kind.adapter().version(p))
+        })
+        .collect()
+}
+
+/// The check of one harness executable used by `users` (`version`: its `--version`).
+fn harness_check(
+    kind: crate::harness::HarnessKind,
+    located: &Result<std::path::PathBuf, String>,
+    users: &[String],
+    version: impl Fn(&Path) -> Result<String, String>,
+) -> Check {
+    let name = format!("harness `{kind}`");
+    let used_by = format!("used by {}", users.join(", "));
+    match located {
+        Err(e) => Check::fail(
+            name,
+            format!("not installed ({used_by}): {e}"),
+            format!("`{APP_NAME} harness install {kind}` shows the official install command"),
+        ),
+        Ok(path) => match version(path) {
+            Ok(v) => Check::ok(name, format!("{}, version {v} ({used_by})", path.display())),
+            Err(e) => Check::warn(
+                name,
+                format!(
+                    "{} found but `--version` failed: {e} ({used_by})",
+                    path.display()
+                ),
+                "check that this installation works in a terminal",
+            ),
+        },
+    }
 }
 
 /// Summary of the backend configuration (or the validation error).
@@ -320,11 +381,45 @@ fn backend_check(
         }
         return Check::ok(name, detail);
     }
-    let claude_based = !matches!(b.kind, BackendKind::Command { .. });
+    let claude_based = matches!(
+        b.kind,
+        BackendKind::ClaudeOauth { .. } | BackendKind::ClaudeEndpoint { .. }
+    );
     if claude_based && !claude_found {
         return severe(detail, "fix the claude executable check first".to_owned());
     }
     match &b.kind {
+        BackendKind::OpenCode { api_key_env, .. } => {
+            if reach.detail.starts_with("opencode not installed") {
+                severe(
+                    detail,
+                    format!(
+                        "install OpenCode (`{APP_NAME} harness install opencode` shows the \
+                         official commands) or set `harness_path` in [backends.{}]",
+                        b.name
+                    ),
+                )
+            } else if credential.is_err() {
+                match api_key_env {
+                    Some(var) => severe(
+                        detail,
+                        format!(
+                            "set {var} in the MCP server's environment and in this terminal, \
+                             or remove api_key_env and {setup}"
+                        ),
+                    ),
+                    None => severe(detail, setup),
+                }
+            } else if reach.detail.contains("rejected the key") {
+                severe(detail, format!("{setup} to store the correct key"))
+            } else {
+                Check::warn(
+                    name,
+                    detail,
+                    "check `base_url` and the network/proxy; the provider did not answer",
+                )
+            }
+        }
         BackendKind::ClaudeOauth { .. } => severe(detail, setup),
         BackendKind::ClaudeEndpoint {
             api_key_env,
@@ -534,9 +629,107 @@ fn probe_writable(dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::backends::tests::{command, command_with_secret, endpoint, oauth, sample};
+    use super::super::backends::tests::{
+        command, command_with_secret, endpoint, oauth, opencode, sample,
+    };
     use super::*;
+    use crate::backends::OpencodeProvider;
     use claude_cli::McpEntry;
+
+    #[test]
+    fn opencode_backend_status() {
+        let ok = Ok("OS keyring".to_owned());
+        let missing = Err("No provider key stored".to_owned());
+        let b = opencode("kic", OpencodeProvider::OpenaiCompatible, None, true);
+        // claude being absent does not matter for opencode.
+        let c = backend_check(&b, false, &ok, &reach(true, "opencode x; HTTP 200"), None);
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.detail.starts_with("opencode, default: "), "{}", c.detail);
+
+        let c = backend_check(
+            &b,
+            true,
+            &ok,
+            &reach(false, "opencode not installed: opencode not found"),
+            None,
+        );
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.next_step.unwrap().contains("harness install opencode"));
+
+        let c = backend_check(
+            &b,
+            true,
+            &missing,
+            &reach(false, "no provider key stored"),
+            None,
+        );
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.next_step.unwrap().contains("setup --backend kic"));
+
+        let c = backend_check(
+            &b,
+            true,
+            &ok,
+            &reach(false, "opencode x; the provider rejected the key: HTTP 401"),
+            None,
+        );
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.next_step.unwrap().contains("correct key"));
+
+        let other = opencode("or", OpencodeProvider::Openrouter, Some("OR_KEY"), false);
+        let c = backend_check(
+            &other,
+            true,
+            &missing,
+            &reach(false, "env var OR_KEY"),
+            None,
+        );
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.next_step.unwrap().contains("set OR_KEY"));
+        let c = backend_check(
+            &other,
+            true,
+            &ok,
+            &reach(false, "opencode x; unreachable: timed out"),
+            None,
+        );
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.next_step.unwrap().contains("base_url"));
+    }
+
+    #[test]
+    fn harness_check_variants() {
+        use crate::harness::HarnessKind;
+        let users = vec!["kic".to_owned(), "or".to_owned()];
+        let c = harness_check(
+            HarnessKind::OpenCode,
+            &Ok(std::path::PathBuf::from("/x/opencode")),
+            &users,
+            |_| Ok("1.19.3".into()),
+        );
+        assert_eq!(c.status, Status::Ok);
+        assert_eq!(c.name, "harness `opencode`");
+        assert!(
+            c.detail.contains("version 1.19.3 (used by kic, or)"),
+            "{}",
+            c.detail
+        );
+        let c = harness_check(
+            HarnessKind::OpenCode,
+            &Err("opencode not found".into()),
+            &users,
+            |_| unreachable!(),
+        );
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.next_step.unwrap().contains("harness install opencode"));
+        let c = harness_check(
+            HarnessKind::OpenCode,
+            &Ok(std::path::PathBuf::from("/x/opencode")),
+            &users,
+            |_| Err("timed out".into()),
+        );
+        assert_eq!(c.status, Status::Warn);
+    }
 
     fn reach(reachable: bool, detail: &str) -> Reachability {
         Reachability {

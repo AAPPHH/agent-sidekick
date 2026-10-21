@@ -7,11 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-21
+
 ### Added
 
+- Harness adapters (step 1): `src/harness/` with a common `Harness` trait (locate, `--version`, credential, launch building, output normalization, reachability check, install hint) and the adapters `claude` and `command`. The launch, credential and reachability logic of `claude-oauth`, `claude-endpoint` and `command` backends moved behind them unchanged (same argv, environment, session isolation, secrets, fallback, results and logs).
+- `harness = "claude" | "command"` per backend. `claude` without `base_url` is the claude-oauth mode, with `base_url` the claude-endpoint mode. The legacy `type` keeps working; `type` and `harness` together must agree.
+- `agent-sidekick harness list` (installed, path, version, backends using it) and `agent-sidekick harness install <name>` (prints the official install command, never runs it).
+- OpenCode harness (step 2): `harness = "opencode"` with `provider = "openai-compatible" | "ollama" | "openrouter"`, `base_url`, `models`/`model` (required), optional `api_key_env`, `harness_path` and `read_only`. Runs `opencode run --format json --model <provider>/<model> --title agent-sidekick` with the prompt on stdin, in a per-backend isolated directory `<config-dir>/opencode/<name>/` (own home, XDG dirs, temp, npm cache), with a generated `opencode.json` that references the key only as `{env:AGENT_SIDEKICK_PROVIDER_KEY}`, a permission set without any "ask" (also passed as `OPENCODE_PERMISSION`), `max_turns` as the build agent's (soft) step limit and the `OPENCODE_DISABLE_*` flags. Inherited `OPENCODE_*`, `ANTHROPIC_*`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `PWD`/`OLDPWD` and the Claude OAuth token never reach it.
+- The opencode JSON event stream is translated into the result: final answer, `[error]` lines, `stopped: permission auto-rejected`, and a usage line (steps, tokens in/out, cost). A run that exits 0 without an answer counts as failed (`failed: no answer: ...`) and allows a fallback.
+- Provider key per opencode backend: `agent-sidekick setup --backend <name>` (OS keyring user `backend-<name>`, file fallback `backend-<name>.key`; nothing for ollama); `uninstall` removes it; `sidekick_status` shows its source.
+- Reachability of opencode backends (`sidekick_backends`, `backends list --check`/`test`, `doctor`, and right before each run): OpenCode installed, key available, and the provider's model list answers (`GET {base_url}/models` with the key as bearer token; ollama `GET /api/tags`; OpenRouter's public list). 401/403 means the key was rejected.
+- `doctor` checks the harness executables used by the configured backends (opencode: path and version); `harness list`/`install` know `opencode` (`opencode --version` runs in a temporary isolated home).
+- A warning in the run log and the server log when the run's project contains OpenCode plugins (`.opencode/plugin(s)` with `.js`/`.ts` files, or a `plugin`/`plugins` entry in `opencode.json(c)` or `.opencode/opencode.json(c)` up to the repository root), which OpenCode executes regardless of its flags, with the provider key in their environment.
+- Codex harness stub (step 3): `harness list` locates the OpenAI Codex CLI (the npm package's native `codex.exe` on Windows, never the `.cmd` shim; `codex` in `PATH` elsewhere) and shows its version (`codex --version` with a temporary `CODEX_HOME` that is removed afterwards); `harness install codex` prints `npm install -g @openai/codex`. A backend with `harness = "codex"` is a config error ("codex harness is not enabled yet (stub)"); there is no `type = "codex"`.
 - `agent-sidekick update`: checks the latest GitHub release and prints the platform's install one-liner (no download, no self-install). `AGENT_SIDEKICK_UPDATE_URL` overrides the API base.
 - `doctor` shows an update hint at most once a day (checked and shown once, result kept in `<config-dir>/update-check.json`); `doctor --offline` skips it.
 - Cargo.toml `repository` (https://github.com/AAPPHH/agent-sidekick).
+
+### Changed
+
+- The `secret_env` of a command backend is now removed from every backend's inherited environment, like an `api_key_env` (the command backend itself still gets its stored value).
+- `sidekick_run` treats a harness-reported failure (exit 0 without an answer) as an error and as a fallback trigger; such results contain a `failed: ...` line after `exit_code`.
 
 ## [0.3.0] - 2026-10-21
 

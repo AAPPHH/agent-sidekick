@@ -5,6 +5,7 @@ pub mod backends;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod harness;
 pub mod locate;
 pub mod logging;
 pub mod paths;

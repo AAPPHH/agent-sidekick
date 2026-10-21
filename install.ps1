@@ -9,7 +9,7 @@
 # Needs only Windows PowerShell 5.1 (preinstalled). No Rust, Git or Node.
 #
 # Environment:
-#   VERSION                          release tag to install, e.g. v0.3.0 (default: latest)
+#   VERSION                          release tag to install, e.g. v0.4.0 (default: latest)
 #   AGENT_SIDEKICK_INSTALL_DIR       target directory (default: %LOCALAPPDATA%\Programs\agent-sidekick)
 #   AGENT_SIDEKICK_INSTALL_BASE_URL  download from this URL or local directory instead of the
 #                                    GitHub release (it must contain the archive and SHA256SUMS)

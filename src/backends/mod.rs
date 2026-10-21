@@ -1,11 +1,17 @@
 //! Configurable backends: where a `sidekick_run` is executed.
 //!
+//! Each backend runs one harness (agent CLI, see [`crate::harness`]), configured with
+//! `harness = "claude" | "command"` or the legacy `type`. Internally a backend keeps its
+//! [`BackendType`] (shown in results and logs as before):
+//!
 //! - `claude-oauth`: the official `claude` CLI with a Claude account's OAuth token
 //!   (the v0.1 behaviour; implicit backend `sidekick` when config.toml has no `[backends]`).
 //! - `claude-endpoint`: the `claude` CLI against an Anthropic-compatible endpoint
 //!   (`ANTHROPIC_BASE_URL`, e.g. Ollama or LM Studio) with an API key.
 //! - `command`: any other agent CLI, configured as an argument array with placeholders;
 //!   optionally with a stored secret handed over in the variable `secret_env`.
+//! - `opencode`: the OpenCode CLI (`harness = "opencode"`, no legacy `type`) against an
+//!   OpenAI-compatible endpoint, Ollama or OpenRouter, in a per-backend isolated directory.
 //!
 //! Submodules: [`resolve`] (config validation), [`launch`] (environment, credentials,
 //! [`crate::runner::Launch`] building), [`reach`] (reachability checks).
@@ -33,6 +39,10 @@ pub enum BackendType {
     ClaudeOauth,
     ClaudeEndpoint,
     Command,
+    /// Only reachable through `harness = "opencode"`; `type = "opencode"` is rejected by
+    /// [`resolve`] (the legacy `type` stays limited to the v0.3 values).
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 impl BackendType {
@@ -41,7 +51,44 @@ impl BackendType {
             BackendType::ClaudeOauth => "claude-oauth",
             BackendType::ClaudeEndpoint => "claude-endpoint",
             BackendType::Command => "command",
+            BackendType::OpenCode => "opencode",
         }
+    }
+}
+
+/// The model provider of an opencode backend (`provider = "..."`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpencodeProvider {
+    /// Any OpenAI-compatible chat completions endpoint (`base_url` ends before
+    /// `/chat/completions`, e.g. `https://chat.kiconnect.nrw/api/v1`); needs a key.
+    OpenaiCompatible,
+    /// A local or remote Ollama server (`base_url` like `http://localhost:11434`, `/v1` is
+    /// appended); no key.
+    Ollama,
+    /// OpenRouter (OpenCode's built-in provider); needs a key, no `base_url`.
+    Openrouter,
+}
+
+impl OpencodeProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpencodeProvider::OpenaiCompatible => "openai-compatible",
+            OpencodeProvider::Ollama => "ollama",
+            OpencodeProvider::Openrouter => "openrouter",
+        }
+    }
+
+    /// Whether the provider needs an API key (stored with `setup --backend` or from
+    /// `api_key_env`).
+    pub fn needs_key(self) -> bool {
+        !matches!(self, OpencodeProvider::Ollama)
+    }
+}
+
+impl fmt::Display for OpencodeProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -96,10 +143,15 @@ impl EndpointAuth {
 }
 
 /// One `[backends.<name>]` table exactly as written in config.toml. Every field is optional
-/// here; [`resolve`] checks which ones are required/allowed for the `type`.
+/// here; [`resolve`] checks which ones are required/allowed for the harness/type.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawBackend {
+    /// The agent CLI that runs the backend (`claude`, `opencode` or `command`). `claude`
+    /// without `base_url` is the claude-oauth mode, with `base_url` the claude-endpoint mode.
+    pub harness: Option<crate::harness::HarnessKind>,
+    /// Legacy (v0.2/v0.3) form of `harness`: `claude-oauth`, `claude-endpoint` or `command`.
+    /// Still accepted; together with `harness` both must agree.
     #[serde(rename = "type")]
     pub kind: Option<BackendType>,
     pub description: Option<String>,
@@ -119,9 +171,11 @@ pub struct RawBackend {
     pub pass_env: Option<Vec<String>>,
     /// claude-*: `CLAUDE_CONFIG_DIR` for the agent (`~` is expanded).
     pub config_dir: Option<PathBuf>,
-    /// claude-endpoint: e.g. `http://localhost:11434`.
+    /// claude-endpoint: e.g. `http://localhost:11434`; opencode: the provider's base URL
+    /// (openai-compatible, ollama).
     pub base_url: Option<String>,
-    /// claude-endpoint: name of an environment variable holding the key.
+    /// claude-endpoint, opencode: name of an environment variable holding the key (instead
+    /// of the stored one).
     pub api_key_env: Option<String>,
     /// claude-endpoint: how the key is sent.
     pub auth: Option<EndpointAuth>,
@@ -133,6 +187,12 @@ pub struct RawBackend {
     /// command: name of the environment variable that receives the backend's stored secret
     /// (keyring user `cmd-<name>`, stored with `setup --backend <name>`).
     pub secret_env: Option<String>,
+    /// opencode: `openai-compatible`, `ollama` or `openrouter`.
+    pub provider: Option<OpencodeProvider>,
+    /// opencode: explicit path of the opencode executable (`~` is expanded).
+    pub harness_path: Option<PathBuf>,
+    /// opencode: deny the edit, bash and webfetch tools (default false).
+    pub read_only: Option<bool>,
 }
 
 /// A validated backend.
@@ -155,11 +215,12 @@ pub struct Backend {
     /// True for the implicit `sidekick` backend created when `[backends]` is absent.
     pub implicit: bool,
     pub kind: BackendKind,
-    /// Names of every configured `api_key_env` (of all backends, this one included).
-    /// Removed from this backend's inherited child environment; `pass_env` cannot re-allow
-    /// them. Filled by [`Backends::new`]; the endpoint that owns a key gets it through
-    /// `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, a command backend whose `secret_env` or
-    /// `env` table names the same variable still gets that explicit value.
+    /// Names of every configured `api_key_env` and `secret_env` (of all backends, this one
+    /// included). Removed from this backend's inherited child environment; `pass_env` cannot
+    /// re-allow them. Filled by [`Backends::new`]; the endpoint that owns a key gets it through
+    /// `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` (opencode: `AGENT_SIDEKICK_PROVIDER_KEY`), a
+    /// command backend whose `secret_env` or `env` table names the same variable still gets
+    /// that explicit value.
     pub foreign_secret_env: Vec<String>,
 }
 
@@ -180,6 +241,19 @@ pub enum BackendKind {
         /// Variable that receives the stored secret ([`crate::token::SecretId::Command`]).
         secret_env: Option<String>,
     },
+    OpenCode {
+        provider: OpencodeProvider,
+        /// Normalized `base_url` (no trailing `/`); `None` for openrouter.
+        base_url: Option<String>,
+        /// Key from this environment variable instead of the stored secret.
+        api_key_env: Option<String>,
+        /// Configured opencode executable (`None`: looked up, see
+        /// [`crate::harness::opencode`]).
+        harness_path: Option<PathBuf>,
+        read_only: bool,
+        /// Per-backend isolation directory `<config-dir>/opencode/<name>`.
+        base_dir: PathBuf,
+    },
 }
 
 impl Backend {
@@ -188,11 +262,13 @@ impl Backend {
             BackendKind::ClaudeOauth { .. } => BackendType::ClaudeOauth,
             BackendKind::ClaudeEndpoint { .. } => BackendType::ClaudeEndpoint,
             BackendKind::Command { .. } => BackendType::Command,
+            BackendKind::OpenCode { .. } => BackendType::OpenCode,
         }
     }
 
     /// Whether a run on this backend uses a model: claude-* always (`--model` or the
-    /// account's/endpoint's default), a command backend only with `{model}` in its command.
+    /// account's/endpoint's default), opencode always (it always has a default model), a
+    /// command backend only with `{model}` in its command.
     pub fn takes_model(&self) -> bool {
         match &self.kind {
             BackendKind::Command { command, .. } => command_uses_model(command),
@@ -226,8 +302,9 @@ impl Backend {
     }
 
     /// The secret this backend reads from the keyring/file store, if any.
-    /// claude-endpoint with `api_key_env` reads the environment instead (`None`); a command
-    /// backend has one only with `secret_env`.
+    /// claude-endpoint/opencode with `api_key_env` read the environment instead (`None`); a
+    /// command backend has one only with `secret_env`; an opencode backend with provider
+    /// `ollama` needs none.
     pub fn secret_id(&self) -> Option<crate::token::SecretId> {
         use crate::token::SecretId;
         match &self.kind {
@@ -239,6 +316,11 @@ impl Backend {
                 secret_env: Some(_),
                 ..
             } => Some(SecretId::Command(self.name.clone())),
+            BackendKind::OpenCode {
+                provider,
+                api_key_env: None,
+                ..
+            } if provider.needs_key() => Some(SecretId::Backend(self.name.clone())),
             _ => None,
         }
     }
@@ -259,19 +341,28 @@ pub struct Backends {
 impl Backends {
     /// `list` must be non-empty and contain exactly one default (checked by [`resolve`]).
     /// Sets every backend's [`Backend::foreign_secret_env`] to all configured `api_key_env`
-    /// names.
+    /// and `secret_env` names.
     pub fn new(mut list: Vec<Backend>) -> Self {
         list.sort_by(|a, b| a.name.cmp(&b.name));
         let mut key_vars: Vec<String> = Vec::new();
         for b in &list {
-            if let BackendKind::ClaudeEndpoint {
-                api_key_env: Some(var),
-                ..
-            } = &b.kind
-            {
-                if !key_vars.contains(var) {
-                    key_vars.push(var.clone());
+            let var = match &b.kind {
+                BackendKind::ClaudeEndpoint {
+                    api_key_env: Some(var),
+                    ..
                 }
+                | BackendKind::OpenCode {
+                    api_key_env: Some(var),
+                    ..
+                }
+                | BackendKind::Command {
+                    secret_env: Some(var),
+                    ..
+                } => var,
+                _ => continue,
+            };
+            if !key_vars.contains(var) {
+                key_vars.push(var.clone());
             }
         }
         for b in &mut list {

@@ -85,7 +85,8 @@ pub struct RunParams {
     /// ignores the model if it is a command backend.
     pub model: Option<String>,
     /// Tools the agent may use without asking, e.g. ["Read", "Edit", "Bash(git:*)"].
-    /// Default: Claude Code's defaults for headless mode. Ignored by command backends.
+    /// Default: Claude Code's defaults for headless mode. Ignored by command and opencode
+    /// backends (opencode: use the backend's read_only setting).
     pub allowed_tools: Option<Vec<String>>,
     /// Timeout in seconds (1-7200) for each attempt; the whole process tree is killed when it
     /// expires. With a fallback the request can take up to about twice this.
@@ -229,6 +230,9 @@ pub fn format_outcome(outcome: &RunOutcome, timeout: Duration) -> String {
         }
         None => s.push_str("exit_code: none (process was killed)\n"),
     }
+    if let Some(f) = &outcome.failure {
+        let _ = writeln!(s, "failed: {f}");
+    }
     let _ = writeln!(s, "log: {}", outcome.log_path.display());
     let _ = writeln!(s, "duration_s: {:.1}", outcome.duration.as_secs_f64());
     let _ = writeln!(s, "--- output (last {TAIL_CHARS} chars) ---");
@@ -236,10 +240,13 @@ pub fn format_outcome(outcome: &RunOutcome, timeout: Duration) -> String {
     s
 }
 
-/// A run counts as failed (tool error) on cancellation, timeout or any non-zero / missing
-/// exit code.
+/// A run counts as failed (tool error) on cancellation, timeout, any non-zero / missing
+/// exit code, or a harness-reported failure (e.g. opencode exited 0 without an answer).
 fn outcome_is_error(outcome: &RunOutcome) -> bool {
-    outcome.cancelled || outcome.timed_out || outcome.exit_code != Some(0)
+    outcome.cancelled
+        || outcome.timed_out
+        || outcome.exit_code != Some(0)
+        || outcome.failure.is_some()
 }
 
 fn run_error_message(err: &RunError, ty: BackendType) -> String {
@@ -251,6 +258,10 @@ fn run_error_message(err: &RunError, ty: BackendType) -> String {
         RunError::Spawn { .. } if ty == BackendType::Command => format!(
             "{err}. Check the backend's `command` in config.toml \
              ('agent-sidekick backends test <name>')."
+        ),
+        RunError::Spawn { .. } if ty == BackendType::OpenCode => format!(
+            "{err}. Check the OpenCode installation with 'agent-sidekick harness list', or set \
+             `harness_path` of the backend ('agent-sidekick backends test <name>')."
         ),
         RunError::Spawn { .. } => format!(
             "{err}. Check the claude installation with 'agent-sidekick doctor', or set \
@@ -316,7 +327,7 @@ pub fn select_backends<'a>(
                     "Invalid parameter 'fallback': '{}' and '{}' are both claude-oauth backends \
                      (Claude accounts). Falling back from one Claude account to another is not \
                      supported: agent-sidekick does not switch accounts or work around rate \
-                     limits. Use a claude-endpoint or command backend as fallback, or omit it.",
+                     limits. Use a claude-endpoint, opencode or command backend as fallback, or omit it.",
                     primary.name, fb.name
                 ));
             }
@@ -342,7 +353,9 @@ enum Attempt {
 /// ran and exited unsuccessfully; never after a timeout or cancellation.
 fn fallback_eligible(attempt: &Attempt) -> bool {
     match attempt {
-        Attempt::Ran(o) => !o.timed_out && !o.cancelled && o.exit_code != Some(0),
+        Attempt::Ran(o) => {
+            !o.timed_out && !o.cancelled && (o.exit_code != Some(0) || o.failure.is_some())
+        }
         Attempt::NotStarted(_) => true,
         Attempt::Stopped(_) => false,
     }
@@ -360,6 +373,13 @@ fn short_reason(reason: &str) -> String {
 
 /// Why a run that exited counts as failed, e.g. `exit_code 3`.
 fn exit_reason(o: &RunOutcome) -> String {
+    match (o.exit_code, &o.failure) {
+        (Some(0), Some(f)) => format!("{f} (exit_code 0)"),
+        (_, _) => exit_code_reason(o),
+    }
+}
+
+fn exit_code_reason(o: &RunOutcome) -> String {
     match o.exit_code {
         Some(c) => format!("exit_code {c}"),
         None => "exit_code none (process was killed or ended by a signal)".to_owned(),
@@ -977,6 +997,7 @@ impl SidekickServer {
                                 secret_env: Some(_),
                                 ..
                             }
+                            | backends::BackendKind::OpenCode { .. }
                     )
                 })
                 .filter_map(Backend::secret_id)
@@ -1023,6 +1044,7 @@ impl SidekickServer {
                 backends::resolve_program(&b, claude_path.as_deref()).map_err(|e| {
                     match b.backend_type() {
                         BackendType::Command => e,
+                        BackendType::OpenCode => format!("OpenCode executable not found: {e}"),
                         _ => format!("Claude Code executable not found: {e}"),
                     }
                 })?;
@@ -1033,6 +1055,7 @@ impl SidekickServer {
                     return Err(format!("endpoint unreachable: {detail}"));
                 }
             }
+            b.harness().pre_run_check(&b, &cred)?;
             Ok((cred, program))
         })
         .await;
@@ -1122,7 +1145,18 @@ impl SidekickServer {
         drop(backend_permit);
 
         match result {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                // Harnesses with structured output (opencode JSON lines) translate the runner's
+                // output buffer into the result text; claude and command keep the tail as is.
+                if let Some(n) = backend.harness().normalize_output(&outcome.output) {
+                    // Redacted again: decoding JSON escapes could have revealed a secret.
+                    outcome.tail =
+                        redact_with(secrets, &runner::truncate_tail(&n.text, runner::TAIL_CHARS));
+                    if outcome.exit_code == Some(0) && !outcome.timed_out && !outcome.cancelled {
+                        outcome.failure = n.failure;
+                    }
+                }
+                outcome.output.clear();
                 tracing::info!(
                     backend = %backend.name,
                     exit_code = ?outcome.exit_code,
@@ -1293,7 +1327,8 @@ impl SidekickServer {
                         backends::BackendKind::ClaudeEndpoint { config_dir, .. } => {
                             Some(("(endpoint default)", config_dir))
                         }
-                        backends::BackendKind::Command { .. } => None,
+                        backends::BackendKind::Command { .. }
+                        | backends::BackendKind::OpenCode { .. } => None,
                     };
                     let allowlist = b
                         .models
@@ -1323,6 +1358,7 @@ impl SidekickServer {
                     let (what, name) = match &id {
                         SecretId::Oauth(n) | SecretId::Endpoint(n) => ("token", n),
                         SecretId::Command(n) => ("secret", n),
+                        SecretId::Backend(n) => ("provider key", n),
                     };
                     match r {
                         Ok((_, source)) => {
@@ -1644,6 +1680,8 @@ mod tests {
             cancelled: false,
             log_path: PathBuf::from("run.log"),
             tail: "done".into(),
+            output: "done".into(),
+            failure: None,
             duration: Duration::from_millis(12_340),
         }
     }

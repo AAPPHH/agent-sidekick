@@ -10,7 +10,7 @@
 # Needs only a POSIX shell, curl or wget, tar, gzip and sha256sum (or shasum). No Rust, Git or Node.
 #
 # Environment:
-#   VERSION                          release tag to install, e.g. v0.3.0 (default: latest)
+#   VERSION                          release tag to install, e.g. v0.4.0 (default: latest)
 #   AGENT_SIDEKICK_INSTALL_DIR       target directory (default: $HOME/.local/bin)
 #   AGENT_SIDEKICK_INSTALL_BASE_URL  download from this URL or local directory instead of the
 #                                    GitHub release (it must contain the archive and SHA256SUMS)

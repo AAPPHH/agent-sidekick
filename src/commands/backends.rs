@@ -240,6 +240,21 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
                 }
             });
         }
+        BackendKind::OpenCode { provider, .. } => {
+            lines.push(match backends::resolve_program(backend, None) {
+                Ok(p) => match backend.harness().version(&p) {
+                    Ok(v) => format!("opencode:    {} (version {v})", p.display()),
+                    Err(e) => format!("opencode:    {} (`--version` failed: {e})", p.display()),
+                },
+                Err(e) => format!("opencode:    not found: {e}"),
+            });
+            if provider.needs_key() {
+                lines.push(match key_source(backend) {
+                    Ok(source) => format!("key source:  {source}"),
+                    Err(e) => format!("key source:  missing: {e}"),
+                });
+            }
+        }
         BackendKind::Command { secret_env, .. } => {
             lines.push(match backends::resolve_program(backend, None) {
                 Ok(p) => format!("program:     {}", p.display()),
@@ -284,6 +299,10 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
 /// Where the backend's credential comes from (never the value).
 fn key_source(backend: &Backend) -> std::result::Result<String, String> {
     if let BackendKind::ClaudeEndpoint {
+        api_key_env: Some(var),
+        ..
+    }
+    | BackendKind::OpenCode {
         api_key_env: Some(var),
         ..
     } = &backend.kind
@@ -360,6 +379,33 @@ pub fn describe(backend: &Backend) -> Vec<String> {
                 ),
             });
         }
+        BackendKind::OpenCode {
+            provider,
+            base_url,
+            api_key_env,
+            harness_path,
+            read_only,
+            base_dir,
+        } => {
+            lines.push(format!("provider:    {provider}"));
+            if let Some(u) = base_url {
+                lines.push(format!("base_url:    {u}"));
+            }
+            lines.push(match harness_path {
+                Some(p) => format!("harness_path: {}", p.display()),
+                None => "harness_path: (looked up: npm global package, PATH)".to_owned(),
+            });
+            lines.push(format!("read_only:   {read_only}"));
+            lines.push(match (provider.needs_key(), api_key_env) {
+                (false, _) => "api key:     none needed".to_owned(),
+                (true, Some(var)) => format!("api key:     from environment variable {var}"),
+                (true, None) => format!(
+                    "api key:     OS keyring entry backend-{} (or its key file in the config directory)",
+                    backend.name
+                ),
+            });
+            lines.push(format!("state dir:   {}", base_dir.display()));
+        }
         BackendKind::Command {
             command,
             prompt_via_stdin,
@@ -412,7 +458,7 @@ pub(crate) fn claude_config_dir(backend: &Backend) -> Option<&PathBuf> {
     match &backend.kind {
         BackendKind::ClaudeOauth { config_dir }
         | BackendKind::ClaudeEndpoint { config_dir, .. } => Some(config_dir),
-        BackendKind::Command { .. } => None,
+        BackendKind::Command { .. } | BackendKind::OpenCode { .. } => None,
     }
 }
 
@@ -492,6 +538,58 @@ pub(crate) mod tests {
             },
             is_default,
         )
+    }
+
+    /// An opencode backend (`provider`, optional `api_key_env`), models `m1`, `m2`.
+    pub(crate) fn opencode(
+        name: &str,
+        provider: crate::backends::OpencodeProvider,
+        api_key_env: Option<&str>,
+        is_default: bool,
+    ) -> Backend {
+        let mut b = backend(
+            name,
+            BackendKind::OpenCode {
+                provider,
+                base_url: match provider {
+                    crate::backends::OpencodeProvider::Openrouter => None,
+                    _ => Some("https://llm.example/v1".into()),
+                },
+                api_key_env: api_key_env.map(Into::into),
+                harness_path: None,
+                read_only: false,
+                base_dir: abs("cfg").join("opencode").join(name),
+            },
+            is_default,
+        );
+        b.model = Some("m1".into());
+        b.models = Some(vec!["m1".into(), "m2".into()]);
+        b
+    }
+
+    #[test]
+    fn describe_opencode_backend() {
+        let b = opencode(
+            "kic",
+            crate::backends::OpencodeProvider::OpenaiCompatible,
+            None,
+            true,
+        );
+        let text = describe(&b).join("\n");
+        assert!(
+            text.contains("backend:     kic (opencode), default"),
+            "{text}"
+        );
+        assert!(text.contains("model:       m1 (default)"), "{text}");
+        assert!(text.contains("models:      m1, m2 (allowlist)"), "{text}");
+        assert!(text.contains("provider:    openai-compatible"), "{text}");
+        assert!(
+            text.contains("base_url:    https://llm.example/v1"),
+            "{text}"
+        );
+        assert!(text.contains("OS keyring entry backend-kic"), "{text}");
+        assert!(text.contains("state dir:   "), "{text}");
+        assert_eq!(claude_config_dir(&b), None);
     }
 
     /// sidekick (oauth, default), work (oauth), local (endpoint, keyring), envkey (endpoint,

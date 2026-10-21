@@ -16,10 +16,11 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    command_uses_model, Backend, BackendKind, BackendType, Backends, Cost, RawBackend,
-    IMPLICIT_BACKEND,
+    command_uses_model, Backend, BackendKind, BackendType, Backends, Cost, OpencodeProvider,
+    RawBackend, IMPLICIT_BACKEND,
 };
 use crate::config::Config;
+use crate::harness::HarnessKind;
 
 /// Inputs that come from the environment, injected for testability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,14 +30,19 @@ pub struct ResolveDefaults {
     /// Config dir of the implicit/`sidekick` claude-oauth backend when none is configured
     /// (`AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` or `~/.claude-sidekick`).
     pub legacy_agent_config_dir: Option<PathBuf>,
+    /// agent-sidekick's own config dir (`paths::config_dir`); opencode backends keep their
+    /// isolated state in `<config_dir>/opencode/<name>`.
+    pub config_dir: Option<PathBuf>,
 }
 
 impl ResolveDefaults {
-    /// From the real environment (`paths::home_dir`, `paths::agent_claude_config_dir`).
+    /// From the real environment (`paths::home_dir`, `paths::agent_claude_config_dir`,
+    /// `paths::config_dir`).
     pub fn from_env() -> Self {
         Self {
             home: crate::paths::home_dir().ok(),
             legacy_agent_config_dir: crate::paths::agent_claude_config_dir().ok(),
+            config_dir: crate::paths::config_dir().ok(),
         }
     }
 }
@@ -64,6 +70,15 @@ const SECRET_PASS_ENV_CLAUDE: &[&str] = &[
 ];
 /// Credentials that must never be passed through to a command backend.
 const SECRET_PASS_ENV_COMMAND: &[&str] = &["CLAUDE_CODE_OAUTH_TOKEN", "AGENT_SIDEKICK_TOKEN"];
+/// Credentials that must never be passed through to an opencode backend (it gets its own
+/// key in `AGENT_SIDEKICK_PROVIDER_KEY`).
+const SECRET_PASS_ENV_OPENCODE: &[&str] = &[
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "AGENT_SIDEKICK_TOKEN",
+    "AGENT_SIDEKICK_PROVIDER_KEY",
+];
 /// Variables `api_key_env` may not name: the OAuth token must never go to an endpoint.
 const FORBIDDEN_API_KEY_ENV: &[&str] = &["CLAUDE_CODE_OAUTH_TOKEN", "AGENT_SIDEKICK_TOKEN"];
 
@@ -256,22 +271,36 @@ fn resolve_one(
         }
     }
 
-    let Some(kind) = raw.kind else {
-        errs.push("`type` is required (one of: claude-oauth, claude-endpoint, command)".to_owned());
-        return Err(errs);
+    let kind = match backend_type_of(raw) {
+        Ok(k) => k,
+        Err(e) => {
+            errs.push(e);
+            return Err(errs);
+        }
+    };
+    // How the backend's kind was written, for error messages.
+    let written_as = match raw.kind {
+        Some(t) => format!("type `{t}`"),
+        None => harness_mode_label(kind).to_owned(),
     };
 
     let pass_env = raw.pass_env.clone().unwrap_or_default();
     let denied = match kind {
         BackendType::Command => SECRET_PASS_ENV_COMMAND,
+        BackendType::OpenCode => SECRET_PASS_ENV_OPENCODE,
         _ => SECRET_PASS_ENV_CLAUDE,
     };
-    for e in check_pass_env(&pass_env, denied, &format!("a {kind} backend")) {
+    // Legacy `type` configs keep the v0.3 wording; `harness` configs name what was written.
+    let pass_env_scope = match raw.kind {
+        Some(_) => format!("a {kind} backend"),
+        None => format!("a backend with {written_as}"),
+    };
+    for e in check_pass_env(&pass_env, denied, &pass_env_scope) {
         errs.push(format!("pass_env: {e}"));
     }
 
     // Fields that are not allowed for this type.
-    let set_fields: [(&str, bool, &[BackendType]); 7] = [
+    let set_fields: [(&str, bool, &[BackendType]); 10] = [
         (
             "config_dir",
             raw.config_dir.is_some(),
@@ -280,12 +309,23 @@ fn resolve_one(
         (
             "base_url",
             raw.base_url.is_some(),
-            &[BackendType::ClaudeEndpoint],
+            &[BackendType::ClaudeEndpoint, BackendType::OpenCode],
         ),
         (
             "api_key_env",
             raw.api_key_env.is_some(),
-            &[BackendType::ClaudeEndpoint],
+            &[BackendType::ClaudeEndpoint, BackendType::OpenCode],
+        ),
+        ("provider", raw.provider.is_some(), &[BackendType::OpenCode]),
+        (
+            "harness_path",
+            raw.harness_path.is_some(),
+            &[BackendType::OpenCode],
+        ),
+        (
+            "read_only",
+            raw.read_only.is_some(),
+            &[BackendType::OpenCode],
         ),
         ("auth", raw.auth.is_some(), &[BackendType::ClaudeEndpoint]),
         ("command", raw.command.is_some(), &[BackendType::Command]),
@@ -302,7 +342,7 @@ fn resolve_one(
     ];
     for (field, is_set, allowed) in set_fields {
         if is_set && !allowed.contains(&kind) {
-            errs.push(format!("field `{field}` is not allowed for type `{kind}`"));
+            errs.push(format!("field `{field}` is not allowed for {written_as}"));
         }
     }
 
@@ -327,18 +367,7 @@ fn resolve_one(
                     }
                 },
             };
-            if let Some(v) = raw.api_key_env.as_deref() {
-                if !valid_env_name(v) {
-                    errs.push(format!("`api_key_env`: invalid variable name {v:?}"));
-                } else if FORBIDDEN_API_KEY_ENV
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(v))
-                {
-                    errs.push(format!(
-                        "`api_key_env` must not be `{v}` (an OAuth token must never be sent to an endpoint)"
-                    ));
-                }
-            }
+            check_api_key_env(raw, &mut errs);
             let dir = config_dir_for(name, raw, defaults, false, &mut errs);
             match (base_url, dir) {
                 (Some(base_url), Some(config_dir)) => Some(BackendKind::ClaudeEndpoint {
@@ -428,6 +457,23 @@ fn resolve_one(
                 }
             }
         }
+        BackendType::OpenCode => opencode_kind(name, raw, defaults, &mut errs),
+    };
+    // opencode always passes `--model`: it needs a default model, and `models` is the
+    // allowlist (a lone `model` is the only allowed one).
+    let models = match (kind, &model, models) {
+        (BackendType::OpenCode, None, None) => {
+            if raw.model.is_none() && raw.models.is_none() {
+                errs.push(
+                    "`models` (or `model`) is required for harness `opencode`: the model \
+                     name(s) the provider serves, e.g. models = [\"gpt-oss-120b\"]"
+                        .to_owned(),
+                );
+            }
+            None
+        }
+        (BackendType::OpenCode, Some(m), None) => Some(vec![m.clone()]),
+        (_, _, models) => models,
     };
 
     if !errs.is_empty() {
@@ -440,10 +486,18 @@ fn resolve_one(
     Ok(Backend {
         name: name.to_owned(),
         description,
-        cost: raw.cost.unwrap_or(match kind {
-            BackendType::ClaudeOauth => Cost::Quota,
-            BackendType::ClaudeEndpoint => Cost::Paid,
-            BackendType::Command => Cost::Free,
+        cost: raw.cost.unwrap_or(match (&kind_val, kind) {
+            (_, BackendType::ClaudeOauth) => Cost::Quota,
+            (_, BackendType::ClaudeEndpoint) => Cost::Paid,
+            (_, BackendType::Command) => Cost::Free,
+            (
+                BackendKind::OpenCode {
+                    provider: OpencodeProvider::Ollama,
+                    ..
+                },
+                _,
+            ) => Cost::Free,
+            (_, BackendType::OpenCode) => Cost::Paid,
         }),
         is_default: raw.default.unwrap_or(false),
         max_concurrent: raw.max_concurrent,
@@ -454,6 +508,169 @@ fn resolve_one(
         implicit: false,
         kind: kind_val,
         foreign_secret_env: Vec::new(),
+    })
+}
+
+/// The internal [`BackendType`] of a backend from `harness` and/or the legacy `type`:
+/// - only `type`: as before (`claude-oauth`, `claude-endpoint`, `command`);
+/// - only `harness`: `claude` without `base_url` is claude-oauth, with `base_url`
+///   claude-endpoint; `command` is command; `codex` is a config error (stub);
+/// - both: they must agree (`type` maps onto its harness, and for `claude` the mode implied
+///   by `base_url` is checked by the field rules of the type); otherwise a config error.
+fn backend_type_of(raw: &RawBackend) -> Result<BackendType, String> {
+    match (raw.kind, raw.harness) {
+        // The legacy `type` stays limited to the v0.3 values.
+        (Some(BackendType::OpenCode), _) => Err(
+            "`type = \"opencode\"` is not supported; write `harness = \"opencode\"` (the \
+             legacy `type` only knows claude-oauth, claude-endpoint and command)"
+                .to_owned(),
+        ),
+        // The codex harness is a stub (located and listed only): no backend can use it, with
+        // or without a `type`. Checked before the type/harness agreement.
+        (_, Some(HarnessKind::Codex)) => Err(crate::harness::codex::config_error()),
+        (None, Some(HarnessKind::OpenCode)) => Ok(BackendType::OpenCode),
+        (Some(ty), None) => Ok(ty),
+        (None, Some(HarnessKind::Claude)) => Ok(if raw.base_url.is_some() {
+            BackendType::ClaudeEndpoint
+        } else {
+            BackendType::ClaudeOauth
+        }),
+        (None, Some(HarnessKind::Command)) => Ok(BackendType::Command),
+        (Some(ty), Some(h)) if HarnessKind::of_type(ty) == h => Ok(ty),
+        (Some(ty), Some(h)) => Err(format!(
+            "`type = \"{ty}\"` and `harness = \"{h}\"` disagree (type `{ty}` means \
+             harness `{}`); set only `harness`",
+            HarnessKind::of_type(ty)
+        )),
+        // Starts with the v0.3 wording, which tests and users may rely on.
+        (None, None) => Err(
+            "`type` is required (one of: claude-oauth, claude-endpoint, \
+             command), or `harness` (one of: claude, opencode, command)"
+                .to_owned(),
+        ),
+    }
+}
+
+/// How a backend configured with `harness` (no `type`) is named in error messages.
+fn harness_mode_label(kind: BackendType) -> &'static str {
+    match kind {
+        BackendType::ClaudeOauth => "harness `claude` without `base_url` (claude-oauth mode)",
+        BackendType::ClaudeEndpoint => "harness `claude` with `base_url` (claude-endpoint mode)",
+        BackendType::Command => "harness `command`",
+        BackendType::OpenCode => "harness `opencode`",
+    }
+}
+
+/// `api_key_env` (claude-endpoint, opencode): a valid name and never one of the agent's own
+/// secrets.
+fn check_api_key_env(raw: &RawBackend, errs: &mut Vec<String>) {
+    if let Some(v) = raw.api_key_env.as_deref() {
+        if !valid_env_name(v) {
+            errs.push(format!("`api_key_env`: invalid variable name {v:?}"));
+        } else if FORBIDDEN_API_KEY_ENV
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(v))
+        {
+            errs.push(format!(
+                "`api_key_env` must not be `{v}` (an OAuth token must never be sent to an endpoint)"
+            ));
+        }
+    }
+}
+
+/// The [`BackendKind::OpenCode`] of `[backends.<name>]` with `harness = "opencode"`:
+/// `provider` required; `base_url` required for openai-compatible/ollama and not allowed for
+/// openrouter; `api_key_env` not allowed for ollama (no key); `harness_path` absolute (or
+/// `~`); the isolation dir is `<config-dir>/opencode/<name>`.
+fn opencode_kind(
+    name: &str,
+    raw: &RawBackend,
+    defaults: &ResolveDefaults,
+    errs: &mut Vec<String>,
+) -> Option<BackendKind> {
+    let before = errs.len();
+    let Some(provider) = raw.provider else {
+        errs.push(
+            "`provider` is required for harness `opencode` (one of: openai-compatible, ollama, \
+             openrouter)"
+                .to_owned(),
+        );
+        return None;
+    };
+    let base_url = match (provider, raw.base_url.as_deref()) {
+        (OpencodeProvider::Openrouter, Some(_)) => {
+            errs.push(
+                "`base_url` is not allowed for provider `openrouter` (OpenCode's built-in \
+                 OpenRouter provider is used); use provider `openai-compatible` for another URL"
+                    .to_owned(),
+            );
+            None
+        }
+        (OpencodeProvider::Openrouter, None) => None,
+        (p, None) => {
+            errs.push(format!(
+                "`base_url` is required for provider `{p}` (e.g. {})",
+                match p {
+                    OpencodeProvider::Ollama => "http://localhost:11434",
+                    _ => "https://chat.kiconnect.nrw/api/v1",
+                }
+            ));
+            None
+        }
+        (_, Some(u)) => match normalize_base_url(u) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                errs.push(e);
+                None
+            }
+        },
+    };
+    if raw.api_key_env.is_some() && !provider.needs_key() {
+        errs.push(format!(
+            "`api_key_env` is not allowed for provider `{provider}` (it needs no key)"
+        ));
+    }
+    check_api_key_env(raw, errs);
+    let harness_path = match &raw.harness_path {
+        None => None,
+        Some(p) if p.as_os_str().is_empty() => {
+            errs.push("`harness_path` must not be empty".to_owned());
+            None
+        }
+        Some(p) => {
+            let expanded = expand_tilde(p, defaults.home.as_deref());
+            if expanded.is_absolute() {
+                Some(expanded)
+            } else {
+                errs.push(format!(
+                    "`harness_path` must be an absolute path (or start with `~`), got {}",
+                    p.display()
+                ));
+                None
+            }
+        }
+    };
+    let base_dir = match &defaults.config_dir {
+        Some(dir) => dir.join("opencode").join(name),
+        None => {
+            errs.push(
+                "cannot determine agent-sidekick's config directory for the opencode state \
+                 (set AGENT_SIDEKICK_CONFIG_DIR)"
+                    .to_owned(),
+            );
+            return None;
+        }
+    };
+    if errs.len() != before {
+        return None;
+    }
+    Some(BackendKind::OpenCode {
+        provider,
+        base_url,
+        api_key_env: raw.api_key_env.clone(),
+        harness_path,
+        read_only: raw.read_only.unwrap_or(false),
+        base_dir,
     })
 }
 
@@ -772,6 +989,7 @@ mod tests {
         ResolveDefaults {
             home: Some(abs("home")),
             legacy_agent_config_dir: Some(abs("home").join(".claude-sidekick")),
+            config_dir: Some(abs("config").join("agent-sidekick")),
         }
     }
 
@@ -851,6 +1069,7 @@ pass_env = ["OPENAI_API_BASE"]
         let d = ResolveDefaults {
             home: None,
             legacy_agent_config_dir: None,
+            config_dir: None,
         };
         let e = resolve_with(&Config::default(), &d).unwrap_err();
         assert!(e.starts_with("backends.sidekick: "), "{e}");
@@ -1759,6 +1978,7 @@ prompt_via_stdin = true
         let d = ResolveDefaults {
             home: None,
             legacy_agent_config_dir: None,
+            config_dir: None,
         };
         let cfg = parse(&one(
             "type = \"claude-oauth\"\ndescription = \"d\"\nconfig_dir = \"~/x\"\n",
