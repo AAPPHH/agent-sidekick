@@ -64,6 +64,9 @@ From a Claude Code session, just ask:
 Returns the exit code, the path of the full run log and the last 4000 characters of output.
 At most 2 runs execute concurrently (configurable); further runs are queued.
 
+- **Cancellation:** cancelling the tool call in Claude Code (Esc) kills the delegated run's whole process tree; a cancelled run that is still queued never starts.
+- **Long runs:** the server sends a progress notification every 30 s while a run is active. This keeps the call alive with respect to Claude Code's MCP tool idle timeout (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, 30 minutes for stdio servers by default). If you have lowered the overall `MCP_TOOL_TIMEOUT` (default about 28 hours), keep it above `timeout_s`.
+
 ### `sidekick_status`
 
 Shows running and queued runs.
@@ -105,14 +108,20 @@ For each run the server starts the official CLI:
 <claude> -p --max-turns N [--model M] [--allowedTools T1 T2 ...] -- <prompt>
 ```
 
-The child environment has `ANTHROPIC_API_KEY` removed and `CLAUDE_CONFIG_DIR` plus `CLAUDE_CODE_OAUTH_TOKEN` set to the agent's config dir and token.
-On Windows, if `claude` is a `.cmd` shim, the prompt is passed via stdin instead of the command line (avoids `cmd.exe` quoting issues).
-A timeout kills the whole process tree (Job Object on Windows, process group on Unix).
+Child environment: credentials and provider switches inherited from your session that would override the agent's token are removed (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`, `AGENT_SIDEKICK_TOKEN`); then `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN` are set to the agent's config dir and token.
+An inherited `ANTHROPIC_BASE_URL` is kept (proxies), but logged as a warning.
+
+The prompt is passed via stdin instead of the command line when it is longer than 8000 characters, or on Windows when `claude` is a `.cmd` shim (avoids command-line length limits and `cmd.exe` quoting issues).
+
+Timeout, cancellation and server shutdown kill the whole process tree (Job Object on Windows, process group on Unix).
+On Linux the server also makes itself a child subreaper, so descendants that detach from the process group (e.g. background commands started by the agent) are re-parented to it and swept when a run is killed.
+On SIGTERM (sent by Claude Code when it stops the server) running process trees are killed before the server exits.
 
 ## Security
 
 - The token is stored in the OS keyring (service `agent-sidekick`, user `oauth-token`). If no keyring is available it falls back to `<config-dir>/token` with mode 0600 (Unix) or a user-only ACL (Windows).
-- The token never appears in logs, error messages or tool output.
+- The server never writes the token into logs, error messages or tool output itself, and it redacts the exact token and anything matching `sk-ant-…` from the agent's output.
+  The delegated agent can, however, read its own token from its environment (`CLAUDE_CODE_OAUTH_TOKEN`); an agent instructed to print it in altered form (encoded, reversed, split) could expose it in the log and the tool result. Treat the delegated agent as trusted with that account.
 - To rotate or revoke: revoke the token in the Claude account settings, then run `claude setup-token` again (step 2) and `agent-sidekick setup`.
 - Never commit tokens to Git.
 - The delegated agent runs with the permissions you grant via `allowed_tools`. In `-p` mode the workspace trust dialog is skipped, so only point `cwd` at directories you trust.

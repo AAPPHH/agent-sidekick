@@ -72,14 +72,27 @@ try {
 }
 
 # Add the install dir to the user PATH if it is missing.
-$UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-$Entries = @()
-if ($UserPath) { $Entries = $UserPath -split ';' | Where-Object { $_ } }
-if (-not ($Entries | Where-Object { $_.TrimEnd('\') -ieq $InstallDir.TrimEnd('\') })) {
-    $NewPath = (@($Entries) + $InstallDir) -join ';'
-    [Environment]::SetEnvironmentVariable('Path', $NewPath, 'User')
-    $env:Path = "$env:Path;$InstallDir"
-    Write-Host "Added $InstallDir to your user PATH (open a new terminal to pick it up)."
+# Read and write the raw registry value: [Environment]::Get/SetEnvironmentVariable would expand
+# %VAR% references and store the result as REG_SZ, permanently losing them.
+$EnvKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+try {
+    $RawPath = [string]$EnvKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $Entries = @($RawPath -split ';' | Where-Object { $_ })
+    $Wanted = [Environment]::ExpandEnvironmentVariables($InstallDir).TrimEnd('\')
+    $Present = $Entries | Where-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\') -ieq $Wanted }
+    if (-not $Present) {
+        $NewPath = (@($Entries) + $InstallDir) -join ';'
+        $EnvKey.SetValue('Path', $NewPath, [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        # Broadcast WM_SETTINGCHANGE so new processes started from Explorer see the new PATH:
+        # SetEnvironmentVariable on a user variable does that as a side effect.
+        $Dummy = 'AGENT_SIDEKICK_INSTALL_' + [Guid]::NewGuid().ToString('N')
+        [Environment]::SetEnvironmentVariable($Dummy, '1', 'User')
+        [Environment]::SetEnvironmentVariable($Dummy, $null, 'User')
+        $env:Path = "$env:Path;$InstallDir"
+        Write-Host "Added $InstallDir to your user PATH (open a new terminal to pick it up)."
+    }
+} finally {
+    $EnvKey.Close()
 }
 
 Write-Host @"
