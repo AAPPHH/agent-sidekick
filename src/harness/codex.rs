@@ -10,7 +10,7 @@
 //! launch.
 //!
 //! The launch facts known for the later adapter are recorded in NOTES.md ("Harness adapters
-//! (0.4.0)", step 3).
+//! (0.3.0)", step 3).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

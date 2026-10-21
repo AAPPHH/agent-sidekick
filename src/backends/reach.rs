@@ -84,28 +84,44 @@ pub fn probe_get(url: &str, bearer: Option<&str>, timeout: Duration) -> ProbeRes
         Err(why) => return ProbeResponse::Failed(why),
     };
 
-    let mut config = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_global(Some(timeout));
-    if target.loopback {
-        config = config.proxy(None);
-    }
-    let agent: ureq::Agent = config.build().into();
-
     let start = Instant::now();
-    let mut request = agent.get(&target.url);
-    if let Some(token) = bearer {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
-    // `call` returns once the response head is read; the body is dropped unread.
-    match request.call() {
-        Ok(resp) => ProbeResponse::Status {
-            code: resp.status().as_u16(),
-            url: target.url,
-            millis: start.elapsed().as_millis(),
-        },
-        Err(e) => ProbeResponse::Failed(error_text(&e, timeout)),
+    loop {
+        // The remaining budget, so retries never extend the overall timeout.
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let mut config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_global(Some(remaining));
+        if target.loopback {
+            config = config.proxy(None);
+        }
+        let agent: ureq::Agent = config.build().into();
+
+        let mut request = agent.get(&target.url);
+        if let Some(token) = bearer {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        // `call` returns once the response head is read; the body is dropped unread.
+        match request.call() {
+            Ok(resp) => {
+                return ProbeResponse::Status {
+                    code: resp.status().as_u16(),
+                    url: target.url,
+                    millis: start.elapsed().as_millis(),
+                }
+            }
+            // A signal (e.g. SIGCHLD when a run's child exits) can interrupt a blocking socket
+            // call on Unix; ureq does not retry that. A GET is idempotent, so try again.
+            Err(ureq::Error::Io(io)) if io.kind() == io::ErrorKind::Interrupted => {
+                if start.elapsed() >= timeout {
+                    return ProbeResponse::Failed(format!(
+                        "timed out after {} ms",
+                        timeout.as_millis()
+                    ));
+                }
+            }
+            Err(e) => return ProbeResponse::Failed(error_text(&e, timeout)),
+        }
     }
 }
 

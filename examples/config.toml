@@ -114,7 +114,7 @@ secret_env = "OPENAI_API_KEY"
 max_concurrent = 1
 
 # 5) Optional, commented out: the same KI:connect.nrw models through the OpenCode agent CLI
-#    (harness = "opencode", since 0.4.0) instead of Aider. OpenCode reads, edits and runs
+#    (harness = "opencode", since 0.3.0) instead of Aider. OpenCode reads, edits and runs
 #    commands like Claude Code does. Install it first (`agent-sidekick harness install opencode`
 #    prints the official commands, e.g. `npm install -g opencode-ai`), then store the key with
 #    `agent-sidekick setup --backend kiconnect-oc` (OS keyring user `backend-kiconnect-oc`, file

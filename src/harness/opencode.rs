@@ -2,7 +2,7 @@
 //! `opencode run --format json --model <provider>/<model> --title agent-sidekick` with the
 //! prompt on stdin.
 //!
-//! Isolation (see NOTES.md, "Harness adapters (0.4.0)"): every backend gets its own directory
+//! Isolation (see NOTES.md, "Harness adapters (0.3.0)"): every backend gets its own directory
 //! `<config-dir>/opencode/<name>/` with `home`, `config`, `data`, `state`, `cache` and `tmp`.
 //! `HOME`/`USERPROFILE` (and on Windows `HOMEDRIVE`/`HOMEPATH`, `APPDATA`/`LOCALAPPDATA`),
 //! the four `XDG_*_HOME` variables, `TEMP`/`TMP`/`TMPDIR` and `npm_config_cache` point there,

@@ -7,10 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-10-21
+## [0.3.0] - 2026-10-21
 
 ### Added
 
+- Models per backend ("one backend per provider, the model as a parameter"): `models` (all types) lists the models a backend offers and is an allowlist for the `model` parameter of `sidekick_run`; `model` is the default and must be one of `models` (without it the default is the first entry). Names must be unique, non-blank, without leading/trailing whitespace or control characters, and must not start with `-`. Without `models`, claude-* backends accept any model as before.
+- `{model}` placeholder for `command` backends, substituted in the same single pass as `{prompt}`, `{cwd}` and `{max_turns}` (never in `command[0]`). A command using `{model}` requires `models`; `models` or `model` without `{model}` is a config error.
+- A `model` not offered by the selected backend is rejected before anything runs (the error lists the allowed models; no fallback). A fallback that does not offer the requested model runs with its own default model, and the result notes it.
+- `sidekick_backends` returns `models` and `default_model` per backend; `sidekick_status` shows each backend's default model and allowlist; `backends list` has a MODELS column (default first, marked `*`); `backends test` prints the default model and the models.
+- README section "Models"; `examples/config.toml` and `examples/CLAUDE.md` configure `kiconnect` as one backend offering `openai-gpt-oss-120b` and `qwen-qwen3-8-27b`.
 - Harness adapters (step 1): `src/harness/` with a common `Harness` trait (locate, `--version`, credential, launch building, output normalization, reachability check, install hint) and the adapters `claude` and `command`. The launch, credential and reachability logic of `claude-oauth`, `claude-endpoint` and `command` backends moved behind them unchanged (same argv, environment, session isolation, secrets, fallback, results and logs).
 - `harness = "claude" | "command"` per backend. `claude` without `base_url` is the claude-oauth mode, with `base_url` the claude-endpoint mode. The legacy `type` keeps working; `type` and `harness` together must agree.
 - `agent-sidekick harness list` (installed, path, version, backends using it) and `agent-sidekick harness install <name>` (prints the official install command, never runs it).
@@ -27,24 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The `secret_env` of a command backend is now removed from every backend's inherited environment, like an `api_key_env` (the command backend itself still gets its stored value).
-- `sidekick_run` treats a harness-reported failure (exit 0 without an answer) as an error and as a fallback trigger; such results contain a `failed: ...` line after `exit_code`.
-
-## [0.3.0] - 2026-10-21
-
-### Added
-
-- Models per backend ("one backend per provider, the model as a parameter"): `models` (all types) lists the models a backend offers and is an allowlist for the `model` parameter of `sidekick_run`; `model` is the default and must be one of `models` (without it the default is the first entry). Names must be unique, non-blank, without leading/trailing whitespace or control characters, and must not start with `-`. Without `models`, claude-* backends accept any model as before.
-- `{model}` placeholder for `command` backends, substituted in the same single pass as `{prompt}`, `{cwd}` and `{max_turns}` (never in `command[0]`). A command using `{model}` requires `models`; `models` or `model` without `{model}` is a config error.
-- A `model` not offered by the selected backend is rejected before anything runs (the error lists the allowed models; no fallback). A fallback that does not offer the requested model runs with its own default model, and the result notes it.
-- `sidekick_backends` returns `models` and `default_model` per backend; `sidekick_status` shows each backend's default model and allowlist; `backends list` has a MODELS column (default first, marked `*`); `backends test` prints the default model and the models.
-- README section "Models"; `examples/config.toml` and `examples/CLAUDE.md` configure `kiconnect` as one backend offering `openai-gpt-oss-120b` and `qwen-qwen3-8-27b`.
-
-### Changed
-
 - The first line of the `sidekick_run` result includes the model: `backend: <name> (<type>), model <m>` (omitted when no model was requested and the backend has no default, or a command backend takes no model).
 - `model` is now allowed for `command` backends (as the default value of `{model}`).
 - The note about ignored parameters of command backends names only what was actually ignored (`model` only when the command has no `{model}`).
+- The `secret_env` of a command backend is now removed from every backend's inherited environment, like an `api_key_env` (the command backend itself still gets its stored value).
+- `sidekick_run` treats a harness-reported failure (exit 0 without an answer) as an error and as a fallback trigger; such results contain a `failed: ...` line after `exit_code`.
 
 ## [0.2.0] - 2026-10-21
 

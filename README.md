@@ -21,7 +21,7 @@ It is a single binary with no runtime dependencies besides the official `claude`
 
    Or build from source (also the way to go on macOS for now): `cargo install --locked --git https://github.com/AAPPHH/agent-sidekick`
 
-   Pin a version with `VERSION=v0.4.0` (PowerShell: `$env:VERSION = 'v0.4.0'`). Re-running the installer upgrades
+   Pin a version with `VERSION=v0.3.0` (PowerShell: `$env:VERSION = 'v0.3.0'`). Re-running the installer upgrades
    in place. When the terminal is interactive the installer finishes by running `agent-sidekick setup`; set
    `AGENT_SIDEKICK_NO_SETUP=1` to skip that. More options are listed at the top of `install.sh` / `install.ps1`.
 
@@ -79,7 +79,7 @@ A backend is a place where `sidekick_run` executes a prompt. Backends are config
 | `command` | Any other agent CLI, e.g. Aider, started directly (no shell) with the prompt as one argument or on stdin. | Optional: a secret stored with `agent-sidekick setup --backend <name>`, handed to the program in the variable named by `secret_env`. |
 | `opencode` (only as `harness = "opencode"`) | The [OpenCode](https://opencode.ai) CLI against an OpenAI-compatible endpoint, Ollama or OpenRouter, in a per-backend isolated directory. See [OpenCode backends](#opencode-backends). | Provider key stored with `agent-sidekick setup --backend <name>` (not for Ollama), or read from `api_key_env`. |
 
-**Harnesses (since 0.4.0):** instead of `type`, a backend can name the agent CLI that runs it with `harness`: `harness = "claude"` without `base_url` is the same as `type = "claude-oauth"`, `harness = "claude"` with `base_url` the same as `type = "claude-endpoint"`, and `harness = "command"` the same as `type = "command"`. `harness = "opencode"` has no `type` equivalent (`type = "opencode"` is a config error). `codex` (the OpenAI Codex CLI) is known as a harness but not enabled yet: `harness list` and `harness install codex` show it, and a backend with `harness = "codex"` is a config error ("codex harness is not enabled yet (stub)"). Existing configs with `type` keep working unchanged; if both are set they must agree (otherwise it is a config error). `agent-sidekick harness list` shows whether each harness is installed (path, version), `agent-sidekick harness install <name>` prints its official install command (it never runs it).
+**Harnesses (since 0.3.0):** instead of `type`, a backend can name the agent CLI that runs it with `harness`: `harness = "claude"` without `base_url` is the same as `type = "claude-oauth"`, `harness = "claude"` with `base_url` the same as `type = "claude-endpoint"`, and `harness = "command"` the same as `type = "command"`. `harness = "opencode"` has no `type` equivalent (`type = "opencode"` is a config error). `codex` (the OpenAI Codex CLI) is known as a harness but not enabled yet: `harness list` and `harness install codex` show it, and a backend with `harness = "codex"` is a config error ("codex harness is not enabled yet (stub)"). Existing configs with `type` keep working unchanged; if both are set they must agree (otherwise it is a config error). `agent-sidekick harness list` shows whether each harness is installed (path, version), `agent-sidekick harness install <name>` prints its official install command (it never runs it).
 
 **Upgrading from v0.1:** without a `[backends]` section nothing changes. There is one implicit backend named `sidekick` of type `claude-oauth` that uses the existing token, config dir and `default_model`.
 As soon as `[backends]` exists, only the backends listed there are available.
