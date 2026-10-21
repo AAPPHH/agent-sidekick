@@ -1,0 +1,9 @@
+
+# The second Claude account (subscription OAuth token from `claude setup-token`).
+# Token: `agent-sidekick setup --backend sidekick` (keyring user `oauth-token`).
+[backends.sidekick]
+harness = "claude"
+description = "Second Claude subscription account (Claude Code). Best quality for complex, multi-file changes and debugging; uses that account's quota."
+cost = "quota"
+max_concurrent = 1
+# config_dir = "~/.claude-sidekick"   # default for a backend named "sidekick"
