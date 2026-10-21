@@ -198,3 +198,40 @@ State as of 2026-10-21, version 0.2.0.
    repository URL (`OWNER/agent-sidekick` placeholders in `install.sh`, `install.ps1` and the README, plus
    `repository` in Cargo.toml), push, then tag `v0.2.0`. The `ubuntu-24.04-arm` runner is free for public repos only.
 6. **macOS** runtime behaviour (Keychain, process groups): CI only.
+
+## Distribution (release, install, plugin, update)
+
+### Repository owner
+
+- Owner decision: `repository = "https://github.com/AAPPHH/agent-sidekick"` in Cargo.toml (git user AAPPHH). This is
+  the single place to change it; `update`/`doctor` derive owner/repo from `CARGO_PKG_REPOSITORY` at compile time
+  (only `https://github.com/<owner>/<repo>` URLs are accepted, a unit test guards it).
+
+### `agent-sidekick update` and the doctor hint (feat/dist-update)
+
+- `update` only checks: `GET <base>/repos/<owner>/<repo>/releases/latest` (base `https://api.github.com`, or
+  `AGENT_SIDEKICK_UPDATE_URL` as test/enterprise/mirror hook), headers `User-Agent: agent-sidekick/<version>`,
+  `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`, no credentials, 10 s timeout (doctor:
+  3 s). Proxies come from ureq's environment handling (`ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`, `NO_PROXY`); loopback
+  hosts bypass the proxy so the tests are not affected by a proxy in the environment. Body limit 1 MiB.
+- Version comparison is hand-written SemVer 2.0 precedence (no new dependency, keeps Cargo.lock untouched): one leading
+  `v`/`V` stripped, build metadata ignored, pre-release lower than the release, numeric identifiers compared
+  numerically. Leading zeros and anything else not SemVer is rejected as a bad response.
+- Results and exit codes: newer release -> install one-liner for the platform (`irm .../install.ps1 | iex` on
+  Windows, `curl -fsSL .../install.sh | sh` elsewhere, both from `releases/latest/download/`) plus "reload VS Code",
+  exit 0. Equal -> "up to date", older (dev/pre-release build) -> "up to date (newer than the latest release)", 404
+  -> "no release published yet"; all exit 0. Real errors exit 1 with a `next step:` line: no connection/timeout,
+  403/429 (treated as rate limit; unauthenticated limit is 60/h per IP), other HTTP status, JSON without a SemVer
+  `tag_name`. Error texts never contain the URL (an overridden one could carry credentials) or response bodies.
+- `/releases/latest` ignores drafts and pre-releases, so a published pre-release is never offered.
+- doctor: `[INFO]` lines after the report, never counted as warning/failure and never changing the exit code.
+  Remembered in `<config-dir>/update-check.json` (`checked_at` Unix seconds, `current`, `result`, `latest`):
+  - successful results are reused for 24 h, so an "update available" hint is repeated from the record (no
+    network) on each doctor run of that day; a failed check is shown once and retried after 1 h (silent meanwhile);
+  - the record is ignored if the installed version changed, the clock went backwards, or the file is unreadable;
+  - like `logging::Mode::Cli`, doctor never creates the config directory: if it does not exist, the check is skipped
+    (info line pointing to `agent-sidekick update`), since "once per day" could not be enforced without the record;
+  - `doctor --offline` skips it entirely (no request, no file).
+- `update` itself does not read or write `update-check.json` (kept simple; doctor checks again within a day at most).
+- Changes outside the new module are kept small for merging with feat/harness: `DoctorArgs { offline }` and three
+  lines in `doctor::run`, the `Update` subcommand in `cli.rs`, `pub mod update` in `commands/mod.rs`.

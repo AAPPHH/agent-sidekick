@@ -44,6 +44,16 @@ It is a single binary with no runtime dependencies besides the official `claude`
 5. **Optional: add backends** (local model, other agent CLIs) in `config.toml`, see [Backends](#backends).
    Without a `[backends]` section everything works as described above.
 
+## Updating
+
+```sh
+agent-sidekick update
+```
+
+checks the latest GitHub release and, if it is newer, prints the install one-liner for your platform (the same as in the Quickstart; it replaces the binary in place).
+Run it, then reload VS Code. `update` itself never downloads or installs anything.
+`agent-sidekick doctor` shows the same hint, checking at most once a day (`doctor --offline` skips the check).
+
 ## Usage
 
 From a Claude Code session, just ask:
@@ -328,7 +338,8 @@ Without a `[backends]` section it also shows the global `default model` and the 
 | `agent-sidekick setup --backend <name> [--token-stdin]` | Set up one backend only: `claude-oauth` token, `claude-endpoint` API key (or a note that `api_key_env` is used), the `secret_env` value of a `command` backend (nothing to store without `secret_env`). The MCP registration is not changed. |
 | `agent-sidekick backends list [--check]` | Table of name, type, cost, default and description; `--check` adds reachability. |
 | `agent-sidekick backends test <name>` | Reachability with details (claude version, resolved program, HTTP status). Exit code 0 if reachable, 1 otherwise. |
-| `agent-sidekick doctor` | Checks the installation and every backend, and prints next steps. |
+| `agent-sidekick doctor [--offline]` | Checks the installation and every backend, and prints next steps. Also shows an update hint, checked at most once a day (result kept in `<config-dir>/update-check.json`, only if that directory exists); `--offline` skips the check. A failed check is an info line, never a doctor failure. |
+| `agent-sidekick update` | Checks the latest GitHub release and prints the install command if a newer one exists. Exit code 0 also when up to date or no release exists yet; 1 if the check failed (offline, rate limit). |
 | `agent-sidekick uninstall [--purge]` | Removes the stored secrets of all configured backends (tokens, endpoint keys, command secrets, and the v0.1 token) and the MCP registration. |
 
 ## Configuration
@@ -381,6 +392,7 @@ Environment variables:
 | `AGENT_SIDEKICK_TOKEN` | Token of the `sidekick` backend for CI/testing; takes precedence over the keyring and token file. |
 | `AGENT_SIDEKICK_DISABLE_KEYRING` | Set to `1` to never use the OS keyring (file fallback only). |
 | `AGENT_SIDEKICK_LOG` | `tracing` filter, e.g. `debug` or `agent_sidekick=trace`. |
+| `AGENT_SIDEKICK_UPDATE_URL` | API base for `update`/`doctor` instead of `https://api.github.com` (tests, GitHub Enterprise or a mirror serving `/repos/<owner>/<repo>/releases/latest`). |
 
 ## How it works
 
