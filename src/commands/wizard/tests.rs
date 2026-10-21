@@ -388,7 +388,7 @@ fn fresh_kiconnect_only() {
         "Developer: Reload Window",
         "/mcp",
         "Lass kiconnect die README zusammenfassen",
-        "nach einem Monat ab",
+        "verlängert sich bei jeder",
         "agent-sidekick setup --backend kiconnect",
         "Schlüssel geprüft: HTTP 200",
     ] {
@@ -473,7 +473,7 @@ fn fresh_claude_only_needs_no_node() {
         out.contains("Lass sidekick die README zusammenfassen"),
         "{out}"
     );
-    assert!(!out.contains("nach einem Monat"), "{out}");
+    assert!(!out.contains("verlängert sich bei jeder"), "{out}");
 }
 
 #[test]

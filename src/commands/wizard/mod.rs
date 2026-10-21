@@ -390,8 +390,10 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     ));
     if profiles.contains(&Profile::Kiconnect) {
         p.say(
-            "Hinweis: Ein KI:connect-Schlüssel läuft nach einem Monat ab. Einen neuen speicherst \
-             du mit `agent-sidekick setup --backend kiconnect`.",
+            "Hinweis: Ein KI:connect-Schlüssel gilt einen Monat und verlängert sich bei jeder \
+             Anmeldung im Webinterface (https://chat.kiconnect.nrw) um einen weiteren Monat. Ist er \
+             abgelaufen, erzeuge dort unter „API Key Management“ mit „Rotate“ einen neuen und \
+             speichere ihn mit `agent-sidekick setup --backend kiconnect`.",
         );
     }
     Ok(Outcome::Done)
@@ -801,8 +803,9 @@ fn verify_key(
 fn secret_instructions(prof: Profile, backend: &Backend, os: Os) -> String {
     match prof {
         Profile::Kiconnect => {
-            "Melde dich auf https://chat.kiconnect.nrw mit deinem Hochschulkonto \
-             an und erstelle dort einen API-Schlüssel. Er gilt einen Monat."
+            "Melde dich auf https://chat.kiconnect.nrw/app mit deinem Hochschulkonto \
+             an. Klicke unten links auf deinen Namen, wähle „API Key Management“ und dann \
+             „Create Key“. Kopiere den Schlüssel."
                 .to_owned()
         }
         Profile::Claude => {

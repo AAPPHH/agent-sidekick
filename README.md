@@ -40,7 +40,8 @@ It is a single binary with no runtime dependencies besides the official `claude`
    An existing `config.toml` is never overwritten silently: you choose between merging (only missing backends are
    appended, existing text stays byte-identical), backup (`config.toml.bak-<timestamp>`) and rewrite, or cancel.
    For the second Claude account the wizard explains `claude setup-token`; run it in a separate terminal and log in
-   with that account. A KI:connect key expires after one month; store a new one with
+   with that account. A KI:connect key is valid for one month and is extended by every login to the
+   KI:connect web interface; after it expired, create a new one there ("Rotate") and store it with
    `agent-sidekick setup --backend kiconnect`.
 
    Without a terminal, or with any flag, `setup` works non-interactively as before (`--no-wizard` forces that in a
