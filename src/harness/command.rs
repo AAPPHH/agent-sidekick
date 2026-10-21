@@ -279,8 +279,11 @@ mod tests {
         let repo = dir.path().join("repo");
         let sub = repo.join("src").join("deep");
         std::fs::create_dir_all(&sub).unwrap();
+        // The temp dir is the outer "repository", so the walk never leaves it (a `.env` in
+        // the real home or /tmp must not change the result).
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         touch(&above);
-        // Without .git the walk goes on to the filesystem root and finds the outer .env.
+        // Without an inner .git the walk goes on to the outer root and finds its .env.
         assert_eq!(gemini_project_files(&sub, None), vec![above.clone()]);
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         assert!(gemini_project_files(&sub, None).is_empty());
