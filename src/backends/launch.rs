@@ -56,6 +56,28 @@ const REMOVED_NAMES: &[&str] = &[
     crate::token::ENV_TOKEN,
 ];
 
+/// Exceptions to [`REMOVED_PREFIXES`]: host configuration, not session identity or a
+/// credential. `CLAUDE_CODE_GIT_BASH_PATH` tells claude on Windows where bash.exe is; without
+/// it a child claude may refuse to start ("requires git-bash").
+const KEPT_PREFIXED_NAMES: &[&str] = &["CLAUDE_CODE_GIT_BASH_PATH"];
+
+/// Removed for claude-endpoint and command backends: claude sends these headers with every
+/// API request, so a caller's gateway credential would reach the backend's endpoint.
+/// `pass_env` may re-allow it for command backends only.
+const CUSTOM_HEADERS_ENV: &str = "ANTHROPIC_CUSTOM_HEADERS";
+
+/// Removed for claude-endpoint backends (not re-allowable via `pass_env`): model overrides
+/// of the caller's session that may not exist on the backend's endpoint. The backend's own
+/// `env` table may still set them explicitly.
+const ENDPOINT_MODEL_VARS: &[&str] = &[
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+];
+
 /// Never kept from the inherited environment, whatever `pass_env` says.
 const NEVER_PASSED: &[&str] = &[OAUTH_TOKEN_ENV, crate::token::ENV_TOKEN];
 
@@ -240,13 +262,17 @@ pub(crate) fn resolve_command_program(
     }
     let p = Path::new(program);
     if p.is_absolute() {
-        return if p.is_file() {
-            Ok(p.to_path_buf())
-        } else {
-            Err(format!(
+        if !p.is_file() {
+            return Err(format!(
                 "backend {backend}: program '{program}' does not exist or is not a file"
-            ))
-        };
+            ));
+        }
+        if !is_executable(p) {
+            return Err(format!(
+                "backend {backend}: program '{program}' is not executable (chmod +x)"
+            ));
+        }
+        return Ok(p.to_path_buf());
     }
     if p.components().count() != 1
         || program.contains('/')
@@ -271,6 +297,18 @@ pub(crate) fn resolve_command_program(
     }
     let joined = std::env::join_paths(dirs).map_err(|_| not_found())?;
     which::which_in(program, Some(joined), cwd).map_err(|_| not_found())
+}
+
+/// Unix: any exec bit set (metadata follows symlinks). Elsewhere: always true.
+#[cfg(unix)]
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_p: &Path) -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -299,23 +337,35 @@ fn in_list(name: &OsStr, list: &[&str]) -> bool {
     list.iter().any(|n| eq_name(name, n))
 }
 
-/// Removed from the inherited environment for this backend type (before `pass_env`).
-fn is_removed(name: &OsStr, ty: BackendType) -> bool {
-    REMOVED_PREFIXES.iter().any(|p| has_prefix(name, p))
+/// Is `name` one of the `api_key_env` variables of the configured backends?
+fn is_key_var(name: &OsStr, backend: &Backend) -> bool {
+    backend.foreign_secret_env.iter().any(|v| eq_name(name, v))
+}
+
+/// Removed from the inherited environment for this backend (before `pass_env`).
+fn is_removed(name: &OsStr, backend: &Backend) -> bool {
+    let ty = backend.backend_type();
+    (REMOVED_PREFIXES.iter().any(|p| has_prefix(name, p)) && !in_list(name, KEPT_PREFIXED_NAMES))
         || in_list(name, REMOVED_NAMES)
-        || (ty != BackendType::ClaudeOauth && eq_name(name, BASE_URL_ENV))
+        || is_key_var(name, backend)
+        || (ty != BackendType::ClaudeOauth
+            && (eq_name(name, BASE_URL_ENV) || eq_name(name, CUSTOM_HEADERS_ENV)))
+        || (ty == BackendType::ClaudeEndpoint && in_list(name, ENDPOINT_MODEL_VARS))
 }
 
 /// May an inherited variable that matches the removal rules be kept via `pass_env`?
-fn may_pass(name: &OsStr, ty: BackendType) -> bool {
-    if in_list(name, NEVER_PASSED) {
+fn may_pass(name: &OsStr, backend: &Backend) -> bool {
+    if in_list(name, NEVER_PASSED) || is_key_var(name, backend) {
         return false;
     }
-    match ty {
+    match backend.backend_type() {
         BackendType::Command => true,
         BackendType::ClaudeOauth => !in_list(name, CLAUDE_CREDENTIAL_VARS),
         BackendType::ClaudeEndpoint => {
-            !in_list(name, CLAUDE_CREDENTIAL_VARS) && !eq_name(name, BASE_URL_ENV)
+            !in_list(name, CLAUDE_CREDENTIAL_VARS)
+                && !eq_name(name, BASE_URL_ENV)
+                && !eq_name(name, CUSTOM_HEADERS_ENV)
+                && !in_list(name, ENDPOINT_MODEL_VARS)
         }
     }
 }
@@ -355,7 +405,6 @@ fn child_env_inner(
     global_pass_env: &[String],
     credential: &Credential,
 ) -> (Vec<(OsString, OsString)>, bool) {
-    let ty = backend.backend_type();
     let passed = |k: &OsStr| {
         global_pass_env
             .iter()
@@ -364,7 +413,7 @@ fn child_env_inner(
     };
     let mut env: Vec<(OsString, OsString)> = base
         .into_iter()
-        .filter(|(k, _)| !is_removed(k, ty) || (passed(k) && may_pass(k, ty)))
+        .filter(|(k, _)| !is_removed(k, backend) || (passed(k) && may_pass(k, backend)))
         .collect();
 
     for (k, v) in &backend.env {
@@ -515,12 +564,8 @@ pub fn build_launch(
             prompt_via_stdin,
             secret_env,
         } => {
-            if crate::locate::is_batch_script(program) && !prompt_via_stdin {
-                return Err(format!(
-                    "backend {name}: command[0] is a .cmd/.bat script; cmd.exe cannot pass \
-                     arbitrary prompt text safely. Use prompt_via_stdin = true or point \
-                     command[0] at an .exe"
-                ));
+            if let Some(e) = batch_argument_error(name, program, *prompt_via_stdin) {
+                return Err(e);
             }
             let env = child_env(backend, base, global_pass_env, credential);
             let args: Vec<OsString> = command
@@ -569,6 +614,22 @@ pub fn build_launch(
     }
 }
 
+/// A command backend whose program is a `.cmd`/`.bat` script cannot take the prompt as an
+/// argument (cmd.exe re-parses it). Shared by [`build_launch`] and the reachability check.
+pub(crate) fn batch_argument_error(
+    backend: &str,
+    program: &Path,
+    prompt_via_stdin: bool,
+) -> Option<String> {
+    (crate::locate::is_batch_script(program) && !prompt_via_stdin).then(|| {
+        format!(
+            "backend {backend}: command[0] is a .cmd/.bat script; cmd.exe cannot pass \
+             arbitrary prompt text safely. Use prompt_via_stdin = true or point \
+             command[0] at an .exe"
+        )
+    })
+}
+
 fn non_blank(s: Option<&str>) -> Option<&str> {
     s.filter(|m| !m.trim().is_empty())
 }
@@ -595,6 +656,7 @@ mod tests {
             pass_env: Vec::new(),
             implicit: false,
             kind,
+            foreign_secret_env: Vec::new(),
         }
     }
 
@@ -1243,6 +1305,182 @@ mod tests {
         assert!(!m);
     }
 
+    // ---- custom headers, model overrides, api_key_env, git bash ------------
+
+    const CANARY: &str = "X-Caller-Gateway-Auth: Bearer gw-MUSTNOTLEAK-0123456789";
+
+    fn caller_overrides() -> Vec<(OsString, OsString)> {
+        let mut b = session_base();
+        b.extend(base(&[
+            ("ANTHROPIC_CUSTOM_HEADERS", CANARY),
+            ("ANTHROPIC_MODEL", "caller-model"),
+            ("ANTHROPIC_SMALL_FAST_MODEL", "caller-small"),
+            ("ANTHROPIC_DEFAULT_FABLE_MODEL", "caller-fable"),
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL", "caller-opus"),
+            ("ANTHROPIC_DEFAULT_SONNET_MODEL", "caller-sonnet"),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "caller-haiku"),
+        ]));
+        b
+    }
+
+    const MODEL_VARS: [&str; 6] = [
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ];
+
+    #[test]
+    fn endpoint_drops_custom_headers_and_model_overrides() {
+        let all: Vec<String> = std::iter::once("ANTHROPIC_CUSTOM_HEADERS".to_owned())
+            .chain(MODEL_VARS.iter().map(|s| s.to_string()))
+            .collect();
+        let mut b = endpoint("e", EndpointAuth::XApiKey);
+        // pass_env (per backend and global) cannot re-allow them for claude-endpoint.
+        b.pass_env = all.clone();
+        let env = child_env(&b, caller_overrides(), &all, &key_cred(KEY_A));
+        assert!(!contains_value(&env, "MUSTNOTLEAK"));
+        for v in all.iter() {
+            assert!(!has(&env, v), "{v} must be removed");
+        }
+        // The backend's own env table may set a model explicitly.
+        b.env
+            .insert("ANTHROPIC_SMALL_FAST_MODEL".into(), "qwen3-coder".into());
+        let env = child_env(&b, caller_overrides(), &[], &key_cred(KEY_A));
+        assert_eq!(
+            get(&env, "ANTHROPIC_SMALL_FAST_MODEL"),
+            Some(OsStr::new("qwen3-coder"))
+        );
+        assert!(!has(&env, "ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn command_drops_custom_headers_unless_passed_keeps_models() {
+        let c = command("c", &["x"], true);
+        let env = child_env(&c, caller_overrides(), &[], &Credential::None);
+        assert!(!has(&env, "ANTHROPIC_CUSTOM_HEADERS"));
+        assert!(!contains_value(&env, "MUSTNOTLEAK"));
+        for v in MODEL_VARS {
+            assert!(has(&env, v), "{v} stays for command backends");
+        }
+        let mut c = command("c", &["x"], true);
+        c.pass_env = vec!["ANTHROPIC_CUSTOM_HEADERS".into()];
+        let env = child_env(&c, caller_overrides(), &[], &Credential::None);
+        assert_eq!(
+            get(&env, "ANTHROPIC_CUSTOM_HEADERS"),
+            Some(OsStr::new(CANARY))
+        );
+    }
+
+    #[test]
+    fn oauth_keeps_custom_headers_and_models() {
+        let env = child_env(&oauth("s"), caller_overrides(), &[], &oauth_cred());
+        assert_eq!(
+            get(&env, "ANTHROPIC_CUSTOM_HEADERS"),
+            Some(OsStr::new(CANARY))
+        );
+        for v in MODEL_VARS {
+            assert!(has(&env, v), "{v}");
+        }
+    }
+
+    #[test]
+    fn git_bash_path_survives_session_isolation() {
+        let mut b = session_base();
+        b.push((
+            "CLAUDE_CODE_GIT_BASH_PATH".into(),
+            r"D:\Git\bin\bash.exe".into(),
+        ));
+        let envs = [
+            child_env(&oauth("s"), b.clone(), &[], &oauth_cred()),
+            child_env(
+                &endpoint("e", EndpointAuth::Bearer),
+                b.clone(),
+                &[],
+                &key_cred(KEY_A),
+            ),
+            child_env(&command("c", &["x"], true), b, &[], &Credential::None),
+        ];
+        for env in &envs {
+            assert_eq!(
+                get(env, "CLAUDE_CODE_GIT_BASH_PATH"),
+                Some(OsStr::new(r"D:\Git\bin\bash.exe"))
+            );
+            // The rest of the prefix rule still applies.
+            assert!(!has(env, "CLAUDE_CODE_SESSION_ID"));
+            assert!(!has(env, "CLAUDE_CODE_ENTRYPOINT"));
+        }
+    }
+
+    const PROXY_KEY: &str = "proxy-key-value-1234567890";
+
+    /// `foreign_secret_env` as `Backends::new` fills it for a config with one endpoint
+    /// using `api_key_env = "PROXY_KEY"`.
+    fn with_key_vars(mut b: Backend) -> Backend {
+        b.foreign_secret_env = vec!["PROXY_KEY".to_owned()];
+        b
+    }
+
+    #[test]
+    fn api_key_env_never_reaches_other_backends() {
+        let mut shared = session_base();
+        shared.push(("PROXY_KEY".into(), PROXY_KEY.into()));
+        shared.push(("OTHER_VAR".into(), "kept".into()));
+        let global = vec!["PROXY_KEY".to_owned()];
+
+        let mut c = with_key_vars(command("c", &["x"], true));
+        c.pass_env = vec!["PROXY_KEY".into()];
+        let mut o = with_key_vars(oauth("s"));
+        o.pass_env = vec!["PROXY_KEY".into()];
+        let mut other_ep = with_key_vars(endpoint("e2", EndpointAuth::XApiKey));
+        other_ep.pass_env = vec!["PROXY_KEY".into()];
+        let mut own = with_key_vars(endpoint("e", EndpointAuth::Bearer));
+        if let BackendKind::ClaudeEndpoint { api_key_env, .. } = &mut own.kind {
+            *api_key_env = Some("PROXY_KEY".into());
+        }
+
+        let envs = [
+            child_env(&c, shared.clone(), &global, &Credential::None),
+            child_env(&o, shared.clone(), &global, &oauth_cred()),
+            child_env(&other_ep, shared.clone(), &global, &key_cred(KEY_A)),
+        ];
+        for env in &envs {
+            assert!(!has(env, "PROXY_KEY"));
+            assert!(!contains_value(env, PROXY_KEY));
+            assert_eq!(get(env, "OTHER_VAR"), Some(OsStr::new("kept")));
+        }
+        // The owning endpoint gets the value only as its auth variable.
+        let env = child_env(&own, shared.clone(), &global, &key_cred(PROXY_KEY));
+        assert!(!has(&env, "PROXY_KEY"));
+        assert_eq!(
+            get(&env, "ANTHROPIC_AUTH_TOKEN"),
+            Some(OsStr::new(PROXY_KEY))
+        );
+        assert_eq!(count(&env, "ANTHROPIC_AUTH_TOKEN"), 1);
+
+        // A command backend whose own secret_env is that name gets its stored secret.
+        let s = with_key_vars(command_with_secret("k", "PROXY_KEY"));
+        let env = child_env(&s, shared.clone(), &[], &cmd_cred(CMD_SECRET_A));
+        assert_eq!(get(&env, "PROXY_KEY"), Some(OsStr::new(CMD_SECRET_A)));
+        assert_eq!(count(&env, "PROXY_KEY"), 1);
+        assert!(!contains_value(&env, PROXY_KEY));
+    }
+
+    #[test]
+    fn api_key_env_removal_is_case_insensitive_on_windows() {
+        let shared = base(&[("Proxy_Key", PROXY_KEY), ("PATH", "/usr/bin")]);
+        let env = child_env(
+            &with_key_vars(oauth("s")),
+            shared,
+            &["proxy_key".to_owned()],
+            &oauth_cred(),
+        );
+        // Windows: the same variable (removed, pass_env cannot keep it). Unix: a different one.
+        assert_eq!(has(&env, "Proxy_Key"), !cfg!(windows));
+    }
+
     // ---- substitute --------------------------------------------------------
 
     #[test]
@@ -1855,6 +2093,31 @@ mod tests {
             assert!(err.contains("relative path"), "{rel}: {err}");
         }
         assert!(resolve_command_program("a", "", None, dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_program_must_be_executable_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("agent.sh");
+        std::fs::write(&p, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let abs = p.to_string_lossy().into_owned();
+        let err = resolve_command_program("a", &abs, None, dir.path()).unwrap_err();
+        assert!(err.contains("is not executable (chmod +x)"), "{err}");
+        assert!(err.starts_with("backend a: program '"), "{err}");
+        // Through a symlink, the target's mode counts.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&p, &link).unwrap();
+        let l = link.to_string_lossy().into_owned();
+        assert!(resolve_command_program("a", &l, None, dir.path()).is_err());
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            resolve_command_program("a", &abs, None, dir.path()).unwrap(),
+            p
+        );
+        assert!(resolve_command_program("a", &l, None, dir.path()).is_ok());
     }
 
     #[test]
