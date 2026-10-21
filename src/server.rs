@@ -34,9 +34,9 @@ use crate::token::{self, SecretId, Token, TokenError, TokenSource};
 const INSTRUCTIONS: &str = "agent-sidekick delegates work to a separate, headless agent on one \
 of the configured backends (e.g. a second Claude Code instance with its own account, an \
 OpenCode or Gemini CLI agent on another provider, or a local model). Without `backend`, a run \
-goes to the configured default backend; see `sidekick_backends` for its description and cost. \
-Call `sidekick_backends` to see the configured backends with their description, cost and \
-reachability, and pick one by its description and cost, and a model from its `models`. Use \
+goes to the configured default backend. Call `sidekick_backends` to see the configured backends \
+with their description, cost and reachability, and pick one by its description and cost, and a \
+model from its `models`. Use \
 `sidekick_run` to hand off a self-contained prompt (optionally with `backend`, `model` and a \
 `fallback`); it runs in the given working directory and returns which backend and model ran, \
 exit code, log path and the tail of the output. Use `sidekick_status` to see running/queued \
@@ -823,8 +823,8 @@ impl SidekickServer {
     }
 
     /// Delegate a prompt to a separate, headless agent that runs with its own credentials
-    /// (not the caller's). Without `backend` it runs on the configured default backend (see
-    /// sidekick_backends for its description and cost); `backend` selects another configured backend (see sidekick_backends: choose by
+    /// (not the caller's). Without `backend` it runs on the configured default backend;
+    /// `backend` selects another configured backend (see sidekick_backends: choose by
     /// description and cost) and `model` one of that backend's models (validated against its
     /// allowlist), `fallback` names a backend to use if the chosen one is unreachable, lacks credentials,
     /// fails to start or exits with an error (not after a timeout; the fallback gets its own
