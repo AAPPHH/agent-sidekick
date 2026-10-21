@@ -1786,6 +1786,7 @@ mod tests {
             pass_env: Vec::new(),
             implicit: false,
             kind,
+            foreign_secret_env: Vec::new(),
         }
     }
 

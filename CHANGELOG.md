@@ -60,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sidekick_status` showed `default model` and `agent claude config dir` values that were not in effect with `[backends]`.
 - After a fallback, progress said "agent running" while the fallback was still queued and could exceed its total.
 - `CLAUDE_CODE_GIT_BASH_PATH` was removed by session isolation, so `claude-*` backends could fail to start on Windows.
+
 ## [0.1.0] - 2026-10-21
 
 ### Added
