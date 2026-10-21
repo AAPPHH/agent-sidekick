@@ -91,14 +91,17 @@ const INTRO: &str = "Willkommen beim Einrichtungsassistenten von agent-sidekick.
 
 const RESUME: &str = "Führe danach `agent-sidekick setup` erneut aus.";
 
-const DIR_NEXT_STEP: &str = "Ordner konnte nicht angelegt werden. Nächster Schritt:     Zugriffsrechte prüfen, dann `agent-sidekick setup` erneut ausführen";
+const DIR_NEXT_STEP: &str = "Ordner konnte nicht angelegt werden. Nächster Schritt: \
+    Zugriffsrechte prüfen, dann `agent-sidekick setup` erneut ausführen";
 
 /// The whole wizard. `Err`: aborted with a message that names the next step.
 pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     p.say(INTRO);
 
     let cfg_path = s.config_file().context(
-        "Der Konfigurationsordner kann nicht bestimmt werden. Nächster Schritt:          AGENT_SIDEKICK_CONFIG_DIR auf einen Ordner setzen, dann `agent-sidekick setup` erneut          ausführen",
+        "Der Konfigurationsordner kann nicht bestimmt werden. Nächster Schritt: \
+         AGENT_SIDEKICK_CONFIG_DIR auf einen Ordner setzen, dann `agent-sidekick setup` erneut \
+         ausführen",
     )?;
     let existing = read_existing(&cfg_path)?;
     let claude_path = existing
@@ -478,7 +481,8 @@ fn offer_install(
     }
     let ok = s.run_visible(&inv).with_context(|| {
         format!(
-            "npm konnte nicht gestartet werden. Nächster Schritt: `npm install -g {package}`              selbst im Terminal ausführen. {RESUME}"
+            "npm konnte nicht gestartet werden. Nächster Schritt: `npm install -g {package}` \
+             selbst im Terminal ausführen. {RESUME}"
         )
     })?;
     if !ok {
