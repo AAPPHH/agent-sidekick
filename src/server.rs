@@ -487,7 +487,8 @@ impl SidekickServer {
             }
         };
         // The token may have fired while the permit was being handed over: never spawn then.
-        if cancel.is_cancelled() {
+        // Check `ctx.ct` directly as well: the forwarder into `cancel` may not have run yet.
+        if cancel.is_cancelled() || ctx.ct.is_cancelled() {
             tracing::info!("sidekick_run cancelled before start");
             return fail(CANCELLED_QUEUED_MSG.into());
         }
@@ -626,7 +627,8 @@ impl ServerHandler for SidekickServer {
 /// client disconnects or a termination signal arrives. In both cases in-flight runs are
 /// cancelled (their process trees killed) before this returns.
 pub async fn serve() -> anyhow::Result<()> {
-    // runner::init_process_supervision(); — enabled after merge
+    // Linux: become a child subreaper so the runner can find setsid'ed descendants.
+    runner::init_process_supervision();
     let (config, config_error) = match Config::load() {
         Ok(c) => (c, None),
         Err(e) => {
