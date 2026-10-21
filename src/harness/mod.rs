@@ -4,13 +4,16 @@
 //! A backend (`[backends.<name>]`) names its harness with
 //! `harness = "claude" | "opencode" | "command"` (or, legacy, with
 //! `type = "claude-oauth" | "claude-endpoint" | "command"`; opencode has no legacy form).
-//! Each harness has one adapter implementing [`Harness`]:
+//! `harness = "codex"` is known but not enabled yet (a config error). Each harness has one
+//! adapter implementing [`Harness`]:
 //!
 //! - [`claude::ClaudeHarness`]: the official `claude` CLI, in OAuth mode (a Claude account's
 //!   token, internal type `claude-oauth`) or endpoint mode (an Anthropic-compatible
 //!   `base_url` with an API key, internal type `claude-endpoint`).
 //! - [`opencode::OpencodeHarness`]: the OpenCode CLI (`opencode run --format json`) against
 //!   an OpenAI-compatible endpoint, Ollama or OpenRouter, isolated per backend.
+//! - [`codex::CodexHarness`]: a stub for the OpenAI Codex CLI: located, versioned and listed
+//!   (`harness list`/`install`), but no backend can use it yet.
 //! - [`command::CommandHarness`]: any other agent CLI, configured as an argument array with
 //!   placeholders.
 //!
@@ -35,6 +38,7 @@ use crate::runner::{Launch, RunRequest};
 use crate::token::{SecretId, Token, TokenError, TokenSource};
 
 pub mod claude;
+pub mod codex;
 pub mod command;
 pub mod opencode;
 
@@ -44,6 +48,18 @@ mod equivalence_tests;
 /// How long `<harness> --version` may take before it is killed.
 pub const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Inherited variables kept for `<harness> --version` of harnesses that run it in a minimal
+/// environment (opencode, codex); everything else is dropped.
+pub(crate) const VERSION_ENV_KEEP: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "LANG",
+    "LC_ALL",
+];
+
 /// The known harnesses (value of `harness = "..."` in config.toml).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,14 +67,17 @@ pub enum HarnessKind {
     Claude,
     #[serde(rename = "opencode")]
     OpenCode,
+    /// Stub: known (lookup, version, install hint) but not usable by a backend yet.
+    Codex,
     Command,
 }
 
 impl HarnessKind {
     /// Every known harness, in the order `harness list` prints them.
-    pub const ALL: [HarnessKind; 3] = [
+    pub const ALL: [HarnessKind; 4] = [
         HarnessKind::Claude,
         HarnessKind::OpenCode,
+        HarnessKind::Codex,
         HarnessKind::Command,
     ];
 
@@ -66,6 +85,7 @@ impl HarnessKind {
         match self {
             HarnessKind::Claude => "claude",
             HarnessKind::OpenCode => "opencode",
+            HarnessKind::Codex => "codex",
             HarnessKind::Command => "command",
         }
     }
@@ -76,6 +96,8 @@ impl HarnessKind {
     }
 
     /// The harness of an internal backend type (also the mapping of the legacy `type`).
+    /// Never [`HarnessKind::Codex`]: the codex stub has no backend type, so no backend runs
+    /// it.
     pub fn of_type(ty: BackendType) -> Self {
         match ty {
             BackendType::ClaudeOauth | BackendType::ClaudeEndpoint => HarnessKind::Claude,
@@ -89,6 +111,7 @@ impl HarnessKind {
         match self {
             HarnessKind::Claude => &claude::ClaudeHarness,
             HarnessKind::OpenCode => &opencode::OpencodeHarness,
+            HarnessKind::Codex => &codex::CodexHarness,
             HarnessKind::Command => &command::CommandHarness,
         }
     }
@@ -258,7 +281,12 @@ mod tests {
             assert_eq!(h.adapter().name(), h.as_str());
         }
         assert_eq!(HarnessKind::parse("opencode"), Some(HarnessKind::OpenCode));
-        assert_eq!(HarnessKind::parse("codex"), None);
+        assert_eq!(HarnessKind::parse("codex"), Some(HarnessKind::Codex));
+        assert_eq!(HarnessKind::parse("aider"), None);
+        assert_eq!(
+            HarnessKind::ALL.map(HarnessKind::as_str),
+            ["claude", "opencode", "codex", "command"]
+        );
         assert_eq!(HarnessKind::parse("Claude"), None);
     }
 
@@ -286,12 +314,18 @@ mod tests {
         assert!(HarnessKind::Command.adapter().install_hint().is_none());
         let opencode = HarnessKind::OpenCode.adapter().install_hint().unwrap();
         assert!(opencode.contains("npm install -g opencode-ai"));
+        let codex = HarnessKind::Codex.adapter().install_hint().unwrap();
+        assert!(codex.contains("npm install -g @openai/codex"));
     }
 
     #[test]
     fn normalize_output_is_identity_for_claude_and_command() {
         let raw = "line 1\n\u{1b}[31mred\u{1b}[0m\n{\"json\": true}\n";
-        for h in [HarnessKind::Claude, HarnessKind::Command] {
+        for h in [
+            HarnessKind::Claude,
+            HarnessKind::Codex,
+            HarnessKind::Command,
+        ] {
             assert_eq!(h.adapter().normalize_output(raw), None);
         }
     }

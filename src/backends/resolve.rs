@@ -514,7 +514,7 @@ fn resolve_one(
 /// The internal [`BackendType`] of a backend from `harness` and/or the legacy `type`:
 /// - only `type`: as before (`claude-oauth`, `claude-endpoint`, `command`);
 /// - only `harness`: `claude` without `base_url` is claude-oauth, with `base_url`
-///   claude-endpoint; `command` is command;
+///   claude-endpoint; `command` is command; `codex` is a config error (stub);
 /// - both: they must agree (`type` maps onto its harness, and for `claude` the mode implied
 ///   by `base_url` is checked by the field rules of the type); otherwise a config error.
 fn backend_type_of(raw: &RawBackend) -> Result<BackendType, String> {
@@ -525,6 +525,9 @@ fn backend_type_of(raw: &RawBackend) -> Result<BackendType, String> {
              legacy `type` only knows claude-oauth, claude-endpoint and command)"
                 .to_owned(),
         ),
+        // The codex harness is a stub (located and listed only): no backend can use it, with
+        // or without a `type`. Checked before the type/harness agreement.
+        (_, Some(HarnessKind::Codex)) => Err(crate::harness::codex::config_error()),
         (None, Some(HarnessKind::OpenCode)) => Ok(BackendType::OpenCode),
         (Some(ty), None) => Ok(ty),
         (None, Some(HarnessKind::Claude)) => Ok(if raw.base_url.is_some() {

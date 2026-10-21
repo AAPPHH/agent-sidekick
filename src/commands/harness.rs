@@ -22,7 +22,7 @@ pub enum HarnessCommand {
     List,
     /// Print the official install command(s) of a harness. Nothing is run.
     Install {
-        /// Harness name (`claude`, `opencode` or `command`).
+        /// Harness name (`claude`, `opencode`, `codex` or `command`).
         name: String,
     },
 }
@@ -120,6 +120,9 @@ pub fn format_list(rows: &[Row]) -> String {
             )),
             Some(Ok(path)) => {
                 out.push_str(&format!("{name}: installed\n"));
+                if let Some(note) = stub_note(r.harness) {
+                    out.push_str(note);
+                }
                 out.push_str(&format!("  path:    {path}\n"));
                 match &r.version {
                     Some(Ok(v)) if !v.is_empty() => out.push_str(&format!("  version: {v}\n")),
@@ -132,6 +135,9 @@ pub fn format_list(rows: &[Row]) -> String {
             }
             Some(Err(e)) => {
                 out.push_str(&format!("{name}: not installed ({e})\n"));
+                if let Some(note) = stub_note(r.harness) {
+                    out.push_str(note);
+                }
                 out.push_str(&format!(
                     "  install: `{APP_NAME} harness install {name}` shows the official command\n"
                 ));
@@ -142,6 +148,16 @@ pub fn format_list(rows: &[Row]) -> String {
         }
     }
     redact_all(&out)
+}
+
+/// The extra `harness list` line of a harness no backend can use yet.
+fn stub_note(h: HarnessKind) -> Option<&'static str> {
+    match h {
+        HarnessKind::Codex => Some(
+            "  status:  not enabled yet (stub); backends with harness = \"codex\" are rejected\n",
+        ),
+        _ => None,
+    }
 }
 
 /// What `harness install <name>` prints, or an error for an unknown name.
@@ -191,11 +207,60 @@ mod tests {
 
     #[test]
     fn install_text_unknown_harness() {
-        let e = install_text("codex").unwrap_err();
+        let e = install_text("aider").unwrap_err();
         assert_eq!(
             e,
-            "unknown harness `codex`; known: claude, opencode, command"
+            "unknown harness `aider`; known: claude, opencode, codex, command"
         );
+    }
+
+    #[test]
+    fn install_text_codex_prints_the_npm_command() {
+        let t = install_text("codex").unwrap();
+        assert!(t.contains("does not run them"), "{t}");
+        assert!(
+            t.contains("  npm (all platforms):   npm install -g @openai/codex\n"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn format_list_marks_codex_as_stub() {
+        let note =
+            "  status:  not enabled yet (stub); backends with harness = \"codex\" are rejected\n";
+        let installed = vec![Row {
+            harness: HarnessKind::Codex,
+            installed: Some(Ok("C:\\npm\\codex.exe".to_owned())),
+            version: Some(Ok("codex-cli 0.163.0".to_owned())),
+            used_by: vec![],
+        }];
+        let t = format_list(&installed);
+        assert!(t.starts_with("codex: installed\n"), "{t}");
+        assert!(t.contains(note), "{t}");
+        assert!(t.contains("  version: codex-cli 0.163.0\n"), "{t}");
+
+        let missing = vec![Row {
+            harness: HarnessKind::Codex,
+            installed: Some(Err("codex not found".to_owned())),
+            version: None,
+            used_by: vec![],
+        }];
+        let t = format_list(&missing);
+        assert!(
+            t.starts_with("codex: not installed (codex not found)\n"),
+            "{t}"
+        );
+        assert!(t.contains(note), "{t}");
+        assert!(t.contains("harness install codex"), "{t}");
+
+        // Other harnesses get no status line.
+        let claude = vec![Row {
+            harness: HarnessKind::Claude,
+            installed: Some(Ok("/usr/bin/claude".into())),
+            version: None,
+            used_by: vec![],
+        }];
+        assert!(!format_list(&claude).contains("status:"));
     }
 
     #[test]

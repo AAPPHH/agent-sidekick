@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     wrong_harness, CheckDeps, Harness, HarnessKind, LaunchInput, Normalized, SecretLoader,
-    VERSION_TIMEOUT,
+    VERSION_ENV_KEEP, VERSION_TIMEOUT,
 };
 use crate::backends::launch::{child_env, eq_name, set_var, PROVIDER_KEY_ENV};
 use crate::backends::reach::{ProbeResponse, PROBE_TIMEOUT};
@@ -58,17 +58,6 @@ pub const DISABLE_FLAGS: &[&str] = &[
     "OPENCODE_DISABLE_CLAUDE_CODE",
     "OPENCODE_DISABLE_LSP_DOWNLOAD",
     "OPENCODE_DISABLE_MODELS_FETCH",
-];
-
-/// Inherited variables kept for `opencode --version` (everything else is dropped).
-const VERSION_ENV_KEEP: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "SYSTEMROOT",
-    "WINDIR",
-    "COMSPEC",
-    "LANG",
-    "LC_ALL",
 ];
 
 /// Adapter of the `opencode` harness.

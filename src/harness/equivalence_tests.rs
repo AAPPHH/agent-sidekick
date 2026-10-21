@@ -486,8 +486,26 @@ fn harness_field_errors() {
         e.contains("or `harness` (one of: claude, opencode, command)"),
         "{e}"
     );
-    // Harnesses of later versions are not known yet.
-    let e = resolve_str(&one("harness = \"codex\"", "")).unwrap_err();
+    // Unknown harness names are a parse error.
+    let e = resolve_str(&one("harness = \"aider\"", "")).unwrap_err();
+    assert!(e.starts_with("parse error"), "{e}");
+    // codex is known but a stub: a config error, alone or next to any legacy `type`.
+    for kinds in [
+        "harness = \"codex\"",
+        "type = \"claude-oauth\"
+harness = \"codex\"",
+        "type = \"command\"
+harness = \"codex\"",
+    ] {
+        let e = resolve_str(&one(kinds, "command = [\"codex\", \"{prompt}\"]")).unwrap_err();
+        assert!(
+            e.contains("codex harness is not enabled yet (stub)"),
+            "{kinds}: {e}"
+        );
+        assert!(!e.contains("disagree"), "{kinds}: {e}");
+    }
+    // ...and the legacy `type` has no codex value.
+    let e = resolve_str(&one("type = \"codex\"", "")).unwrap_err();
     assert!(e.starts_with("parse error"), "{e}");
     // opencode has no legacy `type`.
     let e = resolve_str(&one("type = \"opencode\"", "")).unwrap_err();
