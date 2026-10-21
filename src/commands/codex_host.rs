@@ -474,7 +474,9 @@ pub enum Written {
 }
 
 /// Write `new_text` to `path` (through a temp file and a rename; parent directories are
-/// created). An existing file is first copied to a backup.
+/// created). An existing file is first copied to a backup. A symlinked `path` is written
+/// through to its target (the link stays). On Unix the new file keeps the old file's mode
+/// (the config can hold other MCP servers' secrets); a new file gets 0600.
 pub fn write_with_backup(path: &Path, new_text: &str, timestamp: &str) -> std::io::Result<Written> {
     let old = match std::fs::read_to_string(path) {
         Ok(t) => Some(t),
@@ -495,13 +497,49 @@ pub fn write_with_backup(path: &Path, new_text: &str, timestamp: &str) -> std::i
         }
         None => None,
     };
-    let tmp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, new_text)
-        .and_then(|()| std::fs::rename(&tmp, path))
+    // Replace the link's target, not the link (read_to_string above succeeded, so a
+    // symlink here resolves).
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let tmp = target.with_extension(format!("toml.tmp-{}", std::process::id()));
+    write_tmp(&tmp, new_text, &target)
+        .and_then(|()| std::fs::rename(&tmp, &target))
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })?;
     Ok(Written::Changed { backup })
+}
+
+/// Write the temp file for [`write_with_backup`]; on Unix with the mode of `original`
+/// (0600 if it does not exist), set before any content is written.
+fn write_tmp(tmp: &Path, text: &str, original: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mode = match std::fs::metadata(original) {
+            Ok(m) => m.permissions().mode() & 0o7777,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0o600,
+            Err(e) => return Err(e),
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(tmp)?;
+        // `mode` above is masked by the umask; set the exact mode explicitly.
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = original;
+        std::fs::write(tmp, text)
+    }
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, String> {

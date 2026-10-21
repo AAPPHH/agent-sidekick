@@ -212,6 +212,48 @@ fn files_are_backed_up_before_writing() {
     assert_eq!(read_entry_at(&tmp.path().join("none.toml")).unwrap(), None);
 }
 
+#[cfg(unix)]
+#[test]
+fn writes_keep_the_file_mode_and_follow_symlinks() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let tmp = tempfile::tempdir().unwrap();
+    let r = reg(tmp.path());
+
+    // A new file: 0600 regardless of the umask.
+    let fresh = tmp.path().join("fresh").join("config.toml");
+    register(&fresh, &r, "t0").unwrap();
+    assert_eq!(mode(&fresh), 0o600);
+
+    // An existing 0600 file stays 0600 through register and unregister.
+    let path = tmp.path().join("config.toml");
+    std::fs::write(&path, format!("{USER_CONFIG}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    register(&path, &r, "t1").unwrap();
+    assert_eq!(mode(&path), 0o600);
+    unregister(&path, "t2").unwrap().unwrap();
+    assert_eq!(mode(&path), 0o600);
+    // Another mode is kept as it is.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    register(&path, &r, "t3").unwrap();
+    assert_eq!(mode(&path), 0o640);
+
+    // A symlinked config: the target is rewritten, the link stays a link.
+    let real = tmp.path().join("real.toml");
+    std::fs::write(&real, format!("{USER_CONFIG}\n")).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = tmp.path().join("link-home").join("config.toml");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    register(&link, &r, "t4").unwrap();
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(read_entry_at(&real).unwrap().is_some());
+    assert_eq!(mode(&real), 0o600);
+}
+
 #[test]
 fn needed_vars_come_from_the_config() {
     let cfg: Config = toml::from_str(
