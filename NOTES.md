@@ -206,6 +206,8 @@ State as of 2026-10-21, version 0.2.0.
 
 ## Distribution (release, install, plugin, update)
 
+### Install scripts and release
+
 Owner decision: `Cargo.toml` has `repository = "https://github.com/AAPPHH/agent-sidekick"` (git user AAPPHH). It is
 the only place to change the owner/repository. `scripts/render-installers.sh` reads it (plain `sed`, no cargo
 needed) and writes release copies of `install.sh` / `install.ps1` with the placeholder `OWNER/agent-sidekick`
@@ -315,7 +317,6 @@ Verifier follow-up (2026-10-21):
   build step, and a placeholder URL would not be copy-pasteable. Changing the owner means `Cargo.toml` plus the
   README URLs; scripts, release and CI derive it from Cargo.toml.
 
-## Distribution (release, install, plugin, update)
 
 ### Repository owner
 
@@ -383,7 +384,6 @@ Verifier follow-up (2026-10-21):
   `<config-dir>/logs/`. So the "config dir missing -> update check skipped" path rarely applies in real use; the update
   hint itself never creates the directory (integration test).
 
-## Distribution (release, install, plugin, update)
 
 Owner decision: `Cargo.toml` has `repository = "https://github.com/AAPPHH/agent-sidekick"` (git user AAPPHH). It is the source of truth for the owner: code that can read it (scripts, release, update) derives owner/repo from it. Static files cannot derive anything and hardcode `AAPPHH`; changing the owner means the same edit in `.claude-plugin/marketplace.json` (owner name/url), `plugin/.claude-plugin/plugin.json` (author name/url, homepage, repository), `plugin/README.md` (links, install one-liners, marketplace commands) and `README.md` (plugin paragraph). `grep -rn AAPPHH --exclude-dir=target .` finds them all. This supersedes the "`repository` is intentionally left out" bullet under Open points.
 
