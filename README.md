@@ -339,7 +339,7 @@ Without a `[backends]` section it also shows the global `default model` and the 
 | `agent-sidekick backends list [--check]` | Table of name, type, cost, default and description; `--check` adds reachability. |
 | `agent-sidekick backends test <name>` | Reachability with details (claude version, resolved program, HTTP status). Exit code 0 if reachable, 1 otherwise. |
 | `agent-sidekick doctor [--offline]` | Checks the installation and every backend, and prints next steps. Also shows an update hint at most once a day (checked and shown once, later runs that day stay quiet; result kept in `<config-dir>/update-check.json`, only if that directory exists); `--offline` skips the check. A failed check is an info line, never a doctor failure. |
-| `agent-sidekick update` | Checks the latest GitHub release and prints the install command if a newer one exists. Exit code 0 also when up to date or no release exists yet; 1 if the check failed (offline, rate limit). |
+| `agent-sidekick update` | Checks the latest GitHub release and prints the install command if a newer one exists. Exit code 0 also when up to date or no release exists yet; 1 if the check failed (offline, rate limit, invalid `AGENT_SIDEKICK_UPDATE_URL`). |
 | `agent-sidekick uninstall [--purge]` | Removes the stored secrets of all configured backends (tokens, endpoint keys, command secrets, and the v0.1 token) and the MCP registration. |
 
 ## Configuration

@@ -437,7 +437,7 @@ fn is_loopback_host(host: &str) -> bool {
 fn error_text(e: &ureq::Error, via_proxy: bool) -> String {
     use ureq::Error as E;
     let proxy_note = if via_proxy {
-        " (via the proxy from HTTPS_PROXY/ALL_PROXY/HTTP_PROXY: is it reachable?)"
+        " (a proxy variable HTTPS_PROXY/ALL_PROXY/HTTP_PROXY is set: is that proxy reachable?)"
     } else {
         ""
     };

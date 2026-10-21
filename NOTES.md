@@ -240,7 +240,7 @@ State as of 2026-10-21, version 0.2.0.
   itself: DNS (Winsock 11001/11002/11004 on Windows, std's non-localized "failed to lookup address information"
   prefix elsewhere) -> "host not found (offline or DNS problem?)"; `InvalidData` during the request -> "TLS handshake
   failed: <rustls reason>" (during the body read it is a bad, non-UTF-8 answer instead); connection refused/reset and
-  timeouts get a note "via the proxy from HTTPS_PROXY/ALL_PROXY/HTTP_PROXY" when such a variable is set and the host
+  timeouts get a note "a proxy variable HTTPS_PROXY/ALL_PROXY/HTTP_PROXY is set" when one is set and the host
   is not loopback (variable names only, never the value). An `AGENT_SIDEKICK_UPDATE_URL` that is not an http(s) URL
   with a host is rejected before any request ("not a valid http(s) URL", next step "fix or unset", value not echoed);
   network errors name the variable in the next step when it is set.
