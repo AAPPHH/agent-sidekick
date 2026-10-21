@@ -270,12 +270,27 @@ pub fn mcp_remove(claude: &Path) -> Result<bool> {
     }
 }
 
-/// Exactly: `mcp add agent-sidekick -s user --env AGENT_SIDEKICK_CLAUDE=<claude> -- <exe> serve`.
-/// The name precedes the variadic `--env`, and `--` terminates it.
-pub fn build_mcp_add_args(claude_path_for_env: &Path, self_exe: &Path) -> Vec<OsString> {
+/// The variables of an existing registration's `Environment:` block that a re-registration
+/// carries over: everything except `AGENT_SIDEKICK_CLAUDE`, which is always set anew.
+pub fn preserved_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter()
+        .filter(|(k, _)| k != ENV_CLAUDE && !k.is_empty())
+        .cloned()
+        .collect()
+}
+
+/// Exactly: `mcp add agent-sidekick -s user --env AGENT_SIDEKICK_CLAUDE=<claude>
+/// [--env K=V ...] -- <exe> serve`. The name precedes the variadic `--env`, and `--`
+/// terminates it. `extra_env`: variables carried over from the previous registration
+/// (an `AGENT_SIDEKICK_CLAUDE` among them is ignored).
+pub fn build_mcp_add_args(
+    claude_path_for_env: &Path,
+    self_exe: &Path,
+    extra_env: &[(String, String)],
+) -> Vec<OsString> {
     let mut env = OsString::from(format!("{ENV_CLAUDE}="));
     env.push(claude_path_for_env.as_os_str());
-    vec![
+    let mut args: Vec<OsString> = vec![
         "mcp".into(),
         "add".into(),
         APP_NAME.into(),
@@ -283,21 +298,50 @@ pub fn build_mcp_add_args(claude_path_for_env: &Path, self_exe: &Path) -> Vec<Os
         "user".into(),
         "--env".into(),
         env,
-        "--".into(),
-        self_exe.as_os_str().to_owned(),
-        "serve".into(),
-    ]
+    ];
+    for (k, v) in extra_env.iter().filter(|(k, _)| k != ENV_CLAUDE) {
+        args.push("--env".into());
+        args.push(format!("{k}={v}").into());
+    }
+    args.extend(["--".into(), self_exe.as_os_str().to_owned(), "serve".into()]);
+    args
 }
 
-/// Register the server in user scope.
-pub fn mcp_add(claude: &Path, claude_path_for_env: &Path, self_exe: &Path) -> Result<()> {
+/// Replace every non-empty value of `env` in `text` with `[REDACTED]` (longest first, so
+/// a value that contains another is removed completely).
+pub fn redact_env_values(text: &str, env: &[(String, String)]) -> String {
+    let mut values: Vec<&str> = env
+        .iter()
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())
+        .collect();
+    values.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    let mut out = text.to_owned();
+    for v in values {
+        out = out.replace(v, "[REDACTED]");
+    }
+    out
+}
+
+/// Register the server in user scope, passing `extra_env` as additional `--env` entries.
+/// Their values (possibly secrets) are removed from any error message.
+pub fn mcp_add(
+    claude: &Path,
+    claude_path_for_env: &Path,
+    self_exe: &Path,
+    extra_env: &[(String, String)],
+) -> Result<()> {
     let out = run(
         claude,
-        build_mcp_add_args(claude_path_for_env, self_exe),
+        build_mcp_add_args(claude_path_for_env, self_exe, extra_env),
         DEFAULT_TIMEOUT,
-    )?;
+    )
+    .map_err(|e| anyhow::anyhow!(redact_env_values(&format!("{e:#}"), extra_env)))?;
     if !out.success() {
-        bail!("`claude mcp add {APP_NAME}` failed: {}", out.diagnostics());
+        bail!(
+            "`claude mcp add {APP_NAME}` failed: {}",
+            redact_env_values(&out.diagnostics(), extra_env)
+        );
     }
     Ok(())
 }
@@ -311,7 +355,7 @@ mod tests {
     fn add_args_exact_order() {
         let claude = PathBuf::from("/opt/claude dir/claude");
         let exe = PathBuf::from("/usr/local/bin/agent-sidekick");
-        let args = build_mcp_add_args(&claude, &exe);
+        let args = build_mcp_add_args(&claude, &exe, &[]);
         let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(
             args,
@@ -328,6 +372,118 @@ mod tests {
                 "serve",
             ]
         );
+    }
+
+    fn pair(k: &str, v: &str) -> (String, String) {
+        (k.to_owned(), v.to_owned())
+    }
+
+    #[test]
+    fn add_args_carry_over_preserved_env() {
+        let old = [
+            pair("AGENT_SIDEKICK_CLAUDE", "/old/claude"),
+            pair("MY_KEY", "abc=def=="),
+            pair("WITH_SPACE", "a value with spaces"),
+            pair("WIN_PATH", "C:\\Program Files\\x"),
+            pair("EMPTY", ""),
+        ];
+        let kept = preserved_env(&old);
+        let names: Vec<&str> = kept.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["MY_KEY", "WITH_SPACE", "WIN_PATH", "EMPTY"]);
+
+        let claude = PathBuf::from("/new/claude");
+        let exe = PathBuf::from("/usr/local/bin/agent-sidekick");
+        let args = build_mcp_add_args(&claude, &exe, &kept);
+        let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "mcp",
+                "add",
+                "agent-sidekick",
+                "-s",
+                "user",
+                "--env",
+                "AGENT_SIDEKICK_CLAUDE=/new/claude",
+                "--env",
+                "MY_KEY=abc=def==",
+                "--env",
+                "WITH_SPACE=a value with spaces",
+                "--env",
+                "WIN_PATH=C:\\Program Files\\x",
+                "--env",
+                "EMPTY=",
+                "--",
+                "/usr/local/bin/agent-sidekick",
+                "serve",
+            ]
+        );
+
+        // An AGENT_SIDEKICK_CLAUDE passed in directly is replaced, never duplicated.
+        let args = build_mcp_add_args(&claude, &exe, &old[..1]);
+        let n = args
+            .iter()
+            .filter(|a| a.to_str().unwrap().starts_with("AGENT_SIDEKICK_CLAUDE="))
+            .count();
+        assert_eq!(n, 1);
+        assert_eq!(args.len(), 10);
+    }
+
+    /// Values parsed from `claude mcp get` (with `=` and spaces) round-trip into `--env`.
+    #[test]
+    fn preserved_env_from_mcp_get_output() {
+        let out = "agent-sidekick:\n  Scope: User config (available in all your projects)\n  \
+                   Command: /usr/bin/agent-sidekick\n  Args: serve\n  Environment:\n    \
+                   AGENT_SIDEKICK_CLAUDE=/opt/claude\n    OLLAMA_API_KEY=k=v with space\n";
+        let e = parse_mcp_get(out, "agent-sidekick").unwrap();
+        let kept = preserved_env(&e.env);
+        assert_eq!(kept, [pair("OLLAMA_API_KEY", "k=v with space")]);
+        let args = build_mcp_add_args(Path::new("/c"), Path::new("/x"), &kept);
+        assert!(args
+            .iter()
+            .any(|a| a.to_str() == Some("OLLAMA_API_KEY=k=v with space")));
+    }
+
+    #[test]
+    fn env_values_are_redacted_from_errors() {
+        let env = [
+            pair("A", "secret-one"),
+            pair("B", "secret-one-longer"),
+            pair("C", ""),
+        ];
+        let text = "error: bad arg B=secret-one-longer and A=secret-one";
+        let red = redact_env_values(text, &env);
+        assert!(!red.contains("secret-one"), "{red}");
+        assert_eq!(red, "error: bad arg B=[REDACTED] and A=[REDACTED]");
+        // Empty values never blank out the whole message.
+        assert_eq!(redact_env_values("abc", &env[2..]), "abc");
+    }
+
+    /// A failing `claude mcp add` that echoes its arguments does not leak the values.
+    #[test]
+    fn mcp_add_failure_redacts_values() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let fake = {
+            let p = dir.path().join("claude.cmd");
+            std::fs::write(&p, "@echo off\r\necho failed: %* 1>&2\r\nexit /b 1\r\n").unwrap();
+            p
+        };
+        #[cfg(unix)]
+        let fake = {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.path().join("claude");
+            std::fs::write(&p, "#!/bin/sh\necho \"failed: $*\" 1>&2\nexit 1\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let env = [pair("MY_KEY", "topsecretvalue123")];
+        let err = mcp_add(&fake, Path::new("/c"), Path::new("/x"), &env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed"), "{err}");
+        assert!(err.contains("MY_KEY="), "{err}");
+        assert!(!err.contains("topsecretvalue123"), "{err}");
     }
 
     #[test]

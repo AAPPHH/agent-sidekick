@@ -1,11 +1,13 @@
 //! `agent-sidekick setup`: store the backends' secrets and register the MCP server.
 //!
-//! - Without `--backend`: asks for the OAuth token of every claude-oauth backend (in name
-//!   order), prints a hint for claude-endpoint/command backends, then (re-)registers the
-//!   MCP server with Claude Code.
+//! - Without `--backend`: asks for the OAuth token of every claude-oauth backend whose token
+//!   is not stored yet (in name order), prints a hint for claude-endpoint/command backends,
+//!   creates the claude-* config dirs, then (re-)registers the MCP server with Claude Code,
+//!   keeping the extra `--env` variables of the previous user-scope registration.
 //! - With `--backend <name>`: handles only that backend (OAuth token, endpoint API key, the
-//!   `secret_env` value of a command backend, or an info line) and never changes the MCP
-//!   registration.
+//!   `secret_env` value of a command backend, or an info line), creates its config dir and
+//!   never changes the MCP registration.
+//! - With `--register-only`: asks for nothing and only (re-)registers.
 
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -36,6 +38,9 @@ pub struct SetupArgs {
     /// not changed.
     #[arg(long, value_name = "NAME")]
     pub backend: Option<String>,
+    /// Only (re-)register the MCP server with Claude Code; ask for no tokens at all.
+    #[arg(long, conflicts_with_all = ["backend", "token_stdin", "no_register"])]
+    pub register_only: bool,
 }
 
 /// One thing setup does for one backend.
@@ -43,12 +48,22 @@ pub struct SetupArgs {
 pub enum Step {
     /// claude-oauth: prompt for the OAuth token, store it, create `config_dir`.
     OauthToken { name: String, config_dir: PathBuf },
+    /// claude-oauth in a full setup whose token is already stored (`source`): keep it.
+    OauthStored {
+        name: String,
+        config_dir: PathBuf,
+        source: String,
+    },
     /// claude-endpoint without `api_key_env`, only with `--backend`: prompt for the API key.
     EndpointKey { name: String, config_dir: PathBuf },
     /// claude-endpoint with `api_key_env`: nothing to store, explain the env var.
-    EndpointUsesEnv { name: String, var: String },
+    EndpointUsesEnv {
+        name: String,
+        var: String,
+        config_dir: PathBuf,
+    },
     /// claude-endpoint without `api_key_env` in a full setup: hint to `setup --backend`.
-    EndpointHint { name: String },
+    EndpointHint { name: String, config_dir: PathBuf },
     /// command with `secret_env`, only with `--backend`: prompt for the secret.
     CommandSecret { name: String, var: String },
     /// command with `secret_env` in a full setup: hint to `setup --backend`.
@@ -64,6 +79,47 @@ impl Step {
             Step::OauthToken { .. } | Step::EndpointKey { .. } | Step::CommandSecret { .. }
         )
     }
+
+    /// The Claude config dir of a claude-* backend, which setup creates.
+    pub fn config_dir(&self) -> Option<&Path> {
+        match self {
+            Step::OauthToken { config_dir, .. }
+            | Step::OauthStored { config_dir, .. }
+            | Step::EndpointKey { config_dir, .. }
+            | Step::EndpointUsesEnv { config_dir, .. }
+            | Step::EndpointHint { config_dir, .. } => Some(config_dir),
+            Step::CommandSecret { .. }
+            | Step::CommandSecretHint { .. }
+            | Step::CommandInfo { .. } => None,
+        }
+    }
+}
+
+/// In a full setup, turn the token prompt of every claude-oauth backend whose token is
+/// already stored into [`Step::OauthStored`]. `stored`: where the backend's token is
+/// stored (`None`: not stored).
+pub fn skip_stored(steps: Vec<Step>, stored: &dyn Fn(&str) -> Option<String>) -> Vec<Step> {
+    steps
+        .into_iter()
+        .map(|step| match step {
+            Step::OauthToken { name, config_dir } => match stored(&name) {
+                Some(source) => Step::OauthStored {
+                    name,
+                    config_dir,
+                    source,
+                },
+                None => Step::OauthToken { name, config_dir },
+            },
+            other => other,
+        })
+        .collect()
+}
+
+/// Where the OAuth token of backend `name` is stored, if it is (never the value).
+fn stored_oauth_source(name: &str) -> Option<String> {
+    token::load_secret(&SecretId::Oauth(name.to_owned()))
+        .ok()
+        .map(|(_token, source)| source.to_string())
 }
 
 /// Which steps setup performs. `only`: the `--backend` value.
@@ -86,16 +142,21 @@ pub fn plan(backends: &Backends, only: Option<&str>) -> Result<Vec<Step>, String
                 },
                 BackendKind::ClaudeEndpoint {
                     api_key_env: Some(var),
+                    config_dir,
                     ..
                 } => Step::EndpointUsesEnv {
                     name,
                     var: var.clone(),
+                    config_dir: config_dir.clone(),
                 },
                 BackendKind::ClaudeEndpoint { config_dir, .. } if single => Step::EndpointKey {
                     name,
                     config_dir: config_dir.clone(),
                 },
-                BackendKind::ClaudeEndpoint { .. } => Step::EndpointHint { name },
+                BackendKind::ClaudeEndpoint { config_dir, .. } => Step::EndpointHint {
+                    name,
+                    config_dir: config_dir.clone(),
+                },
                 BackendKind::Command {
                     secret_env: Some(var),
                     ..
@@ -116,7 +177,8 @@ pub fn plan(backends: &Backends, only: Option<&str>) -> Result<Vec<Step>, String
         .collect())
 }
 
-/// `--token-stdin` provides exactly one secret, so it needs exactly one prompt.
+/// `--token-stdin` provides exactly one secret, so it needs exactly one prompt. Only the
+/// steps that actually ask count (a full setup skips tokens that are already stored).
 pub fn check_token_stdin(steps: &[Step], token_stdin: bool, single_backend: bool) -> Result<()> {
     if !token_stdin {
         return Ok(());
@@ -126,15 +188,27 @@ pub fn check_token_stdin(steps: &[Step], token_stdin: bool, single_backend: bool
         .filter(|s| s.asks_secret())
         .map(step_name)
         .collect();
+    let stored: Vec<&str> = steps
+        .iter()
+        .filter(|s| matches!(s, Step::OauthStored { .. }))
+        .map(step_name)
+        .collect();
     match asked.len() {
         1 => Ok(()),
         0 if single_backend => bail!(
             "--token-stdin: this backend has no secret to store (see the output without --token-stdin)"
         ),
+        0 if !stored.is_empty() => bail!(
+            "--token-stdin: the token of every claude-oauth backend is already stored ({}), so \
+             there is no token to read; replace one with `{APP_NAME} setup --backend <name> \
+             --token-stdin`, or only re-register with `{APP_NAME} setup --register-only`",
+            stored.join(", ")
+        ),
         0 => bail!("--token-stdin: no claude-oauth backend is configured, so there is no token to read"),
         _ => bail!(
             "--token-stdin can provide only one secret, but setup would ask for {} ({}); \
-             run `{APP_NAME} setup --backend <name> --token-stdin` once per backend",
+             store each with `{APP_NAME} setup --backend <name> --token-stdin`, then register \
+             with `{APP_NAME} setup --register-only`",
             asked.len(),
             asked.join(", ")
         ),
@@ -144,9 +218,10 @@ pub fn check_token_stdin(steps: &[Step], token_stdin: bool, single_backend: bool
 fn step_name(step: &Step) -> &str {
     match step {
         Step::OauthToken { name, .. }
+        | Step::OauthStored { name, .. }
         | Step::EndpointKey { name, .. }
         | Step::EndpointUsesEnv { name, .. }
-        | Step::EndpointHint { name }
+        | Step::EndpointHint { name, .. }
         | Step::CommandSecret { name, .. }
         | Step::CommandSecretHint { name, .. }
         | Step::CommandInfo { name } => name,
@@ -156,8 +231,18 @@ fn step_name(step: &Step) -> &str {
 pub fn run(args: SetupArgs) -> Result<ExitCode> {
     // The configuration first: a broken config.toml must fail before anything is asked.
     let (cfg, backends) = load_backends().map_err(|e| anyhow!(e))?;
-    let steps = plan(&backends, args.backend.as_deref()).map_err(|e| anyhow!(e))?;
     let single = args.backend.is_some();
+    let steps = if args.register_only {
+        Vec::new()
+    } else {
+        let steps = plan(&backends, args.backend.as_deref()).map_err(|e| anyhow!(e))?;
+        if single {
+            // `--backend` always asks, so a stored token can be replaced.
+            steps
+        } else {
+            skip_stored(steps, &stored_oauth_source)
+        }
+    };
     check_token_stdin(&steps, args.token_stdin, single)?;
     let prompts = steps.iter().any(Step::asks_secret);
     if prompts && !args.token_stdin {
@@ -198,24 +283,16 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
         }
     };
 
-    let mut dirs = vec![paths::config_dir()?, paths::logs_dir()?];
-    for step in &steps {
-        match step {
-            Step::OauthToken { config_dir, .. } | Step::EndpointKey { config_dir, .. } => {
-                dirs.push(config_dir.clone())
-            }
-            _ => {}
-        }
-    }
-    if prompts || !single {
+    if !args.register_only {
         // Before storing (the file fallback lives in the config dir), so that "Created" is
         // reported accurately. Other commands never create these directories.
-        for dir in dirs {
-            if !dir.exists() {
-                std::fs::create_dir_all(&dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
-                println!("Created {}", dir.display());
-            }
+        let base = if prompts || !single {
+            vec![paths::config_dir()?, paths::logs_dir()?]
+        } else {
+            Vec::new()
+        };
+        for dir in dirs_to_create(base, &steps) {
+            create_dir(&dir)?;
         }
     }
 
@@ -228,7 +305,7 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
             if let Ok(None) = claude_cli::mcp_get(&found.path) {
                 println!(
                     "\nNote: the MCP server `{APP_NAME}` is not registered with Claude Code; \
-                     run `{APP_NAME} setup` once to register it."
+                     run `{APP_NAME} setup --register-only` once to register it."
                 );
             }
         }
@@ -251,8 +328,37 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `base` plus the Claude config dir of every claude-* step (whether or not it prompts),
+/// without duplicates.
+fn dirs_to_create(base: Vec<PathBuf>, steps: &[Step]) -> Vec<PathBuf> {
+    let mut dirs = base;
+    for dir in steps.iter().filter_map(Step::config_dir) {
+        if !dirs.iter().any(|d| d == dir) {
+            dirs.push(dir.to_owned());
+        }
+    }
+    dirs
+}
+
+/// Create `dir` (with parents) if it is missing and say so.
+fn create_dir(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        println!("Created {}", dir.display());
+    }
+    Ok(())
+}
+
+fn stored_message(name: &str, source: &str) -> String {
+    format!(
+        "Token for backend `{name}` already stored ({source}); use `{APP_NAME} setup --backend \
+         {name}` to replace it."
+    )
+}
+
 fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
     match step {
+        Step::OauthStored { name, source, .. } => println!("{}", stored_message(name, source)),
         Step::OauthToken { name, config_dir } => {
             if !token_stdin {
                 println!("\n{}", token_instructions(name, config_dir));
@@ -283,12 +389,13 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
             drop(token);
             println!("API key for backend `{name}` stored in {source}.");
         }
-        Step::EndpointUsesEnv { name, var } => println!(
+        Step::EndpointUsesEnv { name, var, .. } => println!(
             "Backend `{name}` (claude-endpoint): the API key is read from the environment \
              variable {var}; nothing is stored. It must be set in the MCP server's environment, \
-             e.g. via `claude mcp add ... -e {var}=...` or the OS."
+             preferably in the OS/user environment Claude Code starts from (an `-e {var}=...` \
+             in the `{APP_NAME}` registration also works and is kept when setup re-registers)."
         ),
-        Step::EndpointHint { name } => println!(
+        Step::EndpointHint { name, .. } => println!(
             "Backend `{name}` (claude-endpoint): run `{APP_NAME} setup --backend {name}` to store \
              its API key."
         ),
@@ -348,20 +455,40 @@ fn resolve_claude(explicit: Option<&Path>, config_claude_path: Option<&Path>) ->
 fn register(claude: &Path, self_exe: &Path) -> Result<()> {
     // `mcp get` shows only the entry that wins in this directory (local > project > user),
     // so a user entry may exist behind a local one: always try to remove the user entry.
-    let registered = match claude_cli::mcp_get(claude) {
-        Ok(entry) => entry.is_some(),
+    let (registered, keep) = match claude_cli::mcp_get(claude) {
+        Ok(entry) => {
+            let keep = entry.as_ref().map(env_to_keep);
+            (
+                entry.is_some(),
+                keep.unwrap_or(EnvToKeep::Known(Vec::new())),
+            )
+        }
         Err(get_err) => {
-            claude_cli::mcp_list_contains(claude).with_context(|| format!("{get_err:#}"))?
+            let listed =
+                claude_cli::mcp_list_contains(claude).with_context(|| format!("{get_err:#}"))?;
+            (listed, EnvToKeep::Unknown)
+        }
+    };
+    let extra_env = match keep {
+        EnvToKeep::Known(env) => env,
+        EnvToKeep::Unknown => {
+            if registered {
+                eprintln!("warning: {UNKNOWN_ENV_WARNING}");
+            }
+            Vec::new()
         }
     };
     if registered && claude_cli::mcp_remove(claude)? {
         println!("Removed existing {APP_NAME} registration (user scope).");
     }
-    claude_cli::mcp_add(claude, claude, self_exe)?;
+    claude_cli::mcp_add(claude, claude, self_exe, &extra_env)?;
     println!(
         "Registered MCP server `{APP_NAME}` (user scope): {} serve",
         self_exe.display()
     );
+    if let Some(note) = kept_env_note(&extra_env) {
+        println!("{note}");
+    }
     // A local or project entry would still take precedence over the new one here.
     match claude_cli::mcp_get(claude) {
         Ok(Some(entry)) => {
@@ -376,6 +503,41 @@ fn register(claude: &Path, self_exe: &Path) -> Result<()> {
         Err(e) => eprintln!("warning: could not verify the registration: {e:#}"),
     }
     Ok(())
+}
+
+/// The environment of the user-scope registration that a re-registration carries over.
+#[derive(Debug, PartialEq, Eq)]
+enum EnvToKeep {
+    /// Read from the user-scope entry (without `AGENT_SIDEKICK_CLAUDE`).
+    Known(Vec<(String, String)>),
+    /// The user-scope entry could not be read (shadowed or `mcp get` failed).
+    Unknown,
+}
+
+const UNKNOWN_ENV_WARNING: &str = "could not read the environment variables of the user-scope \
+    registration (another entry shadows it here, or `claude mcp get` failed); variables added \
+    to it with `-e` are not carried over. Set them in the OS environment or add them again.";
+
+/// Only a user-scope entry is replaced, so only its variables are carried over; a local or
+/// project entry that `mcp get` shows instead hides the user entry's variables.
+fn env_to_keep(entry: &claude_cli::McpEntry) -> EnvToKeep {
+    if entry.is_user_scope() {
+        EnvToKeep::Known(claude_cli::preserved_env(&entry.env))
+    } else {
+        EnvToKeep::Unknown
+    }
+}
+
+/// Names (never values) of the variables carried over to the new registration.
+fn kept_env_note(env: &[(String, String)]) -> Option<String> {
+    if env.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+    Some(format!(
+        "Kept environment variables of the previous registration: {}",
+        names.join(", ")
+    ))
 }
 
 /// Warning text if `entry` (what `mcp get` reports after registering) is not the
@@ -399,7 +561,7 @@ fn require_terminal(stdin_is_terminal: bool) -> Result<()> {
         bail!(
             "stdin is not a terminal, so the secret cannot be prompted for; \
              pipe it in with `{APP_NAME} setup --token-stdin` (with --backend <name> if more \
-             than one secret is needed)"
+             than one secret is needed), or only re-register with `{APP_NAME} setup --register-only`"
         );
     }
     Ok(())
@@ -500,10 +662,12 @@ mod tests {
                 },
                 Step::EndpointUsesEnv {
                     name: "envkey".into(),
-                    var: "MY_KEY".into()
+                    var: "MY_KEY".into(),
+                    config_dir: abs(".claude-sidekick-envkey")
                 },
                 Step::EndpointHint {
-                    name: "local".into()
+                    name: "local".into(),
+                    config_dir: abs(".claude-sidekick-local")
                 },
                 Step::OauthToken {
                     name: "sidekick".into(),
@@ -537,7 +701,8 @@ mod tests {
             plan(&b, Some("envkey")).unwrap(),
             vec![Step::EndpointUsesEnv {
                 name: "envkey".into(),
-                var: "MY_KEY".into()
+                var: "MY_KEY".into(),
+                config_dir: abs(".claude-sidekick-envkey")
             }]
         );
         assert_eq!(
@@ -663,6 +828,166 @@ mod tests {
         // A command backend without secret_env still has nothing to store.
         let none = plan(&b, Some("plain")).unwrap();
         assert!(check_token_stdin(&none, true, true).is_err());
+    }
+
+    fn stored_only(names: &'static [&'static str]) -> impl Fn(&str) -> Option<String> {
+        move |n: &str| names.contains(&n).then(|| "file /x/token".to_owned())
+    }
+
+    #[test]
+    fn full_setup_skips_stored_oauth_tokens() {
+        let b = sample();
+        let steps = skip_stored(plan(&b, None).unwrap(), &stored_only(&["sidekick"]));
+        assert!(steps.contains(&Step::OauthStored {
+            name: "sidekick".into(),
+            config_dir: abs(".claude-sidekick"),
+            source: "file /x/token".into()
+        }));
+        let asked: Vec<&str> = steps
+            .iter()
+            .filter(|s| s.asks_secret())
+            .map(step_name)
+            .collect();
+        assert_eq!(asked, ["work"]);
+        // Only `work` is asked, so --token-stdin is fine now.
+        assert!(check_token_stdin(&steps, true, false).is_ok());
+
+        // Both stored: nothing is asked, no terminal needed, --token-stdin has nothing to read.
+        let all = skip_stored(plan(&b, None).unwrap(), &stored_only(&["sidekick", "work"]));
+        assert!(!all.iter().any(Step::asks_secret));
+        assert!(check_token_stdin(&all, false, false).is_ok());
+        let err = check_token_stdin(&all, true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already stored (sidekick, work)"), "{err}");
+        assert!(err.contains("--register-only"), "{err}");
+        assert!(
+            err.contains("setup --backend <name> --token-stdin"),
+            "{err}"
+        );
+
+        // Nothing stored: unchanged plan.
+        assert_eq!(
+            skip_stored(plan(&b, None).unwrap(), &stored_only(&[])),
+            plan(&b, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn stored_message_names_source_and_replacement() {
+        let msg = stored_message("work", "OS keyring (service agent-sidekick)");
+        assert!(msg.contains("`work` already stored (OS keyring"), "{msg}");
+        assert!(
+            msg.contains("use `agent-sidekick setup --backend work` to replace it"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn multi_secret_token_stdin_error_points_to_register_only() {
+        let err = check_token_stdin(&plan(&sample(), None).unwrap(), true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("setup --register-only"), "{err}");
+        assert!(
+            err.contains("setup --backend <name> --token-stdin"),
+            "{err}"
+        );
+        let err = require_terminal(false).unwrap_err().to_string();
+        assert!(err.contains("--register-only"), "{err}");
+    }
+
+    #[test]
+    fn config_dirs_are_created_for_every_claude_backend() {
+        let b = sample();
+        // `setup --backend envkey` (api_key_env): no prompt, but its config dir is created,
+        // as doctor's next step says.
+        let one = plan(&b, Some("envkey")).unwrap();
+        assert!(!one.iter().any(Step::asks_secret));
+        assert_eq!(
+            dirs_to_create(Vec::new(), &one),
+            [abs(".claude-sidekick-envkey")]
+        );
+        // Full setup: every claude-* backend, including endpoint hints and stored tokens.
+        let full = skip_stored(plan(&b, None).unwrap(), &stored_only(&["work"]));
+        let base = vec![abs("cfg"), abs("logs")];
+        let dirs = dirs_to_create(base, &full);
+        for d in [
+            "cfg",
+            "logs",
+            ".claude-sidekick-envkey",
+            ".claude-sidekick-local",
+            ".claude-sidekick",
+            ".claude-work",
+        ] {
+            assert!(dirs.contains(&abs(d)), "{d}: {dirs:?}");
+        }
+        assert_eq!(dirs.len(), 6);
+        // A command backend has none.
+        assert!(dirs_to_create(Vec::new(), &plan(&b, Some("aider")).unwrap()).is_empty());
+
+        // The directory is really created (with parents), and an existing one is fine.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("a").join("cd-envk");
+        let mut b2 = endpoint("envk", Some("MY_TEST_KEY"), true);
+        if let BackendKind::ClaudeEndpoint { config_dir, .. } = &mut b2.kind {
+            *config_dir = dir.clone();
+        }
+        let steps = plan(&Backends::new(vec![b2]), Some("envk")).unwrap();
+        for d in dirs_to_create(Vec::new(), &steps) {
+            create_dir(&d).unwrap();
+        }
+        assert!(dir.is_dir());
+        create_dir(&dir).unwrap();
+    }
+
+    fn entry_with(scope: Option<&str>, env: &[(&str, &str)]) -> claude_cli::McpEntry {
+        claude_cli::McpEntry {
+            scope: scope.map(Into::into),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reregistration_keeps_user_scope_env_except_claude_path() {
+        let user = entry_with(
+            Some("User config (available in all your projects)"),
+            &[
+                ("AGENT_SIDEKICK_CLAUDE", "/old/claude"),
+                ("MY_TEST_KEY", "abc=def ghi"),
+                ("OTHER", "x"),
+            ],
+        );
+        let EnvToKeep::Known(kept) = env_to_keep(&user) else {
+            panic!("user scope must be known");
+        };
+        assert_eq!(
+            kept,
+            [
+                ("MY_TEST_KEY".to_owned(), "abc=def ghi".to_owned()),
+                ("OTHER".to_owned(), "x".to_owned())
+            ]
+        );
+        let note = kept_env_note(&kept).unwrap();
+        assert_eq!(
+            note,
+            "Kept environment variables of the previous registration: MY_TEST_KEY, OTHER"
+        );
+        assert!(!note.contains("abc=def"), "{note}");
+        assert_eq!(kept_env_note(&[]), None);
+
+        // A shadowing local entry (or an unknown layout) must not leak into user scope.
+        let local = entry_with(
+            Some("Local config (private to you in this project)"),
+            &[("LOCAL_ONLY", "v")],
+        );
+        assert_eq!(env_to_keep(&local), EnvToKeep::Unknown);
+        assert_eq!(env_to_keep(&entry_with(None, &[])), EnvToKeep::Unknown);
+        assert!(UNKNOWN_ENV_WARNING.contains("not carried over"));
     }
 
     #[test]
