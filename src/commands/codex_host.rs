@@ -497,10 +497,10 @@ pub fn write_with_backup(path: &Path, new_text: &str, timestamp: &str) -> std::i
         }
         None => None,
     };
-    // Replace the link's target, not the link (read_to_string above succeeded, so a
-    // symlink here resolves).
+    // Replace the link's target, not the link. A dangling link (no old content) is
+    // replaced by a regular file.
     let target = match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        Ok(m) if m.file_type().is_symlink() && backup.is_some() => std::fs::canonicalize(path)?,
         _ => path.to_path_buf(),
     };
     let tmp = target.with_extension(format!("toml.tmp-{}", std::process::id()));

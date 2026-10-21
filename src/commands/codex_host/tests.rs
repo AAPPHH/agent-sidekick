@@ -252,6 +252,14 @@ fn writes_keep_the_file_mode_and_follow_symlinks() {
         .is_symlink());
     assert!(read_entry_at(&real).unwrap().is_some());
     assert_eq!(mode(&real), 0o600);
+
+    // A dangling link is replaced by a regular file instead of failing.
+    let dangling = tmp.path().join("dangling-home").join("config.toml");
+    std::fs::create_dir_all(dangling.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("gone.toml"), &dangling).unwrap();
+    register(&dangling, &r, "t5").unwrap();
+    assert!(std::fs::symlink_metadata(&dangling).unwrap().is_file());
+    assert_eq!(mode(&dangling), 0o600);
 }
 
 #[test]
