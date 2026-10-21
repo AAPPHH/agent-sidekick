@@ -198,3 +198,9 @@ State as of 2026-10-21, version 0.2.0.
    repository URL (`OWNER/agent-sidekick` placeholders in `install.sh`, `install.ps1` and the README, plus
    `repository` in Cargo.toml), push, then tag `v0.2.0`. The `ubuntu-24.04-arm` runner is free for public repos only.
 6. **macOS** runtime behaviour (Keychain, process groups): CI only.
+
+## Known flaky tests (Linux, under heavy load)
+
+- `commands::claude_cli::tests::mcp_add_failure_redacts_values` failed once in WSL while two other builds ran in parallel; not reproducible in 21 later runs. Most likely cause: `ETXTBSY` (executing a freshly written script while another test thread forks with the write handle open, rust-lang/rust#114554). The test now retries that transient error.
+- `backends::reach::tests::silent_server_times_out` failed once at the `contains("timed out")` assertion under the same load; the detail text was not captured and it did not reproduce. If it recurs, capture the `Reachability` debug output from the assertion message before changing the test.
+

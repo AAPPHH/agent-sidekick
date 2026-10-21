@@ -478,9 +478,18 @@ mod tests {
             p
         };
         let env = [pair("MY_KEY", "topsecretvalue123")];
-        let err = mcp_add(&fake, Path::new("/c"), Path::new("/x"), &env)
-            .unwrap_err()
-            .to_string();
+        // On Linux a freshly written script can briefly fail with ETXTBSY when another test
+        // thread forks while the write handle is open; retry that transient error.
+        let mut err = String::new();
+        for _ in 0..20 {
+            err = mcp_add(&fake, Path::new("/c"), Path::new("/x"), &env)
+                .unwrap_err()
+                .to_string();
+            if !err.contains("Text file busy") && !err.contains("os error 26") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         assert!(err.contains("failed"), "{err}");
         assert!(err.contains("MY_KEY="), "{err}");
         assert!(!err.contains("topsecretvalue123"), "{err}");
