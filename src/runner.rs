@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-use crate::redact::redact;
+use crate::redact::Secrets;
 use crate::token::Token;
 
 /// Number of trailing characters of output returned to the caller.
@@ -82,12 +82,86 @@ pub struct RunRequest {
     pub timeout: Duration,
 }
 
+/// The claude-oauth case of v0.1: one claude executable, one OAuth token. Kept as a
+/// convenience wrapper around [`Launch`] (see [`run`]).
 #[derive(Debug, Clone)]
 pub struct RunContext {
     pub claude: PathBuf,
     pub token: Token,
     pub agent_config_dir: PathBuf,
     pub logs_dir: PathBuf,
+}
+
+impl RunContext {
+    /// The [`Launch`] for `claude -p` with this context's token and config dir.
+    pub fn launch(&self, req: &RunRequest) -> Launch {
+        let env = build_env(std::env::vars_os(), &self.token, &self.agent_config_dir);
+        let mut header = Vec::new();
+        if env.iter().any(|(k, _)| same_env_name(k, BASE_URL_ENV)) {
+            tracing::warn!(
+                "{BASE_URL_ENV} is inherited from the server environment; the agent's requests go to that endpoint"
+            );
+            header.push(base_url_warning());
+        }
+        claude_launch(
+            &self.claude,
+            req,
+            env,
+            Secrets::new([self.token.expose()]),
+            header,
+        )
+    }
+}
+
+/// Everything needed to start one delegated run, independent of the backend type.
+/// Built by the backend layer; [`run_launch`] only executes it.
+#[derive(Debug, Clone)]
+pub struct Launch {
+    /// Executable to start (absolute path, or a name resolved by the OS).
+    pub program: PathBuf,
+    /// Complete argument list (without the program). No shell is involved.
+    pub args: Vec<OsString>,
+    /// Complete child environment; the inherited environment is cleared first.
+    pub env: Vec<(OsString, OsString)>,
+    /// Text written to the child's stdin, which is then closed. `None`: stdin is null.
+    pub stdin: Option<String>,
+    /// Values redacted from the log header, the output, the log file and the tail.
+    pub secrets: Secrets,
+    /// Extra lines for the log header (without the leading `# `), e.g. backend name,
+    /// prompt delivery, warnings. Redacted with `secrets` as well.
+    pub header: Vec<String>,
+}
+
+/// [`Launch`] for `claude -p`: [`build_args`], prompt via stdin when needed (see
+/// [`prompt_via_stdin`]). Adds `program` and `prompt delivery` header lines.
+pub fn claude_launch(
+    claude: &Path,
+    req: &RunRequest,
+    env: Vec<(OsString, OsString)>,
+    secrets: Secrets,
+    mut header: Vec<String>,
+) -> Launch {
+    let batch = crate::locate::is_batch_script(claude);
+    let delivery = prompt_via_stdin(batch, &req.prompt);
+    let mut args = build_args(req);
+    let stdin = delivery.map(|_| {
+        // Drop the trailing `-- <prompt>`; claude -p reads the prompt from stdin.
+        args.truncate(args.len() - 2);
+        req.prompt.clone()
+    });
+    header.push(format!("program: {}", claude.display()));
+    header.push(format!(
+        "prompt delivery: {}",
+        delivery.unwrap_or("argument")
+    ));
+    Launch {
+        program: claude.to_path_buf(),
+        args,
+        env,
+        stdin,
+        secrets,
+        header,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -269,12 +343,14 @@ fn straddling(buf: &[u8], cut: usize, pat: &[u8]) -> Option<usize> {
 /// can then be redacted on its own: no secret crosses the cut. (An `sk-ant-` token whose
 /// body continues past the cut is handled by [`ChunkRedactor`].) Returns `buf.len()` if no
 /// such point exists (pathological input); correctness of the split is then best effort.
-fn safe_cut(buf: &[u8], secret: &[u8]) -> usize {
+fn safe_cut(buf: &[u8], secrets: &[String]) -> usize {
     let mut cut = buf.len();
     loop {
         let before = cut;
-        if let Some(o) = straddling(buf, cut, secret) {
-            cut = o;
+        for secret in secrets {
+            if let Some(o) = straddling(buf, cut, secret.as_bytes()) {
+                cut = o;
+            }
         }
         if let Some(o) = straddling(buf, cut, TOKEN_PATTERN_PREFIX) {
             cut = o;
@@ -313,7 +389,7 @@ fn safe_cut(buf: &[u8], secret: &[u8]) -> usize {
 /// Turns raw output pieces into redacted text. Pieces are whole lines, or cuts of an
 /// over-long line made at [`safe_cut`] points.
 struct ChunkRedactor {
-    token: Token,
+    secrets: Secrets,
     /// The previous piece ended inside an `sk-ant-…` token: drop its continuation.
     in_pattern_token: bool,
 }
@@ -337,7 +413,7 @@ impl ChunkRedactor {
                 }
             }
         }
-        let mut text = redact(&String::from_utf8_lossy(piece), Some(self.token.expose()));
+        let mut text = self.secrets.redact(&String::from_utf8_lossy(piece));
         if line_end && text.ends_with("\r\n") {
             text.truncate(text.len() - 2);
             text.push('\n');
@@ -349,21 +425,21 @@ impl ChunkRedactor {
 /// Reads `r` line by line (lossy UTF-8), redacts each line and appends it to the sink.
 /// Lines longer than [`PUMP_CHUNK_BYTES`] are flushed in pieces cut at safe points, so the
 /// memory used per reader stays bounded and a token is never split before redaction.
-async fn pump(r: impl AsyncRead + Unpin, sink: SharedSink, token: Token) {
-    pump_chunked(r, sink, token, PUMP_CHUNK_BYTES).await;
+async fn pump(r: impl AsyncRead + Unpin, sink: SharedSink, secrets: Secrets) {
+    pump_chunked(r, sink, secrets, PUMP_CHUNK_BYTES).await;
 }
 
 /// [`pump`] with a configurable piece size; returns the largest number of bytes buffered.
 async fn pump_chunked(
     r: impl AsyncRead + Unpin,
     sink: SharedSink,
-    token: Token,
+    secrets: Secrets,
     cap: usize,
 ) -> usize {
     let mut r = BufReader::new(r);
     let mut pending: Vec<u8> = Vec::new();
     let mut redactor = ChunkRedactor {
-        token: token.clone(),
+        secrets: secrets.clone(),
         in_pattern_token: false,
     };
     let mut max_pending = 0;
@@ -388,7 +464,7 @@ async fn pump_chunked(
             pending.clear();
         } else if pending.len() >= cap {
             // `safe_cut` returns at least 1, so less than `cap` bytes stay buffered.
-            let cut = safe_cut(&pending, token.expose().as_bytes());
+            let cut = safe_cut(&pending, secrets.values());
             let text = redactor.text(&pending[..cut], false);
             lock(&sink).push(&text);
             pending.drain(..cut);
@@ -873,15 +949,16 @@ fn command_line_too_long(e: &std::io::Error) -> bool {
 fn spawn_error(path: &Path, batch: bool, e: std::io::Error) -> RunError {
     let reason = if batch && e.kind() == std::io::ErrorKind::InvalidInput {
         format!(
-            "{e}; the model or allowed_tools contain characters cmd.exe cannot pass to a \
-             .cmd/.bat script. Set {} to the path of claude.exe instead",
+            "{e}; the arguments contain characters cmd.exe cannot pass to a .cmd/.bat \
+             script. For claude, set {} to the path of claude.exe; for command backends use \
+             prompt_via_stdin or point the command at an .exe",
             crate::locate::ENV_CLAUDE
         )
     } else if command_line_too_long(&e) {
         format!(
             "{e}; the command line is too long for the operating system. Prompts over \
-             {PROMPT_STDIN_THRESHOLD} characters already go via stdin, so shorten the model \
-             or allowed_tools"
+             {PROMPT_STDIN_THRESHOLD} characters already go via stdin for claude backends, \
+             so shorten the other arguments (or use prompt_via_stdin for command backends)"
         )
     } else {
         e.to_string()
@@ -892,46 +969,38 @@ fn spawn_error(path: &Path, batch: bool, e: std::io::Error) -> RunError {
     }
 }
 
-fn header(
-    ctx: &RunContext,
-    req: &RunRequest,
-    started: &str,
-    delivery: &str,
-    base_url_inherited: bool,
-) -> String {
+/// Header line used when `ANTHROPIC_BASE_URL` leaks into a claude-oauth run.
+fn base_url_warning() -> String {
+    format!(
+        "warning: {BASE_URL_ENV} is inherited from the server environment; \
+         claude sends its requests (with the agent token) to that endpoint"
+    )
+}
+
+fn header(launch: &Launch, req: &RunRequest, started: &str) -> String {
     let tools = req
         .allowed_tools
         .as_ref()
         .map_or_else(|| "(default)".to_owned(), |t| t.join(" "));
-    let warning = if base_url_inherited {
-        format!(
-            "# warning: {BASE_URL_ENV} is inherited from the server environment; \
-             claude sends its requests (with the agent token) to that endpoint\n"
-        )
-    } else {
-        String::new()
-    };
+    let extra: String = launch.header.iter().map(|l| format!("# {l}\n")).collect();
     let text = format!(
         "# agent-sidekick run\n\
          # started (UTC): {started}\n\
-         # claude: {}\n\
+         {extra}\
          # cwd: {}\n\
          # max_turns: {}\n\
          # model: {}\n\
          # allowed_tools: {tools}\n\
          # timeout: {}s\n\
-         {warning}\
-         # prompt delivery: {delivery}\n\
          # prompt:\n{}\n\
          # ---- output (stdout+stderr) ----\n",
-        ctx.claude.display(),
         req.cwd.display(),
         req.max_turns,
         req.model.as_deref().unwrap_or("(default)"),
         req.timeout.as_secs(),
         req.prompt,
     );
-    redact(&text, Some(ctx.token.expose()))
+    launch.secrets.redact(&text)
 }
 
 /// How the wait for claude ended.
@@ -950,37 +1019,30 @@ pub async fn run(
     req: RunRequest,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<RunOutcome, RunError> {
+    let launch = ctx.launch(&req);
+    run_launch(launch, req, &ctx.logs_dir, cancel).await
+}
+
+/// Execute `launch` for `req` (cwd, timeout, and the header fields). Output goes to
+/// `<logs_dir>/<timestamp>-<short-id>.log`; see [`run`] for the cancellation semantics.
+pub async fn run_launch(
+    launch: Launch,
+    req: RunRequest,
+    logs_dir: &Path,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<RunOutcome, RunError> {
     if !req.cwd.is_dir() {
         return Err(RunError::CwdMissing(req.cwd));
     }
-    std::fs::create_dir_all(&ctx.logs_dir).map_err(|e| io_err("creating logs dir", e))?;
+    std::fs::create_dir_all(logs_dir).map_err(|e| io_err("creating logs dir", e))?;
     let now = chrono::Utc::now();
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let log_path = ctx
-        .logs_dir
-        .join(format!("{}-{}.log", now.format("%Y%m%d-%H%M%S"), &id[..8]));
+    let log_path = logs_dir.join(format!("{}-{}.log", now.format("%Y%m%d-%H%M%S"), &id[..8]));
     let mut file = File::create(&log_path).map_err(|e| io_err("creating log file", e))?;
 
-    let batch = crate::locate::is_batch_script(&ctx.claude);
-    let stdin_delivery = prompt_via_stdin(batch, &req.prompt);
-    let env = build_env(std::env::vars_os(), &ctx.token, &ctx.agent_config_dir);
-    let base_url_inherited = env.iter().any(|(k, _)| same_env_name(k, BASE_URL_ENV));
-    if base_url_inherited {
-        tracing::warn!(
-            "{BASE_URL_ENV} is inherited from the server environment; the agent's requests go to that endpoint"
-        );
-    }
-    file.write_all(
-        header(
-            ctx,
-            &req,
-            &now.to_rfc3339(),
-            stdin_delivery.unwrap_or("argument"),
-            base_url_inherited,
-        )
-        .as_bytes(),
-    )
-    .map_err(|e| io_err("writing log file", e))?;
+    let batch = crate::locate::is_batch_script(&launch.program);
+    file.write_all(header(&launch, &req, &now.to_rfc3339()).as_bytes())
+        .map_err(|e| io_err("writing log file", e))?;
 
     if cancel.is_cancelled() {
         let _ = writeln!(file, "{CANCELLED_BEFORE_START_MSG}");
@@ -995,14 +1057,16 @@ pub async fn run(
         });
     }
 
-    let mut args = build_args(&req);
-    // Drop the trailing `-- <prompt>` and send the prompt via stdin instead.
-    let stdin_prompt = stdin_delivery.map(|_| {
-        args.truncate(args.len() - 2);
-        req.prompt.clone()
-    });
+    let Launch {
+        program,
+        args,
+        env,
+        stdin: stdin_prompt,
+        secrets,
+        header: _,
+    } = launch;
 
-    let mut cmd = Command::new(&ctx.claude);
+    let mut cmd = Command::new(&program);
     cmd.args(&args)
         .env_clear()
         .envs(env)
@@ -1026,7 +1090,7 @@ pub async fn run(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let err = spawn_error(&ctx.claude, batch, e);
+            let err = spawn_error(&program, batch, e);
             let _ = writeln!(file, "[agent-sidekick] {err}");
             return Err(err);
         }
@@ -1052,10 +1116,10 @@ pub async fn run(
     }));
     let mut readers: Vec<JoinHandle<()>> = Vec::new();
     if let Some(out) = child.stdout.take() {
-        readers.push(tokio::spawn(pump(out, sink.clone(), ctx.token.clone())));
+        readers.push(tokio::spawn(pump(out, sink.clone(), secrets.clone())));
     }
     if let Some(err) = child.stderr.take() {
-        readers.push(tokio::spawn(pump(err, sink.clone(), ctx.token.clone())));
+        readers.push(tokio::spawn(pump(err, sink.clone(), secrets.clone())));
     }
 
     let ended = tokio::select! {
@@ -1140,6 +1204,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redact::redact;
 
     fn req(model: Option<&str>, tools: Option<Vec<&str>>, prompt: &str) -> RunRequest {
         RunRequest {
@@ -1315,23 +1380,50 @@ mod tests {
     }
 
     #[test]
-    fn header_warns_about_inherited_base_url_without_value() {
-        let ctx = RunContext {
-            claude: PathBuf::from("claude"),
-            token: Token::new("secret-token-value"),
-            agent_config_dir: PathBuf::from("/a"),
-            logs_dir: PathBuf::from("/l"),
-        };
-        let r = req(None, None, "hi");
-        let h = header(&ctx, &r, "now", "argument", true);
+    fn header_contains_launch_lines_and_redacts_secrets() {
+        let r = req(None, None, "hi secret-token-value");
+        let mut launch = claude_launch(
+            Path::new("claude"),
+            &r,
+            Vec::new(),
+            Secrets::new(["secret-token-value"]),
+            vec![base_url_warning()],
+        );
+        let h = header(&launch, &r, "now");
         assert!(
             h.contains("# warning: ANTHROPIC_BASE_URL is inherited"),
             "{h}"
         );
-        assert!(h.contains("# prompt delivery: argument"));
-        let h = header(&ctx, &r, "now", "stdin (batch script)", false);
+        assert!(h.contains("# prompt delivery: argument"), "{h}");
+        assert!(h.contains("# program: claude"), "{h}");
+        assert!(!h.contains("secret-token-value"), "{h}");
+        launch.header = vec!["backend: local (claude-endpoint)".into()];
+        let h = header(&launch, &r, "now");
         assert!(!h.contains("warning"));
-        assert!(h.contains("# prompt delivery: stdin (batch script)"));
+        assert!(h.contains("# backend: local (claude-endpoint)"));
+    }
+
+    #[test]
+    fn oauth_context_launch_sets_env_and_header() {
+        let ctx = RunContext {
+            claude: PathBuf::from("claude.cmd"),
+            token: Token::new("sk-ant-oat01-ctxsecret"),
+            agent_config_dir: PathBuf::from("/agent"),
+            logs_dir: PathBuf::from("/l"),
+        };
+        let l = ctx.launch(&req(None, None, "do it"));
+        assert_eq!(
+            get(&l.env, "CLAUDE_CODE_OAUTH_TOKEN"),
+            ["sk-ant-oat01-ctxsecret"]
+        );
+        // A .cmd shim gets the prompt via stdin, without `-- <prompt>`.
+        assert_eq!(l.stdin.as_deref(), Some("do it"));
+        assert_eq!(strs(&l.args).last(), Some(&"7"));
+        assert!(l
+            .header
+            .iter()
+            .any(|h| h == "prompt delivery: stdin (batch script)"));
+        assert_eq!(l.secrets.values(), ["sk-ant-oat01-ctxsecret"]);
     }
 
     #[test]
@@ -1376,7 +1468,7 @@ mod tests {
 
     #[test]
     fn safe_cut_respects_tokens_utf8_and_crlf() {
-        let secret = b"SECRET";
+        let secret = &["SECRET".to_owned()];
         // Ends with a proper prefix of the secret.
         assert_eq!(safe_cut(b"abc SEC", secret), 4);
         // Ends with a proper prefix of the sk-ant- pattern.
@@ -1434,7 +1526,8 @@ mod tests {
         for cap in 30..120 {
             let dir = tempfile::tempdir().unwrap();
             let sink = mem_sink(dir.path());
-            let max = pump_chunked(input.as_bytes(), sink.clone(), Token::new(token), cap).await;
+            let max =
+                pump_chunked(input.as_bytes(), sink.clone(), Secrets::new([token]), cap).await;
             assert!(max <= cap, "cap {cap}: buffered {max}");
             let mut s = lock(&sink);
             s.file.flush().unwrap();
@@ -1463,7 +1556,13 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let sink = mem_sink(dir.path());
-        let max = pump_chunked(&data[..], sink.clone(), Token::new(token), PUMP_CHUNK_BYTES).await;
+        let max = pump_chunked(
+            &data[..],
+            sink.clone(),
+            Secrets::new([token]),
+            PUMP_CHUNK_BYTES,
+        )
+        .await;
         assert!(max <= PUMP_CHUNK_BYTES, "buffered {max}");
         let s = lock(&sink);
         assert!(s.tail.len() <= 2 * MEM_TAIL_BYTES + PUMP_CHUNK_BYTES);
