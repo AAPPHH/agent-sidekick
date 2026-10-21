@@ -198,3 +198,98 @@ State as of 2026-10-21, version 0.2.0.
    repository URL (`OWNER/agent-sidekick` placeholders in `install.sh`, `install.ps1` and the README, plus
    `repository` in Cargo.toml), push, then tag `v0.2.0`. The `ubuntu-24.04-arm` runner is free for public repos only.
 6. **macOS** runtime behaviour (Keychain, process groups): CI only.
+
+## Distribution (release, install, plugin, update)
+
+Owner decision: `Cargo.toml` has `repository = "https://github.com/AAPPHH/agent-sidekick"` (git user AAPPHH). It is
+the only place to change the owner/repository. `scripts/render-installers.sh` reads it (plain `sed`, no cargo
+needed) and writes release copies of `install.sh` / `install.ps1` with the placeholder `OWNER/agent-sidekick`
+replaced; the release workflow attaches those copies. The source copies keep the placeholder and refuse to run
+without `AGENT_SIDEKICK_REPO` or `AGENT_SIDEKICK_INSTALL_BASE_URL`, with an error naming both. This supersedes the
+"Open points" item about setting the URL in four places; the README install URLs name AAPPHH directly (docs only).
+
+Targets and asset names (one archive per target, `agent-sidekick-<target-triple>.<ext>`, files at the archive root):
+
+| Asset | Notes |
+|---|---|
+| `agent-sidekick-x86_64-unknown-linux-musl.tar.gz` | static, `ubuntu-latest` + `musl-tools` |
+| `agent-sidekick-aarch64-unknown-linux-musl.tar.gz` | static, native `ubuntu-24.04-arm` runner + `musl-tools` |
+| `agent-sidekick-x86_64-pc-windows-msvc.zip` | static CRT (`.cargo/config.toml`), so no VC++ Redistributable is needed |
+| `install.sh`, `install.ps1` | repository filled in |
+| `SHA256SUMS` | `<sha256>  <file>` for all of the above, LF, no BOM |
+
+- **musl rather than gnu on Linux.** keyring 4.2 on Linux uses `zbus-secret-service-keyring-store`, i.e. `zbus`
+  (a pure-Rust D-Bus client) plus RustCrypto (`aes`, `cbc`, `hkdf`, `sha2`). There is no `libdbus-sys` or openssl in
+  `Cargo.lock`. The only C code is `ring` (rustls), which builds with `musl-gcc` (`CC_<target>=musl-gcc` is set in
+  the workflows). A static binary runs on any distribution and glibc version (old LTS, Alpine, containers). At
+  runtime the Secret Service still needs a session D-Bus with a secret service (GNOME Keyring/KWallet); without
+  one the existing token-file fallback applies, the same as for a gnu build.
+- **macOS** (`aarch64-apple-darwin`): built in a separate non-blocking job (`continue-on-error`, not in the publish
+  job's `needs`). It is uploaded only as a workflow artifact, not as a release asset. `install.sh` on Darwin
+  stops with a hint to `cargo install --locked --git ...`. To publish it later, add it to the publish job and drop
+  the `rm -f ./*apple-darwin*`; `install.sh` would then need the Darwin branch mapping to `<arch>-apple-darwin`.
+- The x86_64 Darwin and Windows ARM64 builds are dropped. Windows ARM64 runs the x86_64 build under emulation.
+- `release.yml` first checks that the tag equals `v` + the Cargo.toml version (`cargo metadata`) and that the
+  repository URL can be rendered, then builds. SHA256SUMS is recomputed in the publish job over the downloaded
+  archives plus the rendered scripts.
+- Packaging is in `scripts/package.sh` (tar.gz) and `scripts/package.ps1` (zip). Both write
+  `agent-sidekick-<target>.<ext>` and add or replace its line in `<out>/SHA256SUMS`. `release.yml` and the CI
+  install dry-run call the same scripts.
+
+Install scripts (`install.sh` POSIX sh, `install.ps1` for Windows PowerShell 5.1+):
+
+- Environment: `VERSION` (tag such as `v0.3.0`; `0.3.0` also works; default latest),
+  `AGENT_SIDEKICK_INSTALL_DIR` (default `~/.local/bin` or `%LOCALAPPDATA%\Programs\agent-sidekick`),
+  `AGENT_SIDEKICK_INSTALL_BASE_URL` (a URL or a local directory that holds the archive and SHA256SUMS; it takes
+  precedence over `VERSION`/repo; it is the test hook used by CI), `AGENT_SIDEKICK_REPO` (`owner/name`; the
+  former generic `REPO` was renamed because the name is too generic), `AGENT_SIDEKICK_TARGET` (override the detected
+  triple; test hook, e.g. to install a gnu build in WSL without musl-gcc), `AGENT_SIDEKICK_NO_SETUP=1`,
+  `AGENT_SIDEKICK_NO_MODIFY_PATH=1`.
+- Order: fetch the archive and SHA256SUMS → compare hashes (nothing is installed on a mismatch) → unpack → install →
+  run `<installed> --version` as a smoke test → PATH → `setup` or a hint.
+- `install.sh`: all logic sits in `main()`, called on the last line, so a truncated `curl | sh` download cannot
+  run half a script. Questions and `setup` read from `/dev/tty`, because stdin is the script. "Interactive" means
+  `/dev/tty` can be opened (it fails without a controlling terminal, e.g. in CI). Linux always uses the musl asset.
+  Upgrades copy to `.agent-sidekick.new` and then `mv`, which works atomically even while the binary is running.
+- PATH on Linux: rc file from `$SHELL` (bash → `~/.bashrc`, zsh → `${ZDOTDIR:-~}/.zshrc`, fish →
+  `~/.config/fish/config.fish` with `fish_add_path`, otherwise `~/.profile`). The script prints the line and
+  asks y/N only with a tty and without `NO_MODIFY_PATH`. It never writes unasked and skips the question if the
+  line is already there.
+- `install.ps1`: the body runs in `& { ... }` so `irm | iex` does not leak `$ErrorActionPreference` or variables
+  into the caller's session. Errors are `throw`n, never `exit` (that would close the user's window; with
+  `powershell -File` an uncaught throw still gives exit code 1). The PSScriptAnalyzer suppression
+  `PSAvoidUsingWriteHost` (with justification) sits on a script-level `param()`. PSSA ignores it on the nested
+  script block's `param()`, as tested with PSSA 1.25. A top-level `param()` is accepted by `iex` (tested on 5.1).
+- User PATH on Windows: the spec says `[Environment]::SetEnvironmentVariable(...,'User')`. The script instead reads
+  and writes the raw `HKCU\Environment\Path` value (REG_EXPAND_SZ, `DoNotExpandEnvironmentNames`), so existing
+  `%VAR%` entries are not expanded and frozen. Duplicates are detected after expansion, case-insensitively and
+  ignoring trailing `\`. A dummy `SetEnvironmentVariable(...,'User')` set/unset broadcasts WM_SETTINGCHANGE. The
+  current session's `$env:Path` is also updated. `NO_MODIFY_PATH=1` skips both.
+- Locked exe on Windows: if overwriting fails (a running MCP server), the old exe is renamed to
+  `agent-sidekick.exe.old` (Windows allows renaming a running image) and the new one is copied. The script tells
+  the user to reload VS Code. A stale `.old` is deleted on the next run when it is no longer locked.
+- Interactive on Windows = `[Environment]::UserInteractive -and -not [Console]::IsInputRedirected`. `irm | iex`
+  does not redirect stdin, so setup runs in a normal console.
+
+CI (`ci.yml`): `lint-scripts` (shellcheck `--shell=sh` on the source and rendered `install.sh`, plus
+`scripts/*.sh`); `lint-powershell` (PSScriptAnalyzer on Windows PowerShell 5.1, fails on any Error/Warning);
+`install-dry-run` on ubuntu (musl build, `sh < install.sh` like `curl | sh`, running under dash) and windows
+(`Get-Content -Raw | iex` in powershell 5.1). Each installs twice from the local dist dir into `$RUNNER_TEMP`, checks
+`--version` against Cargo.toml, checks that the user PATH is unchanged (Windows), and checks that a tampered
+SHA256SUMS is rejected and nothing gets installed.
+
+Verified locally (2026-10-21): shellcheck 0.11 (via `shellcheck-py`) is clean on `install.sh` (`-s sh`) and on
+`scripts/*.sh`. PSScriptAnalyzer 1.25 reports 0 findings on `install.ps1` and `scripts/package.ps1`.
+actionlint 1.7.12 and `yaml.safe_load` pass on both workflows. Windows: release exe built with static CRT (imports
+no vcruntime), `package.ps1` run, then `Get-Content -Raw install.ps1 | iex` in PowerShell 5.1 into a temp dir
+(install, re-install, an exe held open is renamed to `.old` and the stale `.old` is cleaned up on the next run, a
+tampered SHA256SUMS is rejected, the source copy refuses without a base URL, `-File` exits with 1). The user PATH
+stayed unchanged. WSL Ubuntu: a `x86_64-unknown-linux-musl` build (static-pie; linked with plain `gcc` as
+`CC_x86_64_unknown_linux_musl`, since `musl-gcc` is not installed there) was packaged by `package.sh` and installed with
+`sh < install.sh` under dash, with and without a pseudo-tty (`script`). With a throwaway `HOME` the tests covered
+answering y (line appended to `.bashrc`), a re-run (line detected, no question), zsh with answer n (unchanged), fish
+without a tty (line printed only), the checksum mismatch, a missing target, a truncated script (syntax error,
+nothing runs) and a 404 for `VERSION=v0.3.0` (no release yet).
+Not verified: the HKCU PATH write (it would touch the real registry), the interactive `setup` hand-off, the
+aarch64 musl build, and the workflows on GitHub (no remote yet). `ubuntu-24.04-arm` is free only for public
+repositories.
