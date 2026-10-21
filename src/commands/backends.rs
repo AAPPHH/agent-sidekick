@@ -1,0 +1,549 @@
+//! `agent-sidekick backends list|test`: show the configured backends and check them.
+//!
+//! Nothing printed here ever contains a secret: credentials are only described by their
+//! source (env var name, keyring, file), and every free text goes through redaction.
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use anyhow::Result;
+
+use super::claude_cli;
+use crate::backends::{self, Backend, BackendKind, Backends, Reachability};
+use crate::config::Config;
+use crate::redact::redact_all;
+use crate::APP_NAME;
+
+/// Width the DESCRIPTION column is truncated to.
+pub const DESCRIPTION_WIDTH: usize = 60;
+/// At most this many reachability checks run at the same time.
+const CHECK_PARALLELISM: usize = 8;
+
+#[derive(Debug, clap::Args)]
+pub struct BackendsArgs {
+    #[command(subcommand)]
+    pub command: BackendsCommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum BackendsCommand {
+    /// List the configured backends (from config.toml).
+    List {
+        /// Also check every backend's reachability (credential, executable, HTTP probe).
+        #[arg(long)]
+        check: bool,
+    },
+    /// Check one backend in detail; exit code 0 if it is reachable, 1 otherwise.
+    Test {
+        /// Backend name as configured in `[backends.<name>]`.
+        name: String,
+    },
+}
+
+pub fn run(args: BackendsArgs) -> Result<ExitCode> {
+    let (cfg, backends) = match load_backends() {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {}", redact_all(&msg));
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    match args.command {
+        BackendsCommand::List { check } => {
+            let reach = check.then(|| check_all(&backends, cfg.claude_path.as_deref()));
+            print!("{}", format_table(&backends, reach.as_deref()));
+            if check {
+                println!("\nDetails: `{APP_NAME} backends test <name>`.");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        BackendsCommand::Test { name } => test(&cfg, &backends, &name),
+    }
+}
+
+/// config.toml (default location) validated into backends. The error is a user-facing
+/// message; an invalid config is never replaced by defaults here.
+pub(crate) fn load_backends() -> std::result::Result<(Config, Backends), String> {
+    let cfg = Config::load().map_err(|e| format!("config.toml: {e:#}"))?;
+    let backends = backends::resolve(&cfg)
+        .map_err(|e| format!("invalid backend configuration in config.toml:\n{e}"))?;
+    Ok((cfg, backends))
+}
+
+/// Error for an unknown backend name, listing the configured ones.
+pub(crate) fn unknown_backend(name: &str, backends: &Backends) -> String {
+    format!(
+        "unknown backend `{name}`; configured: {}",
+        backends.names().join(", ")
+    )
+}
+
+/// [`backends::check_backend`] for every backend, at most [`CHECK_PARALLELISM`] at a time.
+/// Results are in the order of `backends.iter()`.
+pub(crate) fn check_all(backends: &Backends, claude_path: Option<&Path>) -> Vec<Reachability> {
+    let list: Vec<&Backend> = backends.iter().collect();
+    parallel_map(&list, CHECK_PARALLELISM, |b| {
+        backends::check_backend(b, claude_path)
+    })
+}
+
+/// `f` over `items` on scoped threads, `limit` at a time; keeps the order.
+pub(crate) fn parallel_map<T, R, F>(items: &[T], limit: usize, f: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in items.chunks(limit.max(1)) {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = chunk.iter().map(|item| s.spawn(|| f(item))).collect();
+            for h in handles {
+                match h.join() {
+                    Ok(r) => out.push(r),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+        });
+    }
+    out
+}
+
+/// `text` shortened to `width` characters (ending in `...`), on one line.
+pub fn truncate(text: &str, width: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= width {
+        return one_line;
+    }
+    let keep = width.saturating_sub(3);
+    let mut s: String = one_line.chars().take(keep).collect();
+    s.truncate(s.trim_end().len());
+    s.push_str("...");
+    s
+}
+
+/// The `backends list` table. With `reach` (same order as `backends.iter()`), REACHABLE and
+/// DETAIL columns are added.
+pub fn format_table(backends: &Backends, reach: Option<&[Reachability]>) -> String {
+    let mut header = vec!["NAME", "TYPE", "COST", "DEFAULT", "DESCRIPTION"];
+    if reach.is_some() {
+        header.extend(["REACHABLE", "DETAIL"]);
+    }
+    let mut rows: Vec<Vec<String>> = vec![header.into_iter().map(str::to_owned).collect()];
+    for (i, b) in backends.iter().enumerate() {
+        let mut row = vec![
+            b.name.clone(),
+            b.backend_type().to_string(),
+            b.cost.to_string(),
+            if b.is_default { "*" } else { "" }.to_owned(),
+            truncate(&redact_all(&b.description), DESCRIPTION_WIDTH),
+        ];
+        if let Some(r) = reach.and_then(|r| r.get(i)) {
+            row.push(if r.reachable { "yes" } else { "no" }.to_owned());
+            row.push(redact_all(&r.detail).replace(['\r', '\n'], " "));
+        }
+        rows.push(row);
+    }
+    render_rows(&rows)
+}
+
+/// Left-aligned columns separated by two spaces; the last column is not padded.
+fn render_rows(rows: &[Vec<String>]) -> String {
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..cols)
+        .map(|c| {
+            rows.iter()
+                .filter_map(|r| r.get(c))
+                .map(|s| s.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut out = String::new();
+    for row in rows {
+        let mut line = String::new();
+        for (c, cell) in row.iter().enumerate() {
+            if c + 1 == row.len() {
+                line.push_str(cell);
+            } else {
+                line.push_str(cell);
+                let pad = widths[c] - cell.chars().count() + 2;
+                line.extend(std::iter::repeat_n(' ', pad));
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
+    let Some(backend) = backends.get(name) else {
+        eprintln!("error: {}", unknown_backend(name, backends));
+        return Ok(ExitCode::FAILURE);
+    };
+    let claude_path = cfg.claude_path.as_deref();
+    let mut lines = describe(backend);
+
+    match &backend.kind {
+        BackendKind::ClaudeOauth { .. } | BackendKind::ClaudeEndpoint { .. } => {
+            lines.push(match backends::resolve_program(backend, claude_path) {
+                Ok(claude) => match claude_cli::version(&claude) {
+                    Ok(v) => format!("claude:      {} (version {v})", claude.display()),
+                    Err(e) => format!(
+                        "claude:      {} (`--version` failed: {e:#})",
+                        claude.display()
+                    ),
+                },
+                Err(e) => format!("claude:      not found: {e}"),
+            });
+            let what = if matches!(backend.kind, BackendKind::ClaudeOauth { .. }) {
+                "token:"
+            } else {
+                "key source:"
+            };
+            lines.push(match key_source(backend) {
+                Ok(source) => format!("{what:<13}{source}"),
+                Err(e) => format!("{what:<13}missing: {e}"),
+            });
+        }
+        BackendKind::Command { .. } => {
+            lines.push(match backends::resolve_program(backend, None) {
+                Ok(p) => format!("program:     {}", p.display()),
+                Err(e) => format!("program:     not found: {e}"),
+            });
+        }
+    }
+    if let BackendKind::ClaudeEndpoint { base_url, .. } = &backend.kind {
+        let probe = backends::probe_http(base_url, backends::reach::PROBE_TIMEOUT);
+        lines.push(format!("probe:       {}", probe.detail));
+    }
+
+    let reach = backends::check_backend(backend, claude_path);
+    lines.push(format!(
+        "result:      {} ({})",
+        if reach.reachable {
+            "reachable"
+        } else {
+            "NOT reachable"
+        },
+        reach.detail
+    ));
+    for line in lines {
+        println!("{}", redact_all(&line));
+    }
+    Ok(if reach.reachable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// Where the backend's credential comes from (never the value).
+fn key_source(backend: &Backend) -> std::result::Result<String, String> {
+    if let BackendKind::ClaudeEndpoint {
+        api_key_env: Some(var),
+        ..
+    } = &backend.kind
+    {
+        // Doctor/test run in a terminal; the server reads its own environment.
+        return match std::env::var_os(var).filter(|v| !v.is_empty()) {
+            Some(_) => Ok(format!(
+                "environment variable {var} (set in this terminal; the MCP server needs it in its own environment)"
+            )),
+            None => Err(format!(
+                "environment variable {var} (api_key_env) is not set in this terminal; \
+                 the MCP server needs it in its own environment"
+            )),
+        };
+    }
+    // The credential itself is dropped immediately; only its source is kept.
+    backends::load_credential(backend).map(|(_credential, source)| source)
+}
+
+/// Static facts about a backend (from config.toml; no secrets, no env values).
+pub fn describe(backend: &Backend) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "backend:     {} ({}){}",
+            backend.name,
+            backend.backend_type(),
+            if backend.is_default { ", default" } else { "" }
+        ),
+        format!("description: {}", backend.description),
+        format!("cost:        {}", backend.cost),
+    ];
+    if let Some(n) = backend.max_concurrent {
+        lines.push(format!("max_concurrent: {n}"));
+    }
+    if let Some(m) = &backend.model {
+        lines.push(format!("model:       {m}"));
+    }
+    match &backend.kind {
+        BackendKind::ClaudeOauth { config_dir } => {
+            lines.push(config_dir_line(config_dir));
+        }
+        BackendKind::ClaudeEndpoint {
+            base_url,
+            api_key_env,
+            auth,
+            config_dir,
+        } => {
+            lines.push(config_dir_line(config_dir));
+            lines.push(format!("base_url:    {base_url}"));
+            let auth_name = match auth {
+                backends::EndpointAuth::XApiKey => "x-api-key",
+                backends::EndpointAuth::Bearer => "bearer",
+            };
+            lines.push(format!("auth:        {auth_name} ({})", auth.env_var()));
+            lines.push(match api_key_env {
+                Some(var) => format!("api key:     from environment variable {var}"),
+                None => format!(
+                    "api key:     OS keyring entry endpoint-{} (or its key file in the config directory)",
+                    backend.name
+                ),
+            });
+        }
+        BackendKind::Command {
+            command,
+            prompt_via_stdin,
+        } => {
+            lines.push(format!("command:     {}", quote_template(command)));
+            lines.push(format!("prompt_via_stdin: {prompt_via_stdin}"));
+        }
+    }
+    if !backend.env.is_empty() {
+        let keys: Vec<&str> = backend.env.keys().map(String::as_str).collect();
+        lines.push(format!(
+            "env:         {} (values not shown)",
+            keys.join(", ")
+        ));
+    }
+    if !backend.pass_env.is_empty() {
+        lines.push(format!("pass_env:    {}", backend.pass_env.join(", ")));
+    }
+    lines
+}
+
+fn config_dir_line(dir: &Path) -> String {
+    let state = if dir.is_dir() {
+        ""
+    } else {
+        " (does not exist yet)"
+    };
+    format!("config_dir:  {}{state}", dir.display())
+}
+
+/// `["aider", "--message", "{prompt}"]` as written in config.toml.
+pub fn quote_template(command: &[String]) -> String {
+    let parts: Vec<String> = command
+        .iter()
+        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}")))
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// Config dir of a claude-* backend.
+pub(crate) fn claude_config_dir(backend: &Backend) -> Option<&PathBuf> {
+    match &backend.kind {
+        BackendKind::ClaudeOauth { config_dir }
+        | BackendKind::ClaudeEndpoint { config_dir, .. } => Some(config_dir),
+        BackendKind::Command { .. } => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::backends::{Cost, EndpointAuth};
+
+    pub(crate) fn backend(name: &str, kind: BackendKind, is_default: bool) -> Backend {
+        Backend {
+            name: name.to_owned(),
+            description: format!("description of {name}"),
+            cost: Cost::Free,
+            is_default,
+            max_concurrent: None,
+            model: None,
+            env: BTreeMap::new(),
+            pass_env: Vec::new(),
+            implicit: false,
+            kind,
+        }
+    }
+
+    pub(crate) fn abs(rel: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join("agent-sidekick-cmd-tests")
+            .join(rel)
+    }
+
+    pub(crate) fn oauth(name: &str, is_default: bool) -> Backend {
+        backend(
+            name,
+            BackendKind::ClaudeOauth {
+                config_dir: abs(&format!(".claude-{name}")),
+            },
+            is_default,
+        )
+    }
+
+    pub(crate) fn endpoint(name: &str, api_key_env: Option<&str>, is_default: bool) -> Backend {
+        backend(
+            name,
+            BackendKind::ClaudeEndpoint {
+                base_url: "http://localhost:11434".into(),
+                api_key_env: api_key_env.map(Into::into),
+                auth: EndpointAuth::XApiKey,
+                config_dir: abs(&format!(".claude-sidekick-{name}")),
+            },
+            is_default,
+        )
+    }
+
+    pub(crate) fn command(name: &str, is_default: bool) -> Backend {
+        backend(
+            name,
+            BackendKind::Command {
+                command: vec!["aider".into(), "--message".into(), "{prompt}".into()],
+                prompt_via_stdin: false,
+            },
+            is_default,
+        )
+    }
+
+    /// sidekick (oauth, default), work (oauth), local (endpoint, keyring), envkey (endpoint,
+    /// env var), aider (command).
+    pub(crate) fn sample() -> Backends {
+        Backends::new(vec![
+            oauth("sidekick", true),
+            oauth("work", false),
+            endpoint("local", None, false),
+            endpoint("envkey", Some("MY_KEY"), false),
+            command("aider", false),
+        ])
+    }
+
+    #[test]
+    fn truncation() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exactly10!", 10), "exactly10!");
+        assert_eq!(truncate("a b c d e f g h", 10), "a b c d...");
+        assert_eq!(truncate("line one\nline  two", 40), "line one line two");
+        // Multi-byte characters are counted as characters, not bytes.
+        let t = truncate(&"ä".repeat(70), 60);
+        assert_eq!(t.chars().count(), 60);
+        assert!(t.ends_with("..."));
+    }
+
+    #[test]
+    fn table_lists_backends_sorted_with_default_marker() {
+        let table = format_table(&sample(), None);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 6, "{table}");
+        assert!(lines[0].starts_with("NAME"));
+        assert!(lines[0].ends_with("DESCRIPTION"));
+        assert!(!lines[0].contains("REACHABLE"));
+        let names: Vec<&str> = lines[1..]
+            .iter()
+            .map(|l| l.split_whitespace().next().unwrap())
+            .collect();
+        assert_eq!(names, ["aider", "envkey", "local", "sidekick", "work"]);
+        let sidekick = lines.iter().find(|l| l.starts_with("sidekick")).unwrap();
+        assert!(sidekick.contains("claude-oauth"));
+        assert!(sidekick.contains(" * "), "{sidekick}");
+        let work = lines.iter().find(|l| l.starts_with("work")).unwrap();
+        assert!(!work.contains(" * "), "{work}");
+        // Columns are aligned: DESCRIPTION starts at the same offset everywhere.
+        let col = lines[0].find("DESCRIPTION").unwrap();
+        assert!(sidekick[col..].starts_with("description of sidekick"));
+    }
+
+    #[test]
+    fn table_truncates_and_redacts_and_has_no_secrets() {
+        let mut b = endpoint("local", Some("MY_KEY"), true);
+        b.description = format!(
+            "{} sk-ant-oat01-SECRETSECRET {}",
+            "x".repeat(10),
+            "y".repeat(80)
+        );
+        b.env
+            .insert("SOME_VAR".into(), "env-value-not-shown".into());
+        let backends = Backends::new(vec![b]);
+        let reach = vec![Reachability {
+            reachable: false,
+            detail: "unreachable: leaked sk-ant-api03-abcdefgh\nsecond line".into(),
+        }];
+        let table = format_table(&backends, Some(&reach));
+        assert!(!table.contains("SECRETSECRET"), "{table}");
+        assert!(!table.contains("abcdefgh"), "{table}");
+        assert!(!table.contains("env-value-not-shown"), "{table}");
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "detail newlines must not break the table: {table}"
+        );
+        assert!(lines[0].contains("REACHABLE") && lines[0].ends_with("DETAIL"));
+        assert!(lines[1].contains("...  no "), "{table}");
+        assert!(lines[1].ends_with("unreachable: leaked [REDACTED] second line"));
+        let col = lines[0].find("DESCRIPTION").unwrap();
+        let end = lines[0].find("REACHABLE").unwrap();
+        assert!(end - col <= DESCRIPTION_WIDTH + 2);
+    }
+
+    #[test]
+    fn describe_shows_sources_not_values() {
+        let mut b = endpoint("local", Some("OLLAMA_KEY"), false);
+        b.env
+            .insert("CLAUDE_CODE_ATTRIBUTION_HEADER".into(), "secretish".into());
+        let text = describe(&b).join("\n");
+        assert!(
+            text.contains("base_url:    http://localhost:11434"),
+            "{text}"
+        );
+        assert!(text.contains("x-api-key (ANTHROPIC_API_KEY)"), "{text}");
+        assert!(text.contains("environment variable OLLAMA_KEY"), "{text}");
+        assert!(text.contains("CLAUDE_CODE_ATTRIBUTION_HEADER (values not shown)"));
+        assert!(!text.contains("secretish"), "{text}");
+
+        let text = describe(&endpoint("local", None, false)).join("\n");
+        assert!(text.contains("keyring entry endpoint-local"), "{text}");
+
+        let text = describe(&command("aider", true)).join("\n");
+        assert!(text.contains("aider (command), default"), "{text}");
+        assert!(
+            text.contains(r#"command:     ["aider", "--message", "{prompt}"]"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unknown_backend_lists_names() {
+        let msg = unknown_backend("nope", &sample());
+        assert!(msg.contains("`nope`"));
+        assert!(
+            msg.contains("aider, envkey, local, sidekick, work"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn parallel_map_keeps_order_and_bounds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let running = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..20).collect();
+        let out = parallel_map(&items, 3, |i| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            running.fetch_sub(1, Ordering::SeqCst);
+            i * 2
+        });
+        assert_eq!(out, (0..20).map(|i| i * 2).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::SeqCst) <= 3);
+    }
+}

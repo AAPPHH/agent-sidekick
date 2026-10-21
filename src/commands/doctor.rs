@@ -4,10 +4,12 @@ use std::fmt;
 use std::path::Path;
 use std::process::ExitCode;
 
+use super::backends::{claude_config_dir, parallel_map};
 use super::claude_cli;
+use crate::backends::{self, Backend, BackendKind, Backends, Reachability};
 use crate::config::Config;
 use crate::locate::{self, Located};
-use crate::{paths, token, APP_NAME};
+use crate::{paths, APP_NAME};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -29,29 +31,29 @@ impl fmt::Display for Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     pub status: Status,
-    pub name: &'static str,
+    pub name: String,
     pub detail: String,
     pub next_step: Option<String>,
 }
 
 impl Check {
-    fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+    fn ok(name: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             status: Status::Ok,
-            name,
+            name: name.into(),
             detail: detail.into(),
             next_step: None,
         }
     }
-    fn warn(name: &'static str, detail: impl Into<String>, next: impl Into<String>) -> Self {
+    fn warn(name: impl Into<String>, detail: impl Into<String>, next: impl Into<String>) -> Self {
         Self {
             status: Status::Warn,
-            name,
+            name: name.into(),
             detail: detail.into(),
             next_step: Some(next.into()),
         }
     }
-    fn fail(name: &'static str, detail: impl Into<String>, next: impl Into<String>) -> Self {
+    fn fail(name: impl Into<String>, detail: impl Into<String>, next: impl Into<String>) -> Self {
         Self {
             status: Status::Fail,
             ..Self::warn(name, detail, next)
@@ -69,12 +71,12 @@ fn run_checks() -> Vec<Check> {
     let mut checks = Vec::new();
 
     let (cfg_check, cfg) = check_config();
+    let cfg_valid = cfg_check.status != Status::Fail;
     let claude = locate::find_claude(cfg.claude_path.as_deref());
     checks.push(check_claude(&claude));
-    checks.push(check_token());
     checks.push(check_config_dir());
-    checks.push(check_agent_dir());
     checks.push(cfg_check);
+    checks.extend(check_backends(cfg_valid, &cfg, claude.is_ok()));
     checks.push(check_registration(claude.as_ref().ok()));
     checks.push(check_logs_dir());
     checks
@@ -142,15 +144,6 @@ fn check_claude(claude: &Result<Located, locate::LocateError>) -> Check {
     }
 }
 
-fn check_token() -> Check {
-    const NAME: &str = "OAuth token";
-    match token::load() {
-        Ok((_, source)) => Check::ok(NAME, format!("found in {source}")),
-        Err(token::TokenError::Missing) => Check::fail(NAME, "no token stored", SETUP),
-        Err(e) => Check::fail(NAME, e.to_string(), SETUP),
-    }
-}
-
 /// Meaningful because CLI-mode logging never creates the config dir (see `logging`).
 fn check_config_dir() -> Check {
     match paths::config_dir() {
@@ -169,23 +162,6 @@ fn check_config_dir_at(dir: &Path) -> Check {
         Check::ok(NAME, dir.display().to_string())
     } else {
         Check::fail(NAME, format!("{} does not exist", dir.display()), SETUP)
-    }
-}
-
-fn check_agent_dir() -> Check {
-    const NAME: &str = "agent Claude config dir";
-    match paths::agent_claude_config_dir() {
-        Ok(dir) if dir.is_dir() => Check::ok(NAME, dir.display().to_string()),
-        Ok(dir) => Check::warn(
-            NAME,
-            format!("{} does not exist", dir.display()),
-            format!("{SETUP} (it creates the directory)"),
-        ),
-        Err(e) => Check::warn(
-            NAME,
-            format!("{e:#}"),
-            "set AGENT_SIDEKICK_CLAUDE_CONFIG_DIR",
-        ),
     }
 }
 
@@ -224,6 +200,147 @@ fn check_config_file(path: &Path) -> (Check, Config) {
                 format!("fix or delete {}", path.display()),
             ),
             Config::default(),
+        ),
+    }
+}
+
+const BACKENDS: &str = "backends";
+
+/// The backends summary check plus one check per backend (checked in parallel; each
+/// endpoint probe can take up to 2 s). `cfg_valid`: config.toml loaded without error;
+/// otherwise `cfg` holds defaults and is not resolved (that would report the implicit
+/// backend as if nothing were wrong).
+fn check_backends(cfg_valid: bool, cfg: &Config, claude_found: bool) -> Vec<Check> {
+    if !cfg_valid {
+        return vec![Check::fail(
+            BACKENDS,
+            "not checked: config.toml could not be loaded",
+            "fix config.toml first (see above)",
+        )];
+    }
+    let backends = match backends::resolve(cfg) {
+        Ok(b) => b,
+        Err(e) => return vec![backends_check(&Err(e))],
+    };
+    let mut checks = vec![backends_check(&Ok(backends.clone()))];
+    let list: Vec<&Backend> = backends.iter().collect();
+    let claude_path = cfg.claude_path.as_deref();
+    checks.extend(parallel_map(&list, 8, |b| {
+        // Only the source description is kept; the credential is dropped right here.
+        let credential = backends::load_credential(b).map(|(_credential, source)| source);
+        let reach = backends::check_backend(b, claude_path);
+        let dir_exists = claude_config_dir(b).map(|d| d.is_dir());
+        backend_check(b, claude_found, &credential, &reach, dir_exists)
+    }));
+    checks
+}
+
+/// Summary of the backend configuration (or the validation error).
+fn backends_check(resolved: &Result<Backends, String>) -> Check {
+    match resolved {
+        Err(e) => Check::fail(
+            BACKENDS,
+            format!("invalid configuration:\n{e}"),
+            "fix the [backends] section of config.toml (see the README, section Backends)",
+        ),
+        Ok(backends) => {
+            let names: Vec<String> = backends
+                .iter()
+                .map(|b| {
+                    if b.is_default {
+                        format!("{} (default)", b.name)
+                    } else {
+                        b.name.clone()
+                    }
+                })
+                .collect();
+            let implicit = if backends.iter().any(|b| b.implicit) {
+                "; implicit backend, no [backends] section in config.toml"
+            } else {
+                ""
+            };
+            Check::ok(
+                BACKENDS,
+                format!(
+                    "{} configured: {}{implicit}",
+                    backends.len(),
+                    names.join(", ")
+                ),
+            )
+        }
+    }
+}
+
+/// Status of one backend from the results of [`backends::check_backend`] (`reach`) and
+/// [`backends::load_credential`] (`credential`: source description or error).
+/// - unreachable claude-oauth (no token), missing endpoint key, missing command program,
+///   claude not found: FAIL for the default backend, WARN for the others;
+/// - claude-endpoint server not answering: always WARN (it may be started on demand);
+/// - reachable but the claude-* `config_dir` does not exist: WARN.
+fn backend_check(
+    b: &Backend,
+    claude_found: bool,
+    credential: &Result<String, String>,
+    reach: &Reachability,
+    config_dir_exists: Option<bool>,
+) -> Check {
+    let name = format!("backend `{}`", b.name);
+    let default = if b.is_default { ", default" } else { "" };
+    let detail = format!("{}{default}: {}", b.backend_type(), reach.detail);
+    let setup = format!("run `{APP_NAME} setup --backend {}`", b.name);
+    let severe = |detail: String, next: String| {
+        if b.is_default {
+            Check::fail(name.clone(), detail, next)
+        } else {
+            Check::warn(name.clone(), detail, next)
+        }
+    };
+
+    if reach.reachable {
+        if let (Some(false), Some(dir)) = (config_dir_exists, claude_config_dir(b)) {
+            return Check::warn(
+                name.clone(),
+                format!("{detail}; config_dir {} does not exist", dir.display()),
+                format!("{setup} (it creates the directory)"),
+            );
+        }
+        return Check::ok(name, detail);
+    }
+    let claude_based = !matches!(b.kind, BackendKind::Command { .. });
+    if claude_based && !claude_found {
+        return severe(detail, "fix the claude executable check first".to_owned());
+    }
+    match &b.kind {
+        BackendKind::ClaudeOauth { .. } => severe(detail, setup),
+        BackendKind::ClaudeEndpoint {
+            api_key_env,
+            base_url,
+            ..
+        } => match (credential, api_key_env) {
+            (Err(_), Some(var)) => severe(
+                detail,
+                format!(
+                    "set {var} in the MCP server's environment (e.g. `claude mcp add ... -e {var}=...` \
+                     or the OS) and in this terminal, or remove api_key_env and {setup}"
+                ),
+            ),
+            (Err(_), None) => severe(detail, setup),
+            (Ok(_), _) => Check::warn(
+                name,
+                detail,
+                format!(
+                    "start the server at {base_url} (e.g. `ollama serve` or LM Studio's local \
+                     server); ignore this if it is started on demand"
+                ),
+            ),
+        },
+        BackendKind::Command { command, .. } => severe(
+            detail,
+            format!(
+                "install `{}` or fix PATH / `command` of [backends.{}] in config.toml",
+                command.first().map(String::as_str).unwrap_or(""),
+                b.name
+            ),
         ),
     }
 }
@@ -392,8 +509,171 @@ fn probe_writable(dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::backends::tests::{command, endpoint, oauth, sample};
     use super::*;
     use claude_cli::McpEntry;
+
+    fn reach(reachable: bool, detail: &str) -> Reachability {
+        Reachability {
+            reachable,
+            detail: detail.to_owned(),
+        }
+    }
+
+    #[test]
+    fn backends_summary() {
+        let c = backends_check(&Ok(sample()));
+        assert_eq!(c.status, Status::Ok);
+        assert_eq!(c.name, "backends");
+        assert!(
+            c.detail
+                .contains("5 configured: aider, envkey, local, sidekick (default), work"),
+            "{}",
+            c.detail
+        );
+        let c = backends_check(&Err("backends: two defaults".into()));
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("two defaults"));
+        assert!(c.next_step.unwrap().contains("[backends]"));
+    }
+
+    #[test]
+    fn invalid_config_file_is_not_resolved_to_defaults() {
+        let checks = check_backends(false, &Config::default(), true);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Fail);
+        assert!(
+            checks[0].detail.contains("not checked"),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn oauth_backend_status() {
+        let ok = Ok("OS keyring".to_owned());
+        let missing = Err("No token stored".to_owned());
+        let dflt = oauth("sidekick", true);
+        let other = oauth("work", false);
+
+        let c = backend_check(
+            &dflt,
+            true,
+            &ok,
+            &reach(true, "token from keyring"),
+            Some(true),
+        );
+        assert_eq!(c.status, Status::Ok);
+        assert_eq!(c.name, "backend `sidekick`");
+        assert!(
+            c.detail.starts_with("claude-oauth, default: "),
+            "{}",
+            c.detail
+        );
+
+        let no_token = reach(false, "no token stored; run setup");
+        let c = backend_check(&dflt, true, &missing, &no_token, Some(true));
+        assert_eq!(c.status, Status::Fail);
+        assert!(c
+            .next_step
+            .unwrap()
+            .contains("agent-sidekick setup --backend sidekick"));
+        let c = backend_check(&other, true, &missing, &no_token, Some(true));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.next_step.unwrap().contains("setup --backend work"));
+
+        // Reachable, but the config dir is missing: WARN with setup hint.
+        let c = backend_check(&other, true, &ok, &reach(true, "ok"), Some(false));
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("does not exist"), "{}", c.detail);
+        assert!(c.next_step.unwrap().contains("creates the directory"));
+
+        // claude missing: points to the claude check.
+        let c = backend_check(&dflt, false, &ok, &reach(false, "claude not found"), None);
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.next_step.unwrap().contains("claude executable"));
+    }
+
+    #[test]
+    fn endpoint_backend_status() {
+        let ok = Ok("OS keyring".to_owned());
+        let missing = Err("No API key stored".to_owned());
+        let server_down = reach(false, "unreachable: connection refused");
+
+        // Server down: WARN even for the default backend.
+        for is_default in [true, false] {
+            let b = endpoint("local", None, is_default);
+            let c = backend_check(&b, true, &ok, &server_down, Some(true));
+            assert_eq!(c.status, Status::Warn);
+            let next = c.next_step.unwrap();
+            assert!(next.contains("http://localhost:11434"), "{next}");
+            assert!(next.contains("on demand"), "{next}");
+        }
+
+        // Key missing: FAIL for the default, WARN otherwise.
+        let no_key = reach(false, "no API key stored; run setup");
+        let c = backend_check(
+            &endpoint("local", None, true),
+            true,
+            &missing,
+            &no_key,
+            None,
+        );
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.next_step.unwrap().contains("setup --backend local"));
+        let c = backend_check(
+            &endpoint("local", None, false),
+            true,
+            &missing,
+            &no_key,
+            None,
+        );
+        assert_eq!(c.status, Status::Warn);
+
+        // api_key_env not set: the hint names the variable.
+        let b = endpoint("ollama", Some("OLLAMA_KEY"), false);
+        let c = backend_check(&b, true, &missing, &reach(false, "env var not set"), None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.next_step.unwrap().contains("OLLAMA_KEY"));
+
+        let c = backend_check(&b, true, &ok, &reach(true, "HTTP 200"), Some(true));
+        assert_eq!(c.status, Status::Ok);
+    }
+
+    #[test]
+    fn command_backend_status() {
+        let ok = Ok("none needed".to_owned());
+        let missing = reach(false, "aider not found in PATH");
+        let c = backend_check(&command("aider", false), false, &ok, &missing, None);
+        assert_eq!(c.status, Status::Warn);
+        let next = c.next_step.unwrap();
+        assert!(next.contains("install `aider`"), "{next}");
+        assert!(next.contains("[backends.aider]"), "{next}");
+        let c = backend_check(&command("aider", true), true, &ok, &missing, None);
+        assert_eq!(c.status, Status::Fail);
+        // claude is irrelevant for command backends.
+        let c = backend_check(
+            &command("aider", true),
+            false,
+            &ok,
+            &reach(true, "program"),
+            None,
+        );
+        assert_eq!(c.status, Status::Ok);
+    }
+
+    #[test]
+    fn backend_details_are_redacted_in_the_report() {
+        let c = backend_check(
+            &oauth("work", false),
+            true,
+            &Ok("x".into()),
+            &reach(true, "token sk-ant-oat01-SECRETVALUE1234"),
+            Some(true),
+        );
+        let report = format_report(&[c]);
+        assert!(!report.contains("SECRETVALUE"), "{report}");
+    }
 
     #[test]
     fn report_formatting_and_exit_code() {
