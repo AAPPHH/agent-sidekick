@@ -92,7 +92,15 @@ pub fn check_backend(backend: &Backend, claude_path: Option<&Path>) -> Reachabil
         },
         &|id| crate::token::load_secret(id).map(|(_token, source)| source.to_string()),
         &|name| std::env::var(name).ok(),
-        &resolve_command_program,
+        &|program| {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            super::launch::resolve_command_program(
+                &backend.name,
+                program,
+                std::env::var_os("PATH"),
+                &cwd,
+            )
+        },
         &|url| probe_http(url, PROBE_TIMEOUT),
     )
 }
@@ -174,35 +182,6 @@ fn check_backend_with(
             }
         }
     }
-}
-
-/// `command[0]` of a command backend: an absolute path must be an existing file; anything
-/// else is looked up like a shell would (`which`: PATH, or relative to the cwd if it
-/// contains a path separator).
-fn resolve_command_program(program: &str) -> Result<PathBuf, String> {
-    resolve_command_program_in(
-        program,
-        std::env::var_os("PATH"),
-        std::env::current_dir().ok(),
-    )
-}
-
-fn resolve_command_program_in(
-    program: &str,
-    path_var: Option<std::ffi::OsString>,
-    cwd: Option<PathBuf>,
-) -> Result<PathBuf, String> {
-    let p = Path::new(program);
-    if p.is_absolute() {
-        return if p.is_file() {
-            Ok(p.to_path_buf())
-        } else {
-            Err(format!("program {program} does not exist or is not a file"))
-        };
-    }
-    let cwd = cwd.unwrap_or_else(|| PathBuf::from("."));
-    which::which_in(program, path_var, cwd)
-        .map_err(|_| format!("program `{program}` not found in PATH"))
 }
 
 /// A parsed, credential-free probe URL.
@@ -867,52 +846,5 @@ mod tests {
             &no_probe,
         );
         assert!(!r.reachable);
-    }
-
-    // ----- resolve_command_program_in -----
-
-    fn make_program(dir: &Path) -> (String, PathBuf) {
-        let name = if cfg!(windows) {
-            "fakeagent.exe"
-        } else {
-            "fakeagent"
-        };
-        let path = dir.join(name);
-        std::fs::write(&path, b"").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        (name.to_owned(), path)
-    }
-
-    #[test]
-    fn resolve_absolute_program() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_, path) = make_program(dir.path());
-        let got = resolve_command_program_in(path.to_str().unwrap(), None, None).unwrap();
-        assert_eq!(got, path);
-        let missing = dir.path().join("missing-program");
-        let err = resolve_command_program_in(missing.to_str().unwrap(), None, None).unwrap_err();
-        assert!(err.contains("does not exist"), "{err}");
-        // A directory is not a program.
-        let err = resolve_command_program_in(dir.path().to_str().unwrap(), None, None).unwrap_err();
-        assert!(err.contains("not a file"), "{err}");
-    }
-
-    #[test]
-    fn resolve_program_via_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_, path) = make_program(dir.path());
-        let path_var = Some(dir.path().as_os_str().to_owned());
-        let got =
-            resolve_command_program_in("fakeagent", path_var.clone(), Some(dir.path().into()))
-                .unwrap();
-        assert_eq!(got.canonicalize().unwrap(), path.canonicalize().unwrap());
-        let err =
-            resolve_command_program_in("no-such-agent-xyz", path_var, Some(dir.path().into()))
-                .unwrap_err();
-        assert_eq!(err, "program `no-such-agent-xyz` not found in PATH");
     }
 }

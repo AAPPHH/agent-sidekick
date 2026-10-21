@@ -179,7 +179,12 @@ pub fn resolve_program(backend: &Backend, claude_path: Option<&Path>) -> Result<
 /// `program` absolute -> must be an existing file; relative with a separator -> error
 /// (it would depend on the server's working directory); bare name -> PATH search
 /// (`which`; on Windows PATHEXT applies, so `aider` finds `aider.exe`/`aider.cmd`).
-fn resolve_command_program(
+/// `command[0]` of a command backend. Absolute: must be an existing file. Bare name: looked
+/// up in the absolute entries of `path_var` only — empty or relative PATH entries are
+/// ignored so a program is never picked up from the server's working directory (on Unix,
+/// `which` would otherwise resolve an empty entry against `cwd`). Relative paths with a
+/// separator are rejected for the same reason.
+pub(crate) fn resolve_command_program(
     backend: &str,
     program: &str,
     path_var: Option<OsString>,
@@ -207,9 +212,20 @@ fn resolve_command_program(
              a bare program name that is found in PATH"
         ));
     }
-    let path_var = path_var.unwrap_or_default();
-    which::which_in(program, Some(path_var), cwd)
-        .map_err(|_| format!("backend {backend}: program '{program}' not found in PATH"))
+    let not_found = || format!("backend {backend}: program '{program}' not found in PATH");
+    let dirs: Vec<PathBuf> = path_var
+        .as_deref()
+        .map(|v| {
+            std::env::split_paths(v)
+                .filter(|d| !d.as_os_str().is_empty() && d.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
+    if dirs.is_empty() {
+        return Err(not_found());
+    }
+    let joined = std::env::join_paths(dirs).map_err(|_| not_found())?;
+    which::which_in(program, Some(joined), cwd).map_err(|_| not_found())
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,6 +1451,29 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         p
+    }
+
+    #[test]
+    fn empty_or_relative_path_entries_never_resolve_from_cwd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = if cfg!(windows) {
+            "myagent.exe"
+        } else {
+            "myagent"
+        };
+        touch(dir.path(), file);
+        // The program sits in `cwd`, but PATH only has empty / relative entries.
+        for path in ["", ".", "bin"] {
+            let err =
+                resolve_command_program("a", "myagent", Some(path.into()), dir.path()).unwrap_err();
+            assert!(err.contains("not found in PATH"), "{path:?}: {err}");
+        }
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let other = tempfile::TempDir::new().unwrap();
+        let mixed = format!("{sep}{}{sep}", other.path().display());
+        let err =
+            resolve_command_program("a", "myagent", Some(mixed.into()), dir.path()).unwrap_err();
+        assert!(err.contains("not found in PATH"), "{err}");
     }
 
     #[test]
