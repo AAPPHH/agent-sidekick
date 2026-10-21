@@ -82,3 +82,45 @@ where
 
 /// Upper bound for blocking threads (stdin reader, keyring access) at exit.
 const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    fn setup(args: &[&str]) -> Result<commands::setup::SetupArgs, clap::Error> {
+        let argv = ["agent-sidekick", "setup"].iter().chain(args);
+        match Cli::try_parse_from(argv)?.command {
+            Command::Setup(a) => Ok(a),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_only_parses_and_conflicts() {
+        let a = setup(&["--register-only"]).unwrap();
+        assert!(a.register_only);
+        assert!(!setup(&[]).unwrap().register_only);
+        let a = setup(&["--register-only", "--claude", "/x/claude"]).unwrap();
+        assert!(a.register_only && a.claude.is_some());
+        for other in [
+            &["--backend", "work"][..],
+            &["--token-stdin"][..],
+            &["--no-register"][..],
+        ] {
+            let mut args = vec!["--register-only"];
+            args.extend_from_slice(other);
+            let err = setup(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+        }
+    }
+}

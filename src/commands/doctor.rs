@@ -114,6 +114,8 @@ fn count(checks: &[Check], status: Status) -> usize {
 }
 
 const SETUP: &str = "run `agent-sidekick setup`";
+/// Re-registering keeps the stored tokens and the registration's extra variables.
+const REREGISTER: &str = "run `agent-sidekick setup --register-only`";
 
 fn check_claude(claude: &Result<Located, locate::LocateError>) -> Check {
     const NAME: &str = "claude executable";
@@ -404,7 +406,7 @@ fn registration_check(
                     "{detail}; registered claude path {registered} no longer exists, \
                      so every sidekick_run will fail"
                 ),
-                format!("{SETUP} again"),
+                REREGISTER.to_owned(),
             );
         }
         if let Some(found) = found_claude {
@@ -416,7 +418,7 @@ fn registration_check(
                          but doctor found {}",
                         found.display()
                     ),
-                    format!("{SETUP} again if the server should use {}", found.display()),
+                    format!("{REREGISTER} if the server should use {}", found.display()),
                 );
             }
         }
@@ -429,7 +431,7 @@ fn registration_check(
                     "{detail}; command is {cmd}, but this binary is {}",
                     exe.display()
                 ),
-                format!("{SETUP} again with the binary you want Claude Code to use"),
+                format!("{REREGISTER} with the binary you want Claude Code to use"),
             );
         }
     }
@@ -445,7 +447,7 @@ fn registration_check(
             detail,
             format!(
                 "this entry takes precedence over a user-scope one here; remove it with {}, \
-                 then {SETUP} to register in user scope (all projects)",
+                 then {REREGISTER} to register in user scope (all projects)",
                 claude_cli::remove_hint(entry)
             ),
         );
@@ -603,6 +605,22 @@ mod tests {
         let c = backend_check(&dflt, false, &ok, &reach(false, "claude not found"), None);
         assert_eq!(c.status, Status::Fail);
         assert!(c.next_step.unwrap().contains("claude executable"));
+    }
+
+    /// An api_key_env endpoint whose config dir is missing: the hint names
+    /// `setup --backend`, which (since setup creates the dir for every claude-* backend)
+    /// actually clears the warning.
+    #[test]
+    fn api_key_env_endpoint_missing_config_dir_points_to_setup_backend() {
+        let b = endpoint("envkey", Some("MY_KEY"), false);
+        let ok = Ok("environment variable MY_KEY".to_owned());
+        let c = backend_check(&b, true, &ok, &reach(true, "ok"), Some(false));
+        assert_eq!(c.status, Status::Warn);
+        let next = c.next_step.unwrap();
+        assert!(
+            next.contains("agent-sidekick setup --backend envkey` (it creates the directory)"),
+            "{next}"
+        );
     }
 
     #[test]
@@ -812,7 +830,7 @@ mod tests {
         let c = registration_check(&e, Some(exe), Some(&other));
         assert_eq!(c.status, Status::Fail);
         assert!(c.detail.contains("no longer exists"), "{}", c.detail);
-        assert!(c.next_step.unwrap().contains("setup` again"));
+        assert!(c.next_step.unwrap().contains("setup --register-only`"));
 
         std::fs::write(&registered, "").unwrap();
         // Exists and is the one doctor found: OK.
