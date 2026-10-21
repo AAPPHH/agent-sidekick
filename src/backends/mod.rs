@@ -4,7 +4,8 @@
 //!   (the v0.1 behaviour; implicit backend `sidekick` when config.toml has no `[backends]`).
 //! - `claude-endpoint`: the `claude` CLI against an Anthropic-compatible endpoint
 //!   (`ANTHROPIC_BASE_URL`, e.g. Ollama or LM Studio) with an API key.
-//! - `command`: any other agent CLI, configured as an argument array with placeholders.
+//! - `command`: any other agent CLI, configured as an argument array with placeholders;
+//!   optionally with a stored secret handed over in the variable `secret_env`.
 //!
 //! Submodules: [`resolve`] (config validation), [`launch`] (environment, credentials,
 //! [`crate::runner::Launch`] building), [`reach`] (reachability checks).
@@ -123,6 +124,9 @@ pub struct RawBackend {
     pub command: Option<Vec<String>>,
     /// command: send the prompt on stdin instead of via `{prompt}`.
     pub prompt_via_stdin: Option<bool>,
+    /// command: name of the environment variable that receives the backend's stored secret
+    /// (keyring user `cmd-<name>`, stored with `setup --backend <name>`).
+    pub secret_env: Option<String>,
 }
 
 /// A validated backend.
@@ -157,6 +161,8 @@ pub enum BackendKind {
     Command {
         command: Vec<String>,
         prompt_via_stdin: bool,
+        /// Variable that receives the stored secret ([`crate::token::SecretId::Command`]).
+        secret_env: Option<String>,
     },
 }
 
@@ -170,7 +176,8 @@ impl Backend {
     }
 
     /// The secret this backend reads from the keyring/file store, if any.
-    /// claude-endpoint with `api_key_env` reads the environment instead (`None`).
+    /// claude-endpoint with `api_key_env` reads the environment instead (`None`); a command
+    /// backend has one only with `secret_env`.
     pub fn secret_id(&self) -> Option<crate::token::SecretId> {
         use crate::token::SecretId;
         match &self.kind {
@@ -178,6 +185,10 @@ impl Backend {
             BackendKind::ClaudeEndpoint {
                 api_key_env: None, ..
             } => Some(SecretId::Endpoint(self.name.clone())),
+            BackendKind::Command {
+                secret_env: Some(_),
+                ..
+            } => Some(SecretId::Command(self.name.clone())),
             _ => None,
         }
     }

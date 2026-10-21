@@ -805,26 +805,34 @@ impl SidekickServer {
 
     /// Show the sidekick's state and setup: running and queued runs (global and per backend),
     /// concurrency limits, default limits, which claude executable is used, directories,
-    /// config file and errors, and where each Claude account backend's token comes from
-    /// (never the token itself).
+    /// config file and errors, and where each Claude account backend's token and each command
+    /// backend's secret comes from (never the value itself).
     #[tool]
     async fn sidekick_status(&self) -> Result<CallToolResult, McpError> {
         let claude_cfg = self.state.config.claude_path.clone();
         let located = blocking(move || locate::find_claude(claude_cfg.as_deref())).await;
-        let oauth: Vec<String> = match &self.state.backends {
+        let ids: Vec<SecretId> = match &self.state.backends {
             Ok(b) => b
                 .iter()
-                .filter(|b| b.backend_type() == BackendType::ClaudeOauth)
-                .map(|b| b.name.clone())
+                .filter(|b| {
+                    matches!(
+                        b.kind,
+                        backends::BackendKind::ClaudeOauth { .. }
+                            | backends::BackendKind::Command {
+                                secret_env: Some(_),
+                                ..
+                            }
+                    )
+                })
+                .filter_map(Backend::secret_id)
                 .collect(),
             Err(_) => Vec::new(),
         };
         let tokens = blocking(move || {
-            oauth
-                .into_iter()
-                .map(|name| {
-                    let r = token::load_secret(&SecretId::Oauth(name.clone()));
-                    (name, r)
+            ids.into_iter()
+                .map(|id| {
+                    let r = token::load_secret(&id);
+                    (id, r)
                 })
                 .collect::<Vec<_>>()
         })
@@ -835,7 +843,7 @@ impl SidekickServer {
 }
 
 type LocateResult = Result<Result<Located, LocateError>, String>;
-type TokenResults = Result<Vec<(String, Result<(Token, TokenSource), TokenError>)>, String>;
+type TokenResults = Result<Vec<(SecretId, Result<(Token, TokenSource), TokenError>)>, String>;
 
 impl SidekickServer {
     /// One attempt to run `backend`: credentials, program, endpoint probe, launch, permits
@@ -878,7 +886,7 @@ impl SidekickServer {
             Ok(Err(e)) => return Attempt::NotStarted(e),
             Err(e) => return Attempt::NotStarted(format!("preparing the run failed: {e}")),
         };
-        if let Credential::OauthToken(t) | Credential::ApiKey(t) = &cred {
+        if let Some(t) = cred.secret() {
             secrets.push(Secrets::new([t.expose()]));
         }
         let launch = match backends::build_launch(
@@ -1115,25 +1123,31 @@ impl SidekickServer {
             }
             Err(_) => s.push_str("  (none usable: config.toml is invalid)\n"),
         }
-        // Only the source is shown; token values never leave this match.
+        // Only the source is shown; secret values never leave this match.
         match tokens {
             Ok(list) => {
-                for (name, r) in list {
+                for (id, r) in list {
+                    let (what, name) = match &id {
+                        SecretId::Oauth(n) | SecretId::Endpoint(n) => ("token", n),
+                        SecretId::Command(n) => ("secret", n),
+                    };
                     match r {
                         Ok((_, source)) => {
-                            let _ = writeln!(s, "token ({name}): present ({source})");
+                            let _ = writeln!(s, "{what} ({name}): present ({source})");
                         }
                         Err(TokenError::Missing) | Err(TokenError::Empty) => {
-                            let hint = if name == backends::IMPLICIT_BACKEND {
+                            let hint = if id.is_legacy() {
                                 "agent-sidekick setup".to_owned()
                             } else {
                                 format!("agent-sidekick setup --backend {name}")
                             };
-                            let _ =
-                                writeln!(s, "token ({name}): missing - run '{hint}' in a terminal");
+                            let _ = writeln!(
+                                s,
+                                "{what} ({name}): missing - run '{hint}' in a terminal"
+                            );
                         }
                         Err(e) => {
-                            let _ = writeln!(s, "token ({name}): error - {e}");
+                            let _ = writeln!(s, "{what} ({name}): error - {e}");
                         }
                     }
                 }
@@ -1590,6 +1604,7 @@ mod tests {
             backends::BackendKind::Command {
                 command: vec!["/bin/agent".into(), "{prompt}".into()],
                 prompt_via_stdin: false,
+                secret_env: None,
             },
             false,
         )
@@ -1790,13 +1805,27 @@ mod tests {
             Err("stub".into()),
             Ok(vec![
                 (
-                    "sidekick".into(),
+                    SecretId::Oauth("sidekick".into()),
                     Ok((Token::new(secret), TokenSource::Env)),
                 ),
-                ("other".into(), Err(TokenError::Missing)),
+                (SecretId::Oauth("other".into()), Err(TokenError::Missing)),
+                (
+                    SecretId::Command("kic".into()),
+                    Ok((Token::new("cmd-secret-value-123456"), TokenSource::Keyring)),
+                ),
+                (SecretId::Command("aider".into()), Err(TokenError::Missing)),
             ]),
         );
         assert!(!text.contains(secret));
+        assert!(!text.contains("cmd-secret-value"), "{text}");
+        assert!(
+            text.contains("secret (kic): present (OS keyring (service agent-sidekick))"),
+            "{text}"
+        );
+        assert!(
+            text.contains("secret (aider): missing - run 'agent-sidekick setup --backend aider'"),
+            "{text}"
+        );
         assert!(
             text.contains("token (sidekick): present (environment"),
             "{text}"
@@ -1850,6 +1879,7 @@ mod tests {
         b.kind = backends::BackendKind::Command {
             command: vec![missing.to_string_lossy().into_owned(), "{prompt}".into()],
             prompt_via_stdin: false,
+            secret_env: None,
         };
         let server =
             SidekickServer::with_backends(Config::default(), None, Ok(Backends::new(vec![b])));

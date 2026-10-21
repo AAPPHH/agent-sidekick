@@ -334,6 +334,17 @@ fn backend_check(
                 ),
             ),
         },
+        // The program is checked first, so a secret problem is only reported once the
+        // program was found.
+        BackendKind::Command {
+            secret_env: Some(_),
+            ..
+        } if credential.is_err()
+            && (reach.detail.starts_with("no secret stored")
+                || reach.detail.starts_with("cannot read the")) =>
+        {
+            severe(detail, setup)
+        }
         BackendKind::Command { command, .. } => severe(
             detail,
             format!(
@@ -509,7 +520,7 @@ fn probe_writable(dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::backends::tests::{command, endpoint, oauth, sample};
+    use super::super::backends::tests::{command, command_with_secret, endpoint, oauth, sample};
     use super::*;
     use claude_cli::McpEntry;
 
@@ -660,6 +671,47 @@ mod tests {
             None,
         );
         assert_eq!(c.status, Status::Ok);
+    }
+
+    #[test]
+    fn command_backend_with_secret_env_status() {
+        let b = command_with_secret("kic", "OPENAI_API_KEY", false);
+        let stored = Ok("OS keyring (service agent-sidekick)".to_owned());
+        let c = backend_check(
+            &b,
+            false,
+            &stored,
+            &reach(
+                true,
+                "program /usr/bin/aider; secret_env OPENAI_API_KEY from OS keyring",
+            ),
+            None,
+        );
+        assert_eq!(c.status, Status::Ok);
+
+        // Program found, secret missing: setup hint.
+        let missing = Err("No secret stored for backend 'kic'".to_owned());
+        let no_secret = reach(
+            false,
+            "no secret stored for secret_env OPENAI_API_KEY; run `agent-sidekick setup --backend kic`",
+        );
+        let c = backend_check(&b, false, &missing, &no_secret, None);
+        assert_eq!(c.status, Status::Warn);
+        let next = c.next_step.unwrap();
+        assert!(
+            next.contains("agent-sidekick setup --backend kic"),
+            "{next}"
+        );
+
+        // Program missing (checked first): install hint even if the secret is missing too.
+        let c = backend_check(
+            &b,
+            false,
+            &missing,
+            &reach(false, "backend kic: program 'aider' not found in PATH"),
+            None,
+        );
+        assert!(c.next_step.unwrap().contains("install `aider`"));
     }
 
     #[test]

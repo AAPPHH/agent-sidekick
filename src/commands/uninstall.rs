@@ -71,8 +71,8 @@ pub fn run(args: UninstallArgs) -> Result<ExitCode> {
 }
 
 /// Every secret that may be stored for the configured backends, plus the legacy (v0.1)
-/// token, deduplicated. Endpoint keys are included even with `api_key_env` (a key may have
-/// been stored before). If the configuration is invalid, only the legacy secret is known;
+/// token, deduplicated. Endpoint keys are included even with `api_key_env`, command secrets
+/// even without `secret_env` (a secret may have been stored before). If the configuration is invalid, only the legacy secret is known;
 /// the second value is then a warning saying so.
 pub fn secrets_to_delete(resolved: &Result<Backends, String>) -> (Vec<SecretId>, Option<String>) {
     let mut ids = Vec::new();
@@ -83,7 +83,7 @@ pub fn secrets_to_delete(resolved: &Result<Backends, String>) -> (Vec<SecretId>,
                 ids.push(match b.kind {
                     BackendKind::ClaudeOauth { .. } => SecretId::Oauth(b.name.clone()),
                     BackendKind::ClaudeEndpoint { .. } => SecretId::Endpoint(b.name.clone()),
-                    BackendKind::Command { .. } => continue,
+                    BackendKind::Command { .. } => SecretId::Command(b.name.clone()),
                 });
             }
         }
@@ -170,7 +170,9 @@ fn remove_dir(dir: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::backends::tests::{abs, command, endpoint, oauth, sample};
+    use super::super::backends::tests::{
+        abs, command, command_with_secret, endpoint, oauth, sample,
+    };
     use super::*;
 
     #[test]
@@ -190,7 +192,9 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                // aider (command) has none; envkey's key is removed although it uses an env var.
+                // aider's (command) secret is removed although it has no secret_env, and
+                // envkey's key although it uses an env var.
+                SecretId::Command("aider".into()),
                 SecretId::Endpoint("envkey".into()),
                 SecretId::Endpoint("local".into()),
                 SecretId::Oauth("sidekick".into()),
@@ -207,7 +211,11 @@ mod tests {
         let (ids, _) = secrets_to_delete(&Ok(backends));
         assert_eq!(
             ids,
-            vec![SecretId::Oauth("main".into()), SecretId::legacy()]
+            vec![
+                SecretId::Command("aider".into()),
+                SecretId::Oauth("main".into()),
+                SecretId::legacy()
+            ]
         );
 
         let backends = Backends::new(vec![endpoint("sidekick", None, true)]);
@@ -215,6 +223,19 @@ mod tests {
         assert_eq!(
             ids,
             vec![SecretId::Endpoint("sidekick".into()), SecretId::legacy()]
+        );
+    }
+
+    #[test]
+    fn command_secrets_are_removed() {
+        let backends = Backends::new(vec![
+            oauth("sidekick", true),
+            command_with_secret("kic", "OPENAI_API_KEY", false),
+        ]);
+        let (ids, _) = secrets_to_delete(&Ok(backends));
+        assert_eq!(
+            ids,
+            vec![SecretId::Command("kic".into()), SecretId::legacy()]
         );
     }
 

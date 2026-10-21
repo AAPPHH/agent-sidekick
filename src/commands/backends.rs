@@ -215,11 +215,18 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
                 }
             });
         }
-        BackendKind::Command { .. } => {
+        BackendKind::Command { secret_env, .. } => {
             lines.push(match backends::resolve_program(backend, None) {
                 Ok(p) => format!("program:     {}", p.display()),
                 Err(e) => format!("program:     not found: {e}"),
             });
+            if let Some(var) = secret_env {
+                // Only where the value comes from; the value itself is dropped in key_source.
+                lines.push(match key_source(backend) {
+                    Ok(source) => format!("secret:      {var} from {source}"),
+                    Err(e) => format!("secret:      missing: {e}"),
+                });
+            }
         }
     }
     if let (BackendKind::ClaudeEndpoint { base_url, .. }, false) = (&backend.kind, prerequisites_ok)
@@ -317,9 +324,17 @@ pub fn describe(backend: &Backend) -> Vec<String> {
         BackendKind::Command {
             command,
             prompt_via_stdin,
+            secret_env,
         } => {
             lines.push(format!("command:     {}", quote_template(command)));
             lines.push(format!("prompt_via_stdin: {prompt_via_stdin}"));
+            if let Some(var) = secret_env {
+                lines.push(format!(
+                    "secret_env:  {var} (value from OS keyring entry cmd-{} or its key file in \
+                     the config directory; not shown)",
+                    backend.name
+                ));
+            }
         }
     }
     if !backend.env.is_empty() {
@@ -419,6 +434,20 @@ pub(crate) mod tests {
             BackendKind::Command {
                 command: vec!["aider".into(), "--message".into(), "{prompt}".into()],
                 prompt_via_stdin: false,
+                secret_env: None,
+            },
+            is_default,
+        )
+    }
+
+    /// A command backend whose stored secret goes into `var`.
+    pub(crate) fn command_with_secret(name: &str, var: &str, is_default: bool) -> Backend {
+        backend(
+            name,
+            BackendKind::Command {
+                command: vec!["aider".into(), "--message".into(), "{prompt}".into()],
+                prompt_via_stdin: false,
+                secret_env: Some(var.into()),
             },
             is_default,
         )
@@ -528,6 +557,17 @@ pub(crate) mod tests {
             text.contains(r#"command:     ["aider", "--message", "{prompt}"]"#),
             "{text}"
         );
+    }
+
+    #[test]
+    fn describe_command_secret_env_names_variable_only() {
+        let text = describe(&command_with_secret("kic", "OPENAI_API_KEY", false)).join("\n");
+        assert!(
+            text.contains("secret_env:  OPENAI_API_KEY (value from OS keyring entry cmd-kic"),
+            "{text}"
+        );
+        let text = describe(&command("aider", false)).join("\n");
+        assert!(!text.contains("secret_env"), "{text}");
     }
 
     #[test]
