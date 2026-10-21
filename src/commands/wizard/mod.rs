@@ -91,11 +91,15 @@ const INTRO: &str = "Willkommen beim Einrichtungsassistenten von agent-sidekick.
 
 const RESUME: &str = "Führe danach `agent-sidekick setup` erneut aus.";
 
+const DIR_NEXT_STEP: &str = "Ordner konnte nicht angelegt werden. Nächster Schritt:     Zugriffsrechte prüfen, dann `agent-sidekick setup` erneut ausführen";
+
 /// The whole wizard. `Err`: aborted with a message that names the next step.
 pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     p.say(INTRO);
 
-    let cfg_path = s.config_file();
+    let cfg_path = s.config_file().context(
+        "Der Konfigurationsordner kann nicht bestimmt werden. Nächster Schritt:          AGENT_SIDEKICK_CONFIG_DIR auf einen Ordner setzen, dann `agent-sidekick setup` erneut          ausführen",
+    )?;
     let existing = read_existing(&cfg_path)?;
     let claude_path = existing
         .as_ref()
@@ -332,7 +336,7 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     }
 
     // 8. Write.
-    let write_needed = !matches!(&mode, Mode::Merge { text: old, .. } if *old == text);
+    let write_needed = !(merging && sections.is_empty());
     if write_needed {
         write_config(p, s, &cfg_path, &mode, &text)?;
     } else {
@@ -342,9 +346,9 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
         ));
     }
     if let Some(dir) = cfg_path.parent() {
-        s.create_dir(&dir.join("logs"))?;
+        s.create_dir(&dir.join("logs")).context(DIR_NEXT_STEP)?;
     }
-    create_claude_dirs(s, &backends, &add)?;
+    create_claude_dirs(s, &backends, &add).context(DIR_NEXT_STEP)?;
     for (name, id, token) in &secrets {
         let source = s.store_secret(id, token).map_err(|e| {
             anyhow::anyhow!(
@@ -472,7 +476,11 @@ fn offer_install(
     if !p.confirm(&format!("{what} jetzt installieren?"), true)? {
         return Ok(false);
     }
-    let ok = s.run_visible(&inv)?;
+    let ok = s.run_visible(&inv).with_context(|| {
+        format!(
+            "npm konnte nicht gestartet werden. Nächster Schritt: `npm install -g {package}`              selbst im Terminal ausführen. {RESUME}"
+        )
+    })?;
     if !ok {
         let extra = match s.os() {
             Os::Unix => {

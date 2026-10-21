@@ -176,7 +176,7 @@ impl Fake {
     }
 
     fn cfg(&self) -> PathBuf {
-        self.config_file()
+        self.config_file().unwrap()
     }
 
     fn written(&self) -> String {
@@ -215,8 +215,8 @@ impl System for Fake {
     fn os(&self) -> Os {
         self.os
     }
-    fn config_file(&self) -> PathBuf {
-        self.dir.path().join("cfg").join("config.toml")
+    fn config_file(&self) -> Result<PathBuf> {
+        Ok(self.dir.path().join("cfg").join("config.toml"))
     }
     fn resolve_defaults(&self) -> ResolveDefaults {
         let home = self.dir.path().join("home");
@@ -1028,4 +1028,37 @@ fn backup_names_do_not_collide() {
         backup_path(&cfg, "T"),
         dir.path().join("config.toml.bak-T-2")
     );
+}
+
+#[test]
+fn merge_without_final_line_break_and_nothing_to_add_is_not_rewritten() {
+    let fake = Fake::new();
+    let old = EXAMPLE.trim_end();
+    fake.seed_config(old);
+    run_ok(
+        &fake,
+        vec![A::Many(vec![1]), A::One(0), A::Secret(CLAUDE_TOKEN)],
+    );
+    assert_eq!(fake.written(), old);
+    assert!(fake.backups().is_empty());
+}
+
+/// Prints a typical run (for documentation): `cargo test typical_run -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn typical_run_transcript() {
+    let fake = Fake::new();
+    *fake.opencode.borrow_mut() = None;
+    let (_, out) = run_ok(
+        &fake,
+        vec![
+            A::Many(vec![0, 1]),
+            A::Yes,
+            A::One(0),
+            A::Secret(KIC_KEY),
+            A::Yes,
+            A::Secret(CLAUDE_TOKEN),
+        ],
+    );
+    println!("{out}");
 }

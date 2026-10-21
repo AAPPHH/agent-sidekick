@@ -30,7 +30,7 @@ pub trait System {
     /// The platform flavour (file names, npm invocation).
     fn os(&self) -> Os;
     /// `config.toml` (its directory is agent-sidekick's config dir).
-    fn config_file(&self) -> PathBuf;
+    fn config_file(&self) -> Result<PathBuf>;
     /// Inputs for resolving the written config (home, config dir).
     fn resolve_defaults(&self) -> ResolveDefaults;
     /// Claude Code (`claude_path`: the value from an existing config.toml).
@@ -77,8 +77,8 @@ impl System for RealSystem {
         Os::current()
     }
 
-    fn config_file(&self) -> PathBuf {
-        crate::paths::config_file().unwrap_or_else(|_| PathBuf::from("config.toml"))
+    fn config_file(&self) -> Result<PathBuf> {
+        crate::paths::config_file()
     }
 
     fn resolve_defaults(&self) -> ResolveDefaults {
