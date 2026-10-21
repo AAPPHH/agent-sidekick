@@ -667,7 +667,7 @@ fn harness_path_of(
 }
 
 /// The [`BackendKind::Codex`] of `[backends.<name>]` with `harness = "codex"`:
-/// - `auth` (`chatgpt` or `api-key`) is required;
+/// - `auth`: `chatgpt` (default) or `api-key`;
 /// - `base_url`, `api_key_env` and `wire_api` only with `api-key`; `wire_api` must be
 ///   `responses` (the only wire API Codex 0.163 supports) and only next to `base_url`;
 /// - `harness_path` absolute (or `~`); the backend's `CODEX_HOME` is
@@ -690,14 +690,8 @@ fn codex_kind(
             ));
             None
         }
-        None => {
-            errs.push(
-                "`auth` is required for harness `codex`: \"chatgpt\" (log in once with your \
-                 ChatGPT account) or \"api-key\" (an OpenAI API key)"
-                    .to_owned(),
-            );
-            None
-        }
+        // Default: the ChatGPT login (the user's subscription).
+        None => Some(CodexAuth::Chatgpt),
     };
     let chatgpt = auth == Some(CodexAuth::Chatgpt);
     for (field, set) in [

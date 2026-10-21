@@ -295,7 +295,7 @@ The OpenAI Codex CLI (`npm install -g @openai/codex`; `agent-sidekick harness in
 ```toml
 [backends.codex]
 harness = "codex"
-auth = "chatgpt"          # or "api-key"
+auth = "chatgpt"          # the default; or "api-key"
 description = "OpenAI Codex agent (GPT models). Strong for code changes, debugging and reviews; edits files and runs commands in cwd inside Codex's sandbox."
 max_concurrent = 1
 # models = ["gpt-6.1-sol", "gpt-6-luna"]   # optional allowlist; without it any model, and Codex's default when none is requested
@@ -311,7 +311,7 @@ Keys:
 | Key | Meaning |
 |-----|---------|
 | `harness` | `"codex"` (required; there is no `type` for it). |
-| `auth` | Required. `"chatgpt"`: your ChatGPT plan (Plus, Pro, Business, Edu, Enterprise); you log in once with `codex login` in the backend's own `CODEX_HOME` (the exact command, for PowerShell, Git Bash or sh, is printed by `setup --backend <name>`; without a browser use `codex login --device-auth`). Codex keeps and refreshes the login in `<config-dir>/codex/<name>/auth.json`. `"api-key"`: an OpenAI API key (keyring user `backend-<name>`, or `api_key_env`), billed per token. |
+| `auth` | `"chatgpt"` (default): your ChatGPT plan (Plus, Pro, Business, Edu, Enterprise); you log in once with `codex login` in the backend's own `CODEX_HOME` (the exact command, for PowerShell, Git Bash or sh, is printed by `setup --backend <name>`; without a browser use `codex login --device-auth`). Codex keeps and refreshes the login in `<config-dir>/codex/<name>/auth.json`. `"api-key"`: an OpenAI API key (keyring user `backend-<name>`, or `api_key_env`), billed per token. |
 | `base_url` | Only with `api-key`: a Responses-compatible provider instead of OpenAI (`http(s)://.../v1`; Codex calls `{base_url}/responses`). An endpoint that only offers `/chat/completions` cannot be used with Codex 0.163 (use an opencode backend for it). Same URL rules as for claude-endpoint. |
 | `wire_api` | Only with `api-key` and `base_url`; only `"responses"` is accepted (the default; anything else is a config error). |
 | `api_key_env` | Only with `api-key`: read the key from this variable of the MCP server's environment instead of the stored one. |
@@ -454,7 +454,7 @@ pass_env = []             # inherited variables to keep for every backend, see a
 | `models` | all | none (claude-*: any model) | Models the backend offers; an allowlist for `sidekick_run`'s `model`, see [Models](#models). Required for a command backend that uses `{model}`, an error for one that does not. opencode needs `models` or `model`. |
 | `config_dir` | claude-oauth, claude-endpoint | `sidekick`: `AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` or `~/.claude-sidekick`; others: `~/.claude-sidekick-<name>` | `CLAUDE_CONFIG_DIR` of the agent; absolute or starting with `~`. |
 | `base_url` | claude-endpoint, opencode, codex (api-key) | (required; opencode: not for openrouter; codex: optional) | `http://` or `https://` URL of the API (Anthropic-compatible, OpenAI-compatible, or for codex Responses-compatible). Must not contain `user:password@` (config error; store the key with `agent-sidekick setup --backend <name>` or set `api_key_env`); ASCII host (`xn--` form for internationalised names) and a valid port. |
-| `auth` | claude-endpoint, codex | `x-api-key` (claude-endpoint); required for codex | claude-endpoint: `x-api-key` (`ANTHROPIC_API_KEY`) or `bearer` (`ANTHROPIC_AUTH_TOKEN`). codex: `chatgpt` or `api-key`, see [Codex backends](#codex-backends). |
+| `auth` | claude-endpoint, codex | `x-api-key` (claude-endpoint), `chatgpt` (codex) | claude-endpoint: `x-api-key` (`ANTHROPIC_API_KEY`) or `bearer` (`ANTHROPIC_AUTH_TOKEN`). codex: `chatgpt` or `api-key`, see [Codex backends](#codex-backends). |
 | `api_key_env` | claude-endpoint, opencode, codex (api-key) | none (stored key) | Name of an environment variable with the key. It is removed from every other backend's environment. Not for opencode with ollama. |
 | `provider` | opencode | (required) | `openai-compatible`, `ollama` or `openrouter`, see [OpenCode backends](#opencode-backends). |
 | `harness_path` | opencode, codex | looked up | Absolute path (or `~/...`) of the harness executable. |

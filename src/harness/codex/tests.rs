@@ -415,8 +415,20 @@ fn codex_config_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let err = |body: &str| resolve_codex(tmp.path(), body).unwrap_err();
 
-    let e = err("");
-    assert!(e.contains("`auth` is required for harness `codex`"), "{e}");
+    // Without `auth`: the ChatGPT login.
+    let b = resolve_codex(tmp.path(), "").unwrap();
+    assert!(matches!(
+        b.kind,
+        BackendKind::Codex {
+            auth: CodexAuth::Chatgpt,
+            ..
+        }
+    ));
+    let e = err("base_url = \"https://x.example/v1\"\n");
+    assert!(
+        e.contains("is not allowed with `auth = \"chatgpt\"`"),
+        "{e}"
+    );
     let e = err("auth = \"bearer\"\n");
     assert!(
         e.contains("`auth = \"bearer\"` is not valid for harness `codex`"),
