@@ -172,6 +172,61 @@ fn status_reports_token_source_without_leaking() {
     assert!(!text.contains("TESTTOKEN"), "{text}");
 }
 
+/// With `[backends]`, the top-level `default_model` and the legacy agent config dir are not
+/// in effect: status shows each claude backend's own model and config_dir instead.
+#[test]
+fn status_with_explicit_backends_shows_effective_model_and_config_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let main_dir = dir.path().join("main-claude");
+    let local_dir = dir.path().join("local-claude");
+    let config = format!(
+        "default_model = \"opus\"\n\n\
+         [backends.main]\ntype = \"claude-oauth\"\ndescription = \"main\"\ndefault = true\n\
+         config_dir = '{}'\n\n\
+         [backends.local]\ntype = \"claude-endpoint\"\ndescription = \"local\"\n\
+         base_url = \"http://127.0.0.1:9\"\nmodel = \"qwen3-coder\"\nconfig_dir = '{}'\n",
+        main_dir.display(),
+        local_dir.display()
+    );
+    std::fs::write(dir.path().join("config.toml"), config).unwrap();
+    let mut server = Server::start(dir.path(), &[]);
+    server.initialize();
+    let text = text_of(&server.call_tool("sidekick_status", json!({})));
+    assert!(text.contains("config error: none"), "{text}");
+    assert!(!text.contains("default model:"), "{text}");
+    assert!(!text.contains("opus"), "{text}");
+    assert!(!text.contains("agent claude config dir:"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "main (claude-oauth, default): running 0, queued 0, max_concurrent -, \
+             model (account default), config_dir {}\n",
+            main_dir.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "local (claude-endpoint): running 0, queued 0, max_concurrent -, \
+             model qwen3-coder, config_dir {}\n",
+            local_dir.display()
+        )),
+        "{text}"
+    );
+
+    // Without [backends] the global lines describe the implicit backend.
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "default_model = \"sonnet\"\n",
+    )
+    .unwrap();
+    let mut server = Server::start(dir.path(), &[]);
+    server.initialize();
+    let text = text_of(&server.call_tool("sidekick_status", json!({})));
+    assert!(text.contains("default model: sonnet\n"), "{text}");
+    assert!(text.contains("agent claude config dir: "), "{text}");
+    assert!(text.contains(", model sonnet, config_dir "), "{text}");
+}
+
 const DUMMY_TOKEN: &str = "sk-ant-oat01-DUMMYTOKENforTests_0123456789";
 
 /// Writes a fake `claude` that appends a line to `marker` and then hangs for ~60 s.
