@@ -90,6 +90,6 @@ and requires a real `claude` CLI.
 
 ## 6. Further reading
 
-- `README.md` – user-facing documentation.  
+- `README.md` – installation and first steps for users (German); `docs/REFERENCE.md` – technical reference (backends, configuration, tools, security).  
 - `NOTES.md` – design decisions and verification notes.  
 - `docs/RELEASING.md` – release process.

@@ -1667,10 +1667,10 @@ prompt_via_stdin = true
         assert!(!b.get("aider").unwrap().takes_model());
     }
 
-    /// The provider-per-backend example in the README resolves.
+    /// The provider-per-backend example in docs/REFERENCE.md resolves.
     #[test]
     fn readme_kiconnect_example_is_valid() {
-        let readme = include_str!("../../README.md").replace("\r\n", "\n");
+        let readme = include_str!("../../docs/REFERENCE.md").replace("\r\n", "\n");
         let start = readme.find("```toml\n[backends.kiconnect]").unwrap() + "```toml\n".len();
         let end = start + readme[start..].find("```").unwrap();
         let toml = format!(

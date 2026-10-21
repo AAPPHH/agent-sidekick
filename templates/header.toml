@@ -1,5 +1,5 @@
 # agent-sidekick config.toml, written by the setup wizard (`agent-sidekick setup`).
-# Reference with every option: examples/config.toml and the README (section Backends).
+# Reference with every option: examples/config.toml and docs/REFERENCE.md (section Backends).
 # Secrets are never stored here: they live in the OS keyring (or a file in this directory).
 # Run `agent-sidekick setup` again to add profiles; it never overwrites this file silently.
 

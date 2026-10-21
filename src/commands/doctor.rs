@@ -316,7 +316,7 @@ fn backends_check(resolved: &Result<Backends, String>) -> Check {
         Err(e) => Check::fail(
             BACKENDS,
             format!("invalid configuration:\n{e}"),
-            "fix the [backends] section of config.toml (see the README, section Backends)",
+            "fix the [backends] section of config.toml (see docs/REFERENCE.md, section Backends)",
         ),
         Ok(backends) => {
             let names: Vec<String> = backends

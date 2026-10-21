@@ -1,5 +1,5 @@
-# agent-sidekick config.toml with four backends: sidekick, local and aider (the example in the
-# README) plus the optional kiconnect (section 4), which needs a stored key. The routing
+# agent-sidekick config.toml with four backends: sidekick, local and aider (the example in
+# docs/REFERENCE.md) plus the optional kiconnect (section 4), which needs a stored key. The routing
 # rules in examples/CLAUDE.md cover the same four backends. Section 5 shows a commented-out
 # alternative for kiconnect with the OpenCode harness.
 #
@@ -125,7 +125,7 @@ max_concurrent = 1
 #    max_turns is only a soft limit for OpenCode; timeout_s is the hard one.
 #    OpenCode still executes project plugins (.opencode/plugin/*.js|ts in cwd or above, up
 #    to the repository root, or named under "plugin" in the project's opencode.json), and
-#    they see the provider key; only run it in projects you trust (README, OpenCode backends).
+#    they see the provider key; only run it in projects you trust (docs/REFERENCE.md, OpenCode backends).
 #    Rename it to `kiconnect` if you do not keep section 4.
 # [backends.kiconnect-oc]
 # harness = "opencode"
