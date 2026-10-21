@@ -61,9 +61,21 @@ impl Check {
     }
 }
 
-pub fn run() -> anyhow::Result<ExitCode> {
+#[derive(Debug, Default, clap::Args)]
+pub struct DoctorArgs {
+    /// Skip the daily update check (no request to GitHub).
+    #[arg(long)]
+    pub offline: bool,
+}
+
+pub fn run(args: DoctorArgs) -> anyhow::Result<ExitCode> {
     let checks = run_checks();
     print!("{}", format_report(&checks));
+    // Informational only: never changes the exit code.
+    let hint = super::update::doctor_hint(args.offline);
+    if !hint.is_empty() {
+        print!("\n{hint}");
+    }
     Ok(exit_code(&checks))
 }
 

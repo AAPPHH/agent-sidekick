@@ -1,0 +1,15 @@
+{
+  "name": "agent-sidekick",
+  "description": "Claude Code plugin for agent-sidekick, a local MCP server that delegates work to a second, headless agent",
+  "owner": {
+    "name": "AAPPHH",
+    "url": "https://github.com/AAPPHH"
+  },
+  "plugins": [
+    {
+      "name": "agent-sidekick",
+      "source": "./plugin",
+      "description": "Registers the agent-sidekick MCP server (requires the agent-sidekick binary to be installed first) and a skill on when to delegate"
+    }
+  ]
+}

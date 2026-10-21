@@ -205,6 +205,219 @@ State as of 2026-10-21, version 0.2.0.
 - `backends::reach::tests::silent_server_times_out` failed once at the `contains("timed out")` assertion under the same load; the detail text was not captured and it did not reproduce. If it recurs, capture the `Reachability` debug output from the assertion message before changing the test. It recurred once more in the first full WSL run right after a fresh build of the harness branch (2026-10-21); next time keep the line after "panicked at" (e.g. `grep -A3`) so the `{r:?}` detail survives.
 - `tests/backends_fallback.rs` `stopped_run_still_names_backend` hit the 30 s `wait_backend_line` deadline once in WSL while a full Windows test suite ran in parallel on the same machine; it passed 3/3 in isolation and in a full rerun. Load flake (the test waits for a line from a child process); test unchanged.
 
+## Distribution (release, install, plugin, update)
+
+### Install scripts and release
+
+Owner decision: `Cargo.toml` has `repository = "https://github.com/AAPPHH/agent-sidekick"` (git user AAPPHH). It is
+the only place to change the owner/repository. `scripts/render-installers.sh` reads it (plain `sed`, no cargo
+needed) and writes release copies of `install.sh` / `install.ps1` with the placeholder `OWNER/agent-sidekick`
+replaced; the release workflow attaches those copies. The source copies keep the placeholder and refuse to run
+without `AGENT_SIDEKICK_REPO` or `AGENT_SIDEKICK_INSTALL_BASE_URL`, with an error naming both. This supersedes the
+"Open points" item about setting the URL in four places; the README install URLs name AAPPHH directly (docs only).
+
+Targets and asset names (one archive per target, `agent-sidekick-<target-triple>.<ext>`, files at the archive root):
+
+| Asset | Notes |
+|---|---|
+| `agent-sidekick-x86_64-unknown-linux-musl.tar.gz` | static, `ubuntu-latest` + `musl-tools` |
+| `agent-sidekick-aarch64-unknown-linux-musl.tar.gz` | static, native `ubuntu-24.04-arm` runner + `musl-tools` |
+| `agent-sidekick-x86_64-pc-windows-msvc.zip` | static CRT (`.cargo/config.toml`), so no VC++ Redistributable is needed |
+| `install.sh`, `install.ps1` | repository filled in |
+| `SHA256SUMS` | `<sha256>  <file>` for all of the above, LF, no BOM |
+
+- **musl rather than gnu on Linux.** keyring 4.2 on Linux uses `zbus-secret-service-keyring-store`, i.e. `zbus`
+  (a pure-Rust D-Bus client) plus RustCrypto (`aes`, `cbc`, `hkdf`, `sha2`). There is no `libdbus-sys` or openssl in
+  `Cargo.lock`. The only C code is `ring` (rustls), which builds with `musl-gcc` (`CC_<target>=musl-gcc` is set in
+  the workflows). A static binary runs on any distribution and glibc version (old LTS, Alpine, containers). At
+  runtime the Secret Service still needs a session D-Bus with a secret service (GNOME Keyring/KWallet); without
+  one the existing token-file fallback applies, the same as for a gnu build.
+- **macOS** (`aarch64-apple-darwin`): built in a separate non-blocking job (`continue-on-error`, not in the publish
+  job's `needs`). It is uploaded only as a workflow artifact, not as a release asset. `install.sh` on Darwin
+  stops with a hint to `cargo install --locked --git ...`. To publish it later, add it to the publish job and drop
+  the `rm -f ./*apple-darwin*`; `install.sh` would then need the Darwin branch mapping to `<arch>-apple-darwin`.
+- The x86_64 Darwin and Windows ARM64 builds are dropped. Windows ARM64 runs the x86_64 build under emulation.
+- `release.yml` first checks that the tag equals `v` + the Cargo.toml version (`cargo metadata`) and that the
+  repository URL can be rendered, then builds. SHA256SUMS is recomputed in the publish job over the downloaded
+  archives plus the rendered scripts.
+- Packaging is in `scripts/package.sh` (tar.gz) and `scripts/package.ps1` (zip). Both write
+  `agent-sidekick-<target>.<ext>` and add or replace its line in `<out>/SHA256SUMS`. `release.yml` and the CI
+  install dry-run call the same scripts.
+
+Install scripts (`install.sh` POSIX sh, `install.ps1` for Windows PowerShell 5.1+):
+
+- Environment: `VERSION` (tag such as `v0.3.0`; `0.3.0` also works; default latest),
+  `AGENT_SIDEKICK_INSTALL_DIR` (default `~/.local/bin` or `%LOCALAPPDATA%\Programs\agent-sidekick`),
+  `AGENT_SIDEKICK_INSTALL_BASE_URL` (a URL or a local directory that holds the archive and SHA256SUMS; it takes
+  precedence over `VERSION`/repo; it is the test hook used by CI), `AGENT_SIDEKICK_REPO` (`owner/name`; the
+  former generic `REPO` was renamed because the name is too generic), `AGENT_SIDEKICK_TARGET` (override the detected
+  triple; test hook, e.g. to install a gnu build in WSL without musl-gcc), `AGENT_SIDEKICK_NO_SETUP=1`,
+  `AGENT_SIDEKICK_NO_MODIFY_PATH=1`.
+- Order: fetch the archive and SHA256SUMS → compare hashes (nothing is installed on a mismatch) → unpack → install →
+  run `<installed> --version` as a smoke test → PATH → `setup` or a hint.
+- `install.sh`: all logic sits in `main()`, called on the last line, so a truncated `curl | sh` download cannot
+  run half a script. Questions and `setup` read from `/dev/tty`, because stdin is the script. "Interactive" means
+  `/dev/tty` can be opened (it fails without a controlling terminal, e.g. in CI). Linux always uses the musl asset.
+  Upgrades copy to `.agent-sidekick.new` and then `mv`, which works atomically even while the binary is running.
+- PATH on Linux: rc file from `$SHELL` (bash → `~/.bashrc`, zsh → `${ZDOTDIR:-~}/.zshrc`, fish →
+  `~/.config/fish/config.fish` with `fish_add_path`, otherwise `~/.profile`). The script prints the line and
+  asks y/N only with a tty and without `NO_MODIFY_PATH`. It never writes unasked and skips the question if the
+  line is already there.
+- `install.ps1`: the body runs in `& { ... }` so `irm | iex` does not leak `$ErrorActionPreference` or variables
+  into the caller's session. Errors are `throw`n, never `exit` (that would close the user's window; with
+  `powershell -File` an uncaught throw still gives exit code 1). The PSScriptAnalyzer suppression
+  `PSAvoidUsingWriteHost` (with justification) sits on a script-level `param()`. PSSA ignores it on the nested
+  script block's `param()`, as tested with PSSA 1.25. A top-level `param()` is accepted by `iex` (tested on 5.1).
+- User PATH on Windows: the spec says `[Environment]::SetEnvironmentVariable(...,'User')`. The script instead reads
+  and writes the raw `HKCU\Environment\Path` value (REG_EXPAND_SZ, `DoNotExpandEnvironmentNames`), so existing
+  `%VAR%` entries are not expanded and frozen. Duplicates are detected after expansion, case-insensitively and
+  ignoring trailing `\`. A dummy `SetEnvironmentVariable(...,'User')` set/unset broadcasts WM_SETTINGCHANGE. The
+  current session's `$env:Path` is also updated. `NO_MODIFY_PATH=1` skips both.
+- Locked exe on Windows: if overwriting fails (a running MCP server), the old exe is renamed to
+  `agent-sidekick.exe.old` (Windows allows renaming a running image) and the new one is copied. The script tells
+  the user to reload VS Code. A stale `.old` is deleted on the next run when it is no longer locked.
+- Interactive on Windows = `[Environment]::UserInteractive -and -not [Console]::IsInputRedirected`. `irm | iex`
+  does not redirect stdin, so setup runs in a normal console.
+
+CI (`ci.yml`): `lint-scripts` (shellcheck `--shell=sh` on the source and rendered `install.sh`, plus
+`scripts/*.sh`); `lint-powershell` (PSScriptAnalyzer on Windows PowerShell 5.1, fails on any Error/Warning);
+`install-dry-run` on ubuntu (musl build, `sh < install.sh` like `curl | sh`, running under dash) and windows
+(`Get-Content -Raw | iex` in powershell 5.1). Each installs twice from the local dist dir into `$RUNNER_TEMP`, checks
+`--version` against Cargo.toml, checks that the user PATH is unchanged (Windows), and checks that a tampered
+SHA256SUMS is rejected and nothing gets installed.
+
+Verified locally (2026-10-21): shellcheck 0.11 (via `shellcheck-py`) is clean on `install.sh` (`-s sh`) and on
+`scripts/*.sh`. PSScriptAnalyzer 1.25 reports 0 findings on `install.ps1` and `scripts/package.ps1`.
+actionlint 1.7.12 and `yaml.safe_load` pass on both workflows. Windows: release exe built with static CRT (imports
+no vcruntime), `package.ps1` run, then `Get-Content -Raw install.ps1 | iex` in PowerShell 5.1 into a temp dir
+(install, re-install, an exe held open is renamed to `.old` and the stale `.old` is cleaned up on the next run, a
+tampered SHA256SUMS is rejected, the source copy refuses without a base URL, `-File` exits with 1). The user PATH
+stayed unchanged. WSL Ubuntu: a `x86_64-unknown-linux-musl` build (static-pie; linked with plain `gcc` as
+`CC_x86_64_unknown_linux_musl`, since `musl-gcc` is not installed there) was packaged by `package.sh` and installed with
+`sh < install.sh` under dash, with and without a pseudo-tty (`script`). With a throwaway `HOME` the tests covered
+answering y (line appended to `.bashrc`), a re-run (line detected, no question), zsh with answer n (unchanged), fish
+without a tty (line printed only), the checksum mismatch, a missing target, a truncated script (syntax error,
+nothing runs) and a 404 for `VERSION=v0.3.0` (no release yet).
+Not verified: the HKCU PATH write (it would touch the real registry), the interactive `setup` hand-off, the
+aarch64 musl build, and the workflows on GitHub (no remote yet). `ubuntu-24.04-arm` is free only for public
+repositories.
+
+Verifier follow-up (2026-10-21):
+- Fixed (blocking): `lint-powershell` passed two paths to `Invoke-ScriptAnalyzer -Path`, which takes a single string
+  in PSSA 1.25 (ParameterBindingException before any analysis). It now calls it once per file in a `foreach`. The
+  earlier "0 findings" claim was per file only; the exact CI loop now gives 0 findings in Windows PowerShell 5.1
+  with PSSA 1.25.
+- Fixed: on Windows the installers are rendered in a separate `shell: bash` step (Git Bash, path via `cygpath -u`)
+  instead of `bash ...` from pwsh, whose resolution depends on PATH order (could be the WSL launcher).
+- Hardening: `install.sh` passes `--proto =https --tlsv1.2` to curl whenever the base URL is https (the default), so
+  a redirect cannot downgrade to http. An explicit http `AGENT_SIDEKICK_INSTALL_BASE_URL` (local test server) still
+  works. wget gets no https-only flag: `--https-only` is GNU wget >= 1.17 only and busybox wget rejects it; the
+  default URLs are https anyway. SHA256SUMS comes from the same release: it detects corruption, not a compromised
+  release (as the spec intends; signing is out of scope).
+- Not changed: the README install URLs keep AAPPHH literally. Docs cannot be rendered from Cargo.toml without a
+  build step, and a placeholder URL would not be copy-pasteable. Changing the owner means `Cargo.toml` plus the
+  README URLs; scripts, release and CI derive it from Cargo.toml.
+
+
+### Repository owner
+
+- Owner decision: `repository = "https://github.com/AAPPHH/agent-sidekick"` in Cargo.toml (git user AAPPHH). This is
+  the single place to change it; `update`/`doctor` derive owner/repo from `CARGO_PKG_REPOSITORY` at compile time
+  (only `https://github.com/<owner>/<repo>` URLs are accepted, a unit test guards it).
+
+### `agent-sidekick update` and the doctor hint (feat/dist-update)
+
+- `update` only checks: `GET <base>/repos/<owner>/<repo>/releases/latest` (base `https://api.github.com`, or
+  `AGENT_SIDEKICK_UPDATE_URL` as test/enterprise/mirror hook), headers `User-Agent: agent-sidekick/<version>`,
+  `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`, no credentials, 10 s timeout (doctor:
+  3 s). Proxies come from ureq's environment handling (`ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`, `NO_PROXY`); loopback
+  hosts bypass the proxy so the tests are not affected by a proxy in the environment. Body limit 1 MiB.
+- Version comparison is hand-written SemVer 2.0 precedence (no new dependency, keeps Cargo.lock untouched): one leading
+  `v`/`V` stripped, build metadata ignored, pre-release lower than the release, numeric identifiers compared
+  numerically. Leading zeros and anything else not SemVer is rejected as a bad response.
+- Results and exit codes: newer release -> install one-liner for the platform (`irm .../install.ps1 | iex` on
+  Windows, `curl -fsSL .../install.sh | sh` elsewhere, both from `releases/latest/download/`) plus "reload VS Code",
+  exit 0. Equal -> "up to date", older (dev/pre-release build) -> "up to date (newer than the latest release)", 404
+  -> "no release published yet"; all exit 0. Real errors exit 1 with a `next step:` line: no connection/timeout,
+  403/429 (treated as rate limit; unauthenticated limit is 60/h per IP), other HTTP status, JSON without a SemVer
+  `tag_name`. Error texts never contain the URL (an overridden one could carry credentials) or response bodies.
+- `/releases/latest` ignores drafts and pre-releases, so a published pre-release is never offered.
+- doctor: `[INFO]` lines after the report, never counted as warning/failure and never changing the exit code.
+  Remembered in `<config-dir>/update-check.json` (`checked_at` Unix seconds, `current`, `result`, `latest`):
+  - the spec's "hint at most once per day" is read literally: the result is shown when it is fetched, and later
+    doctor runs within 24 h print nothing about updates (no network, no repeated hint; `agent-sidekick update`
+    checks on demand); a failed check is shown once and retried after 1 h (silent meanwhile);
+  - the record is ignored if the installed version changed, the clock went backwards, or the file is unreadable;
+  - like `logging::Mode::Cli`, doctor never creates the config directory: if it does not exist, the check is skipped
+    (info line pointing to `agent-sidekick update`), since "once per day" could not be enforced without the record;
+  - `doctor --offline` skips it entirely (no request, no file).
+- `update` itself does not read or write `update-check.json` (kept simple; doctor checks again within a day at most).
+- Changes outside the new module are kept small for merging with feat/harness: `DoctorArgs { offline }` and three
+  lines in `doctor::run`, the `Update` subcommand in `cli.rs`, `pub mod update` in `commands/mod.rs`.
+- Error texts: ureq hands resolver, connect and TLS failures through as `io::Error`, so `update.rs` classifies them
+  itself: DNS (Winsock 11001/11002/11004 on Windows, std's non-localized "failed to lookup address information"
+  prefix elsewhere) -> "host not found (offline or DNS problem?)"; `InvalidData` during the request -> "TLS handshake
+  failed: <rustls reason>" (during the body read it is a bad, non-UTF-8 answer instead); connection refused/reset and
+  timeouts get a note "a proxy variable HTTPS_PROXY/ALL_PROXY/HTTP_PROXY is set" when one is set and the host
+  is not loopback (variable names only, never the value). An `AGENT_SIDEKICK_UPDATE_URL` that is not an http(s) URL
+  with a host is rejected before any request ("not a valid http(s) URL", next step "fix or unset", value not echoed);
+  network errors name the variable in the next step when it is set.
+- Redirects: ureq follows them; `https_only` is set for https bases, so a redirect to plain http is refused. http
+  bases (loopback test servers, an internal http mirror) keep working.
+
+### Merge notes (feat/dist-update, measured with `git merge-tree --write-tree`)
+
+- Cargo.toml `repository`: feat/dist-update and feat/dist-install add the identical line before `readme`;
+  feat/dist-plugin adds it after `readme`. Git merges that without conflict but leaves the key twice, and Cargo then
+  refuses the manifest (`cargo metadata` fails with a duplicate-key error). Not moved here, since moving it would
+  only shift the duplicate to the dist-install merge: whoever merges feat/dist-plugin after one of the others must
+  delete one of the two `repository` lines (or move it before `readme` on feat/dist-plugin first).
+- With feat/harness: `src/cli.rs` and `src/commands/doctor.rs` merge cleanly (an earlier prediction of conflicts in
+  `run(DoctorArgs)` / `Command::Doctor(DoctorArgs)` was wrong). Real conflicts: `src/commands/mod.rs` (only the
+  doc-comment line), README.md, NOTES.md, CHANGELOG.md.
+- With feat/dist-install and feat/dist-plugin: only NOTES.md conflicts (README.md auto-merges).
+- The install one-liner printed by `update` targets AAPPHH/agent-sidekick; until feat/dist-install fills in the
+  repository in released install scripts (its source copy still defaults to `OWNER/agent-sidekick` and refuses to run
+  with that placeholder unless `AGENT_SIDEKICK_REPO` is set), it only works once a release exists. No release exists
+  yet: the real API answers 404 -> "no release published yet", exit 0.
+- Known, pre-existing, not changed here (doctor belongs to feat/harness): with a real `claude` on PATH, `doctor`
+  runs `claude mcp list`, which starts the registered server; that inherits `AGENT_SIDEKICK_CONFIG_DIR` and creates
+  `<config-dir>/logs/`. So the "config dir missing -> update check skipped" path rarely applies in real use; the update
+  hint itself never creates the directory (integration test).
+
+
+Owner decision: `Cargo.toml` has `repository = "https://github.com/AAPPHH/agent-sidekick"` (git user AAPPHH). It is the source of truth for the owner: code that can read it (scripts, release, update) derives owner/repo from it. Static files cannot derive anything and hardcode `AAPPHH`; changing the owner means the same edit in `.claude-plugin/marketplace.json` (owner name/url), `plugin/.claude-plugin/plugin.json` (author name/url, homepage, repository), `plugin/README.md` (links, install one-liners, marketplace commands) and `README.md` (plugin paragraph). `grep -rn AAPPHH --exclude-dir=target .` finds them all. This supersedes the "`repository` is intentionally left out" bullet under Open points.
+
+### Claude Code plugin + marketplace
+
+Files: `.claude-plugin/marketplace.json` (repo root = marketplace root, marketplace `name` `agent-sidekick`, one entry `agent-sidekick` with `source: "./plugin"`), `plugin/.claude-plugin/plugin.json`, `plugin/.mcp.json`, `plugin/skills/delegate/SKILL.md`, `plugin/README.md`. No `.mcp.json` at the repo root (that would be a project-scope server prompting everyone who opens the repo).
+
+Format sources (checked 2026-10-21): https://code.claude.com/docs/en/plugins-reference (manifest fields, `userConfig`, `${user_config.KEY}` substituted in MCP server config, `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}`/`${CLAUDE_PROJECT_DIR}` resolve in stdio `command`/`args`/`env`), https://code.claude.com/docs/en/plugin-marketplaces (marketplace.json needs `name`, `owner`, `plugins[]` with `name` + `source`; relative source from the marketplace root, no `..`; entry name must equal plugin.json `name`; install id `<entry>@<marketplace>`), https://code.claude.com/docs/en/mcp (plugin servers start automatically, register as `plugin:<plugin>:<server>`, tools are `mcp__plugin_<plugin>_<server>__<tool>`), https://code.claude.com/docs/en/plugins/components (instructions go in a skill; a CLAUDE.md at the plugin root is not loaded).
+
+Decisions:
+
+- Command: `${user_config.binary}` with `userConfig.binary` default `"agent-sidekick"`, args `["serve"]`. Without configuration the server is started as the bare `agent-sidekick` from Claude Code's PATH; users whose GUI app does not see the PATH set the absolute path via `/plugin configure agent-sidekick@agent-sidekick` (or `claude plugin configure ... --values-stdin`). No absolute default path: install locations differ per OS (`~/.local/bin` vs `%LOCALAPPDATA%\Programs\agent-sidekick`) and there is no documented portable variable for them in plugin MCP configs (`${VAR:-default}` expansion is documented for project/user `.mcp.json`, not for plugins; not relied on).
+- No `AGENT_SIDEKICK_CLAUDE` in the plugin's server env: unlike `setup`, the plugin cannot know the path of `claude`. The server falls back to `claude_path` in config.toml, PATH, then well-known locations (`locate.rs`); plugin/README.md tells users to set `claude_path` if runs fail with "claude not found".
+- `version: "0.3.0"` in plugin.json pins plugin updates to that string: the release step must bump it together with Cargo.toml (`claude plugin tag` checks plugin.json and the marketplace entry agree).
+- Skill `delegate` (`/agent-sidekick:delegate`, also model-invoked) is a backend-agnostic condensation of `examples/CLAUDE.md` (~70-80 tokens always-on per `claude plugin details`; includes the "no fallback for side effects outside the working tree" rule).
+- Plugin vs `setup` registration: use one. Plugin users run `agent-sidekick setup --no-register` and remove an old registration with `claude mcp remove agent-sidekick -s user`; `setup` users don't install the plugin.
+
+Verification (claude 2.1.296, temporary `CLAUDE_CONFIG_DIR` in the session scratchpad, `AGENT_SIDEKICK_CONFIG_DIR` temp, `AGENT_SIDEKICK_DISABLE_KEYRING=1`; the real `~/.claude` and `%APPDATA%\agent-sidekick` were not touched):
+
+- `claude plugin validate --strict ./plugin` and `claude plugin validate --strict .`: both "Validation passed" (the marketplace run advises an install line in README.md: `/plugin install agent-sidekick --marketplace <owner>/<repo>`, "one-step form on Claude Code 2.1.275+"; only the CLI form `claude plugin install agent-sidekick --marketplace ...` was seen in `--help` of 2.1.296, so plugin/README.md documents that and claims no version cutoff or slash-command support).
+- `claude plugin marketplace add <worktree>` then `claude plugin install agent-sidekick@agent-sidekick` (and bare `claude plugin install agent-sidekick`): installed, enabled; `claude plugin details agent-sidekick` lists Skills (1) delegate and MCP servers (1) agent-sidekick.
+- `claude mcp list`: binary not on PATH, default option -> `plugin:agent-sidekick:agent-sidekick: agent-sidekick serve - Failed to connect`; with the debug build on PATH -> `Connected`; with `binary` set to the absolute path and not on PATH -> `Connected`. So the default substitution of `${user_config.binary}` works even while the option shows "not set".
+- Duplicates: with a user-scope `agent-sidekick` registration whose command and args are identical to the plugin's, `claude mcp list` showed only the user-scope server (Claude Code skipped the plugin copy). With different commands (setup's absolute path vs the plugin's bare name, the normal case) both were listed and connected: two processes, every tool twice. The dedup rule is observed behaviour, not documented.
+- `agent-sidekick doctor` with only the plugin: `[FAIL] MCP registration: agent-sidekick is not registered`, next step `run agent-sidekick setup`, which would create the duplicate.
+- `claude plugin install agent-sidekick@agent-sidekick --config "binary=C:\path with space\agent-sidekick.exe"` sets the option at install time, and re-running it on an installed plugin updates the value (`claude mcp list` shows the new command). `claude plugin configure ... --values-stdin < values.json` works from bash; piping JSON from PowerShell 5.1 is rejected by claude and `echo '{"binary":"C:\\..."}'` is not portable (dash's echo turns `\\` into `\`, giving invalid JSON), so plugin/README.md documents `--config`, `/plugin configure` and the file redirect (via `cmd /c` in PowerShell) instead of an echo pipe.
+- Not verified live: the plugin tool name `mcp__plugin_agent-sidekick_agent-sidekick__sidekick_run` (from the documented pattern `mcp__plugin_<plugin>_<server>__<tool>`); plugin/README.md says to check `/mcp` if a permission rule does not match.
+
+Open points:
+
+- For feat/harness (doctor/setup owners): `doctor` should recognise the plugin registration (e.g. `claude plugin list` shows `agent-sidekick@...` enabled, or `claude mcp list` has `plugin:agent-sidekick:agent-sidekick`) and then warn about a duplicate user-scope registration instead of failing; `setup` could skip registering (or warn) when the plugin is enabled, and `setup --backend <name>` (single mode, src/commands/setup.rs, the "not registered ... run `setup --register-only`" note) should not suggest registering when the plugin is enabled. plugin/README.md tells plugin users to ignore both the doctor and the setup --backend hint until then. Not changed here to keep this branch out of src/.
+- Depends on the scripts step: plugin/README.md and the README pointer use `https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.{sh,ps1}`, but `install.sh`/`install.ps1` still default `REPO` to `OWNER/agent-sidekick`; until that default is derived from Cargo.toml, the one-liners download the script and then fail to fetch the archive. The root README Quickstart (install one-liners with `OWNER/agent-sidekick`) is left to the scripts step as well, so for now it disagrees with the AAPPHH plugin paragraph; switching it here would only conflict with that step.
+- Not tested: install from the GitHub marketplace (`/plugin marketplace add AAPPHH/agent-sidekick`) since the repo is not published; the interactive `/plugin` dialogs and the userConfig prompt on enable; VS Code with a GUI-reduced PATH.
+
 ## Harness adapters (0.4.0)
 
 ### Step 1: trait + claude/command adapters, behaviour unchanged

@@ -1,0 +1,21 @@
+{
+  "name": "agent-sidekick",
+  "version": "0.4.0",
+  "description": "Registers the agent-sidekick MCP server (sidekick_run, sidekick_backends, sidekick_status) for an already installed agent-sidekick binary, plus a skill on when to delegate",
+  "author": {
+    "name": "AAPPHH",
+    "url": "https://github.com/AAPPHH"
+  },
+  "homepage": "https://github.com/AAPPHH/agent-sidekick",
+  "repository": "https://github.com/AAPPHH/agent-sidekick",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["mcp", "delegation", "agent", "sidekick"],
+  "userConfig": {
+    "binary": {
+      "type": "string",
+      "title": "agent-sidekick executable",
+      "description": "Command or absolute path of the agent-sidekick binary. Keep the default if agent-sidekick is on the PATH that Claude Code sees; otherwise enter the absolute path (e.g. %LOCALAPPDATA%\\Programs\\agent-sidekick\\agent-sidekick.exe expanded, or ~/.local/bin/agent-sidekick expanded).",
+      "default": "agent-sidekick"
+    }
+  }
+}

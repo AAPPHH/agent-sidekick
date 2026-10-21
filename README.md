@@ -10,18 +10,20 @@ It is a single binary with no runtime dependencies besides the official `claude`
 1. **Install** the binary (release archives are verified against `SHA256SUMS`):
 
    ```sh
-   # Linux / macOS (installs to ~/.local/bin)
-   curl -fsSL https://github.com/OWNER/agent-sidekick/releases/latest/download/install.sh | sh
+   # Linux x86_64 / aarch64 (static binary, installs to ~/.local/bin)
+   curl -fsSL https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.sh | sh
    ```
 
    ```powershell
    # Windows (installs to %LOCALAPPDATA%\Programs\agent-sidekick and adds it to the user PATH)
-   irm https://github.com/OWNER/agent-sidekick/releases/latest/download/install.ps1 | iex
+   irm https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.ps1 | iex
    ```
 
-   Or build from source: `cargo install --path .`
+   Or build from source (also the way to go on macOS for now): `cargo install --locked --git https://github.com/AAPPHH/agent-sidekick`
 
-   > `OWNER/agent-sidekick` is a placeholder until the repository is published; set `REPO=owner/name` for the install scripts.
+   Pin a version with `VERSION=v0.4.0` (PowerShell: `$env:VERSION = 'v0.4.0'`). Re-running the installer upgrades
+   in place. When the terminal is interactive the installer finishes by running `agent-sidekick setup`; set
+   `AGENT_SIDEKICK_NO_SETUP=1` to skip that. More options are listed at the top of `install.sh` / `install.ps1`.
 
 2. **Create a token for the agent account.** Log in with the account the sidekick should use:
 
@@ -39,10 +41,22 @@ It is a single binary with no runtime dependencies besides the official `claude`
    agent-sidekick setup
    ```
 
+   Alternative: register the server through the Claude Code plugin instead (adds a `delegate` skill; use either the plugin or `setup`'s registration, not both). Run `agent-sidekick setup --no-register`, then in Claude Code `/plugin marketplace add AAPPHH/agent-sidekick` and `/plugin install agent-sidekick@agent-sidekick`. See [plugin/README.md](plugin/README.md).
+
 4. **Reload VS Code** (Command Palette: "Developer: Reload Window") or restart Claude Code, then check that the agent-sidekick server shows up as connected in `/mcp`.
 
 5. **Optional: add backends** (local model, other agent CLIs) in `config.toml`, see [Backends](#backends).
    Without a `[backends]` section everything works as described above.
+
+## Updating
+
+```sh
+agent-sidekick update
+```
+
+checks the latest GitHub release and, if it is newer, prints the install one-liner for your platform (the same as in the Quickstart; it replaces the binary in place).
+Run it, then reload VS Code. `update` itself never downloads or installs anything.
+`agent-sidekick doctor` shows the same hint at most once a day: it checks once, shows the result, and stays quiet on later runs that day (`doctor --offline` skips the check).
 
 ## Usage
 
@@ -392,7 +406,8 @@ Without a `[backends]` section it also shows the global `default model` and the 
 | `agent-sidekick backends test <name>` | Reachability with details (claude version, resolved program, HTTP status). Exit code 0 if reachable, 1 otherwise. |
 | `agent-sidekick harness list` | Each known harness (`claude`, `opencode`, `command`): installed or not, path, `--version` output, and the configured backends using it. `command` is generic (its program is configured per backend), so it shows `n/a`. `opencode --version` runs in a temporary isolated home that is removed afterwards. |
 | `agent-sidekick harness install <name>` | Prints the official install command(s) of a harness; agent-sidekick never runs them. `command` has nothing to install. |
-| `agent-sidekick doctor` | Checks the installation, the harness executables the backends use (`opencode`: path and version) and every backend, and prints next steps. |
+| `agent-sidekick doctor [--offline]` | Checks the installation, the harness executables the backends use (`opencode`: path and version) and every backend, and prints next steps. Also shows an update hint at most once a day (checked and shown once, later runs that day stay quiet; result kept in `<config-dir>/update-check.json`, only if that directory exists); `--offline` skips the check. A failed check is an info line, never a doctor failure. |
+| `agent-sidekick update` | Checks the latest GitHub release and prints the install command if a newer one exists. Exit code 0 also when up to date or no release exists yet; 1 if the check failed (offline, rate limit, invalid `AGENT_SIDEKICK_UPDATE_URL`). |
 | `agent-sidekick uninstall [--purge]` | Removes the stored secrets of all configured backends (tokens, endpoint keys, command secrets, opencode provider keys, and the v0.1 token) and the MCP registration. The opencode backend directories (`<config-dir>/opencode/<name>`, no keys) are only removed with `--purge`. |
 
 ## Configuration
@@ -449,6 +464,7 @@ Environment variables:
 | `AGENT_SIDEKICK_TOKEN` | Token of the `sidekick` backend for CI/testing; takes precedence over the keyring and token file. |
 | `AGENT_SIDEKICK_DISABLE_KEYRING` | Set to `1` to never use the OS keyring (file fallback only). |
 | `AGENT_SIDEKICK_LOG` | `tracing` filter, e.g. `debug` or `agent_sidekick=trace`. |
+| `AGENT_SIDEKICK_UPDATE_URL` | API base for `update`/`doctor` instead of `https://api.github.com` (tests, GitHub Enterprise or a mirror serving `/repos/<owner>/<repo>/releases/latest`). |
 
 ## How it works
 

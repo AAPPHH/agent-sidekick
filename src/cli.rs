@@ -23,14 +23,17 @@ pub enum Command {
     Setup(commands::setup::SetupArgs),
     /// Run the MCP server over stdio (started by Claude Code, not by hand).
     Serve,
-    /// Check the installation and all backends; print next steps for anything that is missing.
-    Doctor,
+    /// Check the installation and all backends; print next steps for anything that is missing
+    /// (`--offline`: skip the daily update check).
+    Doctor(commands::doctor::DoctorArgs),
     /// List or test the configured backends.
     Backends(commands::backends::BackendsArgs),
     /// List the known harnesses (agent CLIs) or print a harness's official install command.
     Harness(commands::harness::HarnessArgs),
     /// Remove the stored tokens/API keys of all backends and the MCP registration.
     Uninstall(commands::uninstall::UninstallArgs),
+    /// Check for a newer release and print the command that installs it.
+    Update,
 }
 
 pub fn main() -> ExitCode {
@@ -44,9 +47,9 @@ pub fn main() -> ExitCode {
             let _guard = logging::init(logging::Mode::Cli);
             commands::setup::run(args)
         }
-        Command::Doctor => {
+        Command::Doctor(args) => {
             let _guard = logging::init(logging::Mode::Cli);
-            commands::doctor::run()
+            commands::doctor::run(args)
         }
         Command::Backends(args) => {
             let _guard = logging::init(logging::Mode::Cli);
@@ -59,6 +62,10 @@ pub fn main() -> ExitCode {
         Command::Uninstall(args) => {
             let _guard = logging::init(logging::Mode::Cli);
             commands::uninstall::run(args)
+        }
+        Command::Update => {
+            let _guard = logging::init(logging::Mode::Cli);
+            commands::update::run()
         }
     };
     match result {
