@@ -4,13 +4,17 @@
 use std::path::Path;
 
 use super::Profile;
-use crate::backends::{self, Backends, ResolveDefaults};
+use crate::backends::{self, Backends, CodexAuth, ResolveDefaults};
 use crate::config::Config;
 
 pub const HEADER: &str = include_str!("../../../templates/header.toml");
 pub const KICONNECT: &str = include_str!("../../../templates/kiconnect.toml");
 pub const SIDEKICK: &str = include_str!("../../../templates/sidekick.toml");
 pub const GEMINI: &str = include_str!("../../../templates/gemini.toml");
+pub const CODEX: &str = include_str!("../../../templates/codex.toml");
+
+/// Placeholder of the Codex template for the `auth` value.
+pub const AUTH_PLACEHOLDER: &str = "{{AUTH}}";
 
 /// Placeholders of the Gemini template (never `{prompt}`-style: those are command
 /// placeholders and are rejected in `command[0]`).
@@ -60,15 +64,17 @@ pub fn toml_string(value: &str) -> String {
 }
 
 /// The table of `profile`, filled in, with `default = true` right after its header when
-/// `is_default`. Gemini needs `gemini` (the node and entry paths).
+/// `is_default`. Gemini needs `gemini` (the node and entry paths); Codex uses `codex_auth`.
 pub fn section(
     profile: Profile,
     is_default: bool,
     gemini: Option<&GeminiPaths<'_>>,
+    codex_auth: CodexAuth,
 ) -> Result<String, String> {
     let mut text = match profile {
         Profile::Kiconnect => KICONNECT.to_owned(),
         Profile::Claude => SIDEKICK.to_owned(),
+        Profile::Codex => CODEX.replace(AUTH_PLACEHOLDER, &toml_string(codex_auth.as_str())),
         Profile::Gemini => {
             let paths = gemini
                 .ok_or("internal error: the Gemini template needs the node and Gemini CLI paths")?;
@@ -184,7 +190,7 @@ mod tests {
         };
         Profile::ALL
             .iter()
-            .map(|&p| section(p, p == default, Some(&g)).unwrap())
+            .map(|&p| section(p, p == default, Some(&g), CodexAuth::Chatgpt).unwrap())
             .collect()
     }
 
@@ -197,13 +203,13 @@ mod tests {
             entry: &entry,
         };
         for p in Profile::ALL {
-            let text = fresh_config(&[section(p, true, Some(&g)).unwrap()]);
+            let text = fresh_config(&[section(p, true, Some(&g), CodexAuth::Chatgpt).unwrap()]);
             let (_, b) = validate(&text, &defaults(dir.path()))
                 .unwrap_or_else(|e| panic!("{p:?}: {e}\n{text}"));
             assert_eq!(b.len(), 1);
             let backend = b.default_backend();
             assert_eq!(backend.name, p.backend_name());
-            assert_eq!(backend.secret_id(), Some(p.secret_id()));
+            assert_eq!(backend.secret_id(), p.secret_id());
         }
     }
 
@@ -212,7 +218,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let text = fresh_config(&all_sections(dir.path(), Profile::Kiconnect));
         let (_, b) = validate(&text, &defaults(dir.path())).unwrap();
-        assert_eq!(b.names(), ["gemini", "kiconnect", "sidekick"]);
+        assert_eq!(b.names(), ["codex", "gemini", "kiconnect", "sidekick"]);
         assert_eq!(b.default_backend().name, "kiconnect");
 
         let k = b.get("kiconnect").unwrap();
@@ -258,6 +264,25 @@ mod tests {
         assert_eq!(secret_env.as_deref(), Some("GEMINI_API_KEY"));
         assert_eq!(g.secret_id(), Some(SecretId::Command("gemini".into())));
         assert_eq!(g.model.as_deref(), Some("auto"));
+
+        let c = b.get("codex").unwrap();
+        let BackendKind::Codex { auth, base_url, .. } = &c.kind else {
+            panic!("{c:?}")
+        };
+        assert_eq!(*auth, CodexAuth::Chatgpt);
+        assert_eq!(*base_url, None);
+        assert_eq!(c.model, None, "Codex's default model");
+        assert_eq!(c.max_concurrent, Some(1));
+        assert_eq!(c.cost.as_str(), "quota");
+        assert_eq!(c.secret_id(), None);
+        assert!(c.description.starts_with("OpenAI Codex agent"));
+
+        // The API-key variant stores its key as backend-codex and is paid.
+        let text = fresh_config(&[section(Profile::Codex, true, None, CodexAuth::ApiKey).unwrap()]);
+        let (_, b) = validate(&text, &defaults(dir.path())).unwrap();
+        let c = b.get("codex").unwrap();
+        assert_eq!(c.secret_id(), Some(SecretId::Backend("codex".into())));
+        assert_eq!(c.cost.as_str(), "paid");
     }
 
     #[test]
@@ -273,7 +298,7 @@ mod tests {
 
     #[test]
     fn gemini_without_paths_is_an_error() {
-        assert!(section(Profile::Gemini, false, None).is_err());
+        assert!(section(Profile::Gemini, false, None, CodexAuth::Chatgpt).is_err());
     }
 
     #[test]
@@ -289,7 +314,7 @@ mod tests {
             entry: &entry,
         };
         assert!(existing.contains_key("kiconnect") && existing.contains_key("sidekick"));
-        let add = vec![section(Profile::Gemini, false, Some(&g)).unwrap()];
+        let add = vec![section(Profile::Gemini, false, Some(&g), CodexAuth::Chatgpt).unwrap()];
         let merged = merged_config(example, &add);
         assert!(merged.starts_with(example));
         let (_, b) = validate(&merged, &defaults(dir.path())).unwrap();

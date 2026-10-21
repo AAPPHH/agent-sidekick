@@ -25,6 +25,7 @@ pub enum Tool {
     Claude,
     Node,
     OpenCode,
+    Codex,
 }
 
 pub trait System {
@@ -56,6 +57,14 @@ pub trait System {
     fn create_dir(&self, dir: &Path) -> Result<()>;
     /// (Re-)register the MCP server with Claude Code (prints its own lines).
     fn register(&self, claude: &Path) -> Result<()>;
+    /// The Codex CLI, if installed.
+    fn find_codex(&self) -> Option<PathBuf>;
+    /// Register the MCP server with Codex (`setup --codex`; prints its own lines).
+    fn register_codex(&self, claude: &Path) -> Result<()>;
+    /// Create a codex backend's `CODEX_HOME` with its generated config; returns the directory.
+    fn prepare_codex_home(&self, backend: &crate::backends::Backend) -> Result<PathBuf, String>;
+    /// Whether `path` is an existing file (never read).
+    fn file_exists(&self, path: &Path) -> bool;
     /// The `doctor` report.
     fn doctor(&self) -> String;
     /// Timestamp for backup file names, e.g. `20261021-142233`.
@@ -139,6 +148,7 @@ impl System for RealSystem {
         match tool {
             Tool::Claude => HarnessKind::Claude.adapter().version(path),
             Tool::OpenCode => HarnessKind::OpenCode.adapter().version(path),
+            Tool::Codex => HarnessKind::Codex.adapter().version(path),
             Tool::Node => {
                 let out = crate::commands::claude_cli::run(path, ["--version"], QUICK_TIMEOUT)
                     .map_err(|e| format!("{e:#}"))?;
@@ -180,6 +190,28 @@ impl System for RealSystem {
         let self_exe =
             std::env::current_exe().context("determining the path of this executable")?;
         crate::commands::setup::register(claude, &self_exe)
+    }
+
+    fn find_codex(&self) -> Option<PathBuf> {
+        crate::harness::codex::locate_real(None).ok()
+    }
+
+    fn register_codex(&self, claude: &Path) -> Result<()> {
+        let self_exe =
+            std::env::current_exe().context("determining the path of this executable")?;
+        let path = crate::commands::codex_host::real_config_path()
+            .context("cannot determine the Codex config (set CODEX_HOME)")?;
+        let cfg = crate::config::Config::load().ok();
+        crate::commands::setup::register_codex(&path, &self_exe, Some(claude), cfg.as_ref())
+    }
+
+    fn prepare_codex_home(&self, backend: &crate::backends::Backend) -> Result<PathBuf, String> {
+        crate::harness::codex::prepare_home(backend)
+            .map(|file| file.parent().map(Path::to_path_buf).unwrap_or(file))
+    }
+
+    fn file_exists(&self, path: &Path) -> bool {
+        path.is_file()
     }
 
     fn doctor(&self) -> String {

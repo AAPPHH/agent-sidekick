@@ -124,6 +124,8 @@ struct Fake {
     register_ok: bool,
     registered: Cell<u32>,
     doctor_runs: Cell<u32>,
+    codex: RefCell<Option<PathBuf>>,
+    codex_registered: Cell<u32>,
 }
 
 const CLAUDE_TOKEN: &str = "sk-ant-oat01-SECRETclaudeTOKEN123";
@@ -171,6 +173,9 @@ impl Fake {
             register_ok: true,
             registered: Cell::new(0),
             doctor_runs: Cell::new(0),
+            // Not installed by default, so the Codex question appears only where tested.
+            codex: RefCell::new(None),
+            codex_registered: Cell::new(0),
             dir,
         }
     }
@@ -246,6 +251,7 @@ impl System for Fake {
             Tool::Claude => "2.1.296 (Claude Code)",
             Tool::Node => "v22.11.0",
             Tool::OpenCode => "1.14.0",
+            Tool::Codex => "codex-cli 0.163.0",
         }
         .to_owned())
     }
@@ -260,6 +266,9 @@ impl System for Fake {
             let root = self.dir.path().join("installed");
             if args.iter().any(|a| a == npm::OPENCODE_PACKAGE) {
                 *self.opencode.borrow_mut() = Some(root.join("opencode.exe"));
+            }
+            if args.iter().any(|a| a == npm::CODEX_PACKAGE) {
+                *self.codex.borrow_mut() = Some(root.join("codex.exe"));
             }
             if args.iter().any(|a| a == npm::GEMINI_PACKAGE) {
                 *self.gemini.borrow_mut() = Some(root.join("gemini.js"));
@@ -301,6 +310,25 @@ impl System for Fake {
         } else {
             anyhow::bail!("claude mcp add failed")
         }
+    }
+    fn find_codex(&self) -> Option<PathBuf> {
+        self.codex.borrow().clone()
+    }
+    fn register_codex(&self, _claude: &Path) -> Result<()> {
+        self.codex_registered.set(self.codex_registered.get() + 1);
+        Ok(())
+    }
+    fn prepare_codex_home(&self, backend: &Backend) -> Result<PathBuf, String> {
+        let file = crate::harness::codex::prepare_home(backend)?;
+        assert!(
+            file.starts_with(self.dir.path()),
+            "outside the test dir: {}",
+            file.display()
+        );
+        Ok(file.parent().unwrap().to_path_buf())
+    }
+    fn file_exists(&self, path: &Path) -> bool {
+        path.is_file()
     }
     fn doctor(&self) -> String {
         self.doctor_runs.set(self.doctor_runs.get() + 1);
@@ -383,7 +411,8 @@ fn fresh_kiconnect_only() {
         "2.1.296",
         "Node.js: ",
         "OpenCode: ",
-        "KI:connect.nrw (Hochschul-Kontingent, kostenlos) | Claude-Zweitkonto | Gemini default [0]",
+        "KI:connect.nrw (Hochschul-Kontingent, kostenlos) | Claude-Zweitkonto | Gemini | OpenAI Codex (ChatGPT-Abo oder API-Key) default [0]",
+        "Codex: nicht gefunden (nur für OpenAI Codex nötig)",
         "FAKE DOCTOR REPORT",
         "Developer: Reload Window",
         "/mcp",
@@ -1135,6 +1164,119 @@ fn merge_without_final_line_break_and_nothing_to_add_is_not_rewritten() {
     );
     assert_eq!(fake.written(), old);
     assert!(fake.backups().is_empty());
+}
+
+const OPENAI_KEY: &str = "sk-proj-SECRET-openai-key-0123456789";
+
+/// Codex installed, ChatGPT plan: no key, the login command for the backend's own
+/// CODEX_HOME, then the registration in Codex as well.
+#[test]
+fn fresh_codex_with_chatgpt_login_and_codex_registration() {
+    let fake = Fake::new();
+    *fake.codex.borrow_mut() = Some(fake.dir.path().join("npm").join("codex.exe"));
+    let (outcome, out) = run_ok(
+        &fake,
+        vec![
+            A::Many(vec![3]),
+            A::One(0), // ChatGPT plan
+            A::Yes,    // "Anmeldung erledigt?" (not really: no auth.json)
+            A::Yes,    // also register in Codex
+        ],
+    );
+    assert_eq!(outcome, Outcome::Done);
+    let b = fake.resolved();
+    assert_eq!(b.names(), ["codex"]);
+    let codex = b.get("codex").unwrap();
+    let BackendKind::Codex { auth, base_dir, .. } = &codex.kind else {
+        panic!("{codex:?}")
+    };
+    assert_eq!(*auth, CodexAuth::Chatgpt);
+    assert_eq!(codex.max_concurrent, Some(1));
+    // Its CODEX_HOME exists with the generated config before the user logs in.
+    assert!(base_dir.join("config.toml").is_file());
+    assert!(
+        fake.secrets.borrow().is_empty(),
+        "no key for a ChatGPT login"
+    );
+    assert_eq!(fake.registered.get(), 1);
+    assert_eq!(fake.codex_registered.get(), 1);
+    for needle in [
+        "Codex: ",
+        "codex-cli 0.163.0",
+        "OpenAI Codex (ChatGPT-Abo oder API-Key)",
+        "Wie soll OpenAI Codex abgerechnet werden?",
+        "codex login",
+        &base_dir.display().to_string(),
+        "Noch keine Anmeldung gefunden",
+        "agent-sidekick backends test codex",
+        "Auch in Codex anmelden?",
+        "In Codex: eine neue Sitzung starten",
+    ] {
+        assert!(out.contains(needle), "missing {needle:?}:\n{out}");
+    }
+
+    // Logged in by now: a second run finds the login and asks nothing about it.
+    std::fs::write(base_dir.join("auth.json"), "{}").unwrap();
+    let (_, out) = run_ok(
+        &fake,
+        vec![
+            A::Many(vec![3]),
+            A::One(0), // merge: the existing backend stays
+            A::No,     // not in Codex this time
+        ],
+    );
+    assert!(
+        out.contains("schon eine ChatGPT-Anmeldung vorhanden"),
+        "{out}"
+    );
+    assert_eq!(fake.codex_registered.get(), 1);
+}
+
+/// Codex missing: installed through npm; API key: stored as backend-codex after the online
+/// check against OpenAI's model list.
+#[test]
+fn fresh_codex_with_api_key_installs_codex() {
+    let fake = Fake::new();
+    let (_, out) = run_ok(
+        &fake,
+        vec![
+            A::Many(vec![3]),
+            A::Yes,    // install Codex via npm
+            A::One(1), // API key
+            A::Secret(OPENAI_KEY),
+            A::Yes, // check online
+            A::Yes, // register in Codex (installed now)
+        ],
+    );
+    let runs = fake.runs.borrow();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0]
+        .args
+        .iter()
+        .any(|a| a.to_string_lossy() == npm::CODEX_PACKAGE));
+    let b = fake.resolved();
+    let codex = b.get("codex").unwrap();
+    assert!(matches!(
+        codex.kind,
+        BackendKind::Codex {
+            auth: CodexAuth::ApiKey,
+            ..
+        }
+    ));
+    assert_eq!(
+        fake.secret(&SecretId::Backend("codex".into())).as_deref(),
+        Some(OPENAI_KEY)
+    );
+    assert_eq!(
+        *fake.probes.borrow(),
+        [(
+            "https://api.openai.com/v1/models".to_owned(),
+            Some(OPENAI_KEY.to_owned())
+        )]
+    );
+    assert_eq!(fake.codex_registered.get(), 1);
+    assert!(out.contains("platform.openai.com/api-keys"), "{out}");
+    assert!(!out.contains("codex login"), "{out}");
 }
 
 /// Prints a typical run (for documentation): `cargo test typical_run -- --ignored --nocapture`.

@@ -906,6 +906,60 @@ mod tests {
     }
 
     #[test]
+    fn codex_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg: crate::config::Config = toml::from_str(
+            "[backends.chat]\nharness = \"codex\"\nauth = \"chatgpt\"\ndescription = \"d\"\n\
+             default = true\n\
+             [backends.key]\nharness = \"codex\"\nauth = \"api-key\"\ndescription = \"d\"\n\
+             [backends.envkey]\nharness = \"codex\"\nauth = \"api-key\"\napi_key_env = \"K\"\n\
+             description = \"d\"\n",
+        )
+        .unwrap();
+        let backends = crate::backends::resolve_with(
+            &cfg,
+            &crate::backends::ResolveDefaults {
+                home: Some(tmp.path().to_path_buf()),
+                legacy_agent_config_dir: None,
+                config_dir: Some(tmp.path().join("cfg")),
+            },
+        )
+        .unwrap();
+        let home = tmp.path().join("cfg").join("codex").join("chat");
+        let full = plan(&backends, None).unwrap();
+        assert_eq!(
+            full,
+            vec![
+                Step::CodexLogin {
+                    name: "chat".into(),
+                    home: home.clone()
+                },
+                Step::ProviderUsesEnv {
+                    name: "envkey".into(),
+                    var: "K".into()
+                },
+                Step::ProviderKeyHint { name: "key".into() },
+            ]
+        );
+        assert!(!full.iter().any(Step::asks_secret));
+        assert_eq!(
+            plan(&backends, Some("key")).unwrap(),
+            vec![Step::ProviderKey { name: "key".into() }]
+        );
+        // The ChatGPT login is no secret: --token-stdin has nothing to read.
+        let one = plan(&backends, Some("chat")).unwrap();
+        assert!(check_token_stdin(&one, true, true).is_err());
+        assert_eq!(dirs_to_create(Vec::new(), &one), Vec::<PathBuf>::new());
+
+        // Running the step creates the CODEX_HOME with its config (not a terminal here, so
+        // nothing waits for input) and leaves no login behind.
+        run_step(&one[0], &backends, false, false).unwrap();
+        assert!(home.join("config.toml").is_file());
+        assert!(!home.join("auth.json").exists());
+        assert_eq!(harness_of(&backends, "key"), "codex");
+    }
+
+    #[test]
     fn wizard_only_for_bare_setup_in_a_terminal() {
         let bare = SetupArgs {
             token_stdin: false,

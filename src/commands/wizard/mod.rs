@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 
 use crate::backends::reach::ProbeResponse;
-use crate::backends::{Backend, BackendKind, Backends};
+use crate::backends::{Backend, BackendKind, Backends, CodexAuth};
 use crate::config::Config;
 use crate::locate::Os;
 use crate::redact::{redact_all, MIN_SECRET_LEN};
@@ -38,17 +38,24 @@ pub enum Profile {
     Kiconnect,
     Claude,
     Gemini,
+    Codex,
 }
 
 impl Profile {
     /// In the order the wizard offers them.
-    pub const ALL: [Profile; 3] = [Profile::Kiconnect, Profile::Claude, Profile::Gemini];
+    pub const ALL: [Profile; 4] = [
+        Profile::Kiconnect,
+        Profile::Claude,
+        Profile::Gemini,
+        Profile::Codex,
+    ];
 
     pub fn backend_name(self) -> &'static str {
         match self {
             Profile::Kiconnect => "kiconnect",
             Profile::Claude => "sidekick",
             Profile::Gemini => "gemini",
+            Profile::Codex => "codex",
         }
     }
 
@@ -57,15 +64,18 @@ impl Profile {
             Profile::Kiconnect => "KI:connect.nrw (Hochschul-Kontingent, kostenlos)",
             Profile::Claude => "Claude-Zweitkonto",
             Profile::Gemini => "Gemini",
+            Profile::Codex => "OpenAI Codex (ChatGPT-Abo oder API-Key)",
         }
     }
 
-    /// The secret of the backend the template creates.
-    pub fn secret_id(self) -> SecretId {
+    /// The stored secret of the backend the template creates (Codex: with `auth =
+    /// "chatgpt"`, which needs none; with `api-key` it is `backend-codex`).
+    pub fn secret_id(self) -> Option<SecretId> {
         match self {
-            Profile::Kiconnect => SecretId::Backend("kiconnect".into()),
-            Profile::Claude => SecretId::legacy(),
-            Profile::Gemini => SecretId::Command("gemini".into()),
+            Profile::Kiconnect => Some(SecretId::Backend("kiconnect".into())),
+            Profile::Claude => Some(SecretId::legacy()),
+            Profile::Gemini => Some(SecretId::Command("gemini".into())),
+            Profile::Codex => None,
         }
     }
 }
@@ -84,10 +94,11 @@ pub fn run_interactive() -> Result<ExitCode> {
 }
 
 const INTRO: &str = "Willkommen beim Einrichtungsassistenten von agent-sidekick.\n\
-    agent-sidekick lässt Claude Code Aufgaben an einen zweiten Agenten abgeben, zum Beispiel \
-    an KI:connect.nrw, ein zweites Claude-Konto oder Gemini.\n\
+    agent-sidekick lässt Claude Code (oder Codex) Aufgaben an einen zweiten Agenten abgeben, \
+    zum Beispiel an KI:connect.nrw, ein zweites Claude-Konto, Gemini oder OpenAI Codex.\n\
     Der Assistent prüft die Voraussetzungen, schreibt die Konfiguration, speichert deine \
-    Schlüssel sicher im Schlüsselbund und meldet den Server bei Claude Code an.";
+    Schlüssel sicher im Schlüsselbund und meldet den Server bei Claude Code an (auf Wunsch \
+    auch bei Codex).";
 
 const RESUME: &str = "Führe danach `agent-sidekick setup` erneut aus.";
 
@@ -158,12 +169,22 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
         )),
         None => p.say("  OpenCode: nicht gefunden (nur für KI:connect.nrw nötig)"),
     }
+    let mut codex = s.find_codex();
+    match &codex {
+        Some(path) => p.say(&format!(
+            "  Codex: {} ({})",
+            path.display(),
+            version_text(s, Tool::Codex, path)
+        )),
+        None => p.say("  Codex: nicht gefunden (nur für OpenAI Codex nötig)"),
+    }
 
     // 2. Profiles.
     let mut profiles = choose_profiles(p)?;
 
     // 3. Tools for the profiles (nothing is written before this step succeeds).
     let needs_node = (profiles.contains(&Profile::Kiconnect) && opencode.is_none())
+        || (profiles.contains(&Profile::Codex) && codex.is_none())
         || profiles.contains(&Profile::Gemini);
     let node = match node {
         Some(n) => Some(n),
@@ -173,7 +194,7 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
                 "Node.js fehlt (gebraucht für {}). Nächster Schritt: Node.js installieren, ein \
                  neues Terminal öffnen (nutzt du das Terminal in VS Code: VS Code komplett neu \
                  starten). {RESUME} Es wurde nichts geändert.",
-                node_users(&profiles, opencode.is_none())
+                node_users(&profiles, opencode.is_none(), codex.is_none())
             );
         }
         None => None,
@@ -194,6 +215,25 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
                 "Hinweis: KI:connect.nrw braucht OpenCode. Installiere es später mit \
                  `npm install -g {}` und prüfe dann mit `agent-sidekick doctor`.",
                 npm::OPENCODE_PACKAGE
+            ));
+        }
+    }
+    if profiles.contains(&Profile::Codex) && codex.is_none() {
+        let node = node.as_deref().expect("checked above");
+        if offer_install(p, s, node, npm::CODEX_PACKAGE, "Codex")? {
+            codex = s.find_codex();
+            match &codex {
+                Some(path) => p.say(&format!("Codex installiert: {}", path.display())),
+                None => p.say(
+                    "Codex wurde installiert, aber noch nicht gefunden. Nächster Schritt: ein \
+                     neues Terminal öffnen und `agent-sidekick doctor` ausführen.",
+                ),
+            }
+        } else {
+            p.say(&format!(
+                "Hinweis: OpenAI Codex braucht die Codex-CLI. Installiere sie später mit \
+                 `npm install -g {}` und prüfe dann mit `agent-sidekick doctor`.",
+                npm::CODEX_PACKAGE
             ));
         }
     }
@@ -316,12 +356,33 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
         }
     };
 
+    // How a new Codex backend pays: the ChatGPT plan (login) or an OpenAI API key.
+    let codex_auth = if add.contains(&Profile::Codex) {
+        let options = [
+            "ChatGPT-Abo: einmal mit deinem ChatGPT-Konto anmelden (Plus, Pro, Business, Edu, \
+             Enterprise)"
+                .to_owned(),
+            "OpenAI-API-Schlüssel: Abrechnung pro Token über platform.openai.com".to_owned(),
+        ];
+        match p.choose_one("\nWie soll OpenAI Codex abgerechnet werden?", &options, 0)? {
+            0 => CodexAuth::Chatgpt,
+            _ => CodexAuth::ApiKey,
+        }
+    } else {
+        CodexAuth::Chatgpt
+    };
+
     // 6. Build and validate the new config before anything is asked or written.
     let mut sections = Vec::new();
     for &prof in &add {
         sections.push(
-            templates::section(prof, default == Some(prof), gemini_paths.as_ref())
-                .map_err(anyhow::Error::msg)?,
+            templates::section(
+                prof,
+                default == Some(prof),
+                gemini_paths.as_ref(),
+                codex_auth,
+            )
+            .map_err(anyhow::Error::msg)?,
         );
     }
     let text = match &mode {
@@ -376,6 +437,13 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     }
     drop(secrets);
 
+    // 8b. The ChatGPT login of a Codex backend (it lives in the backend's own CODEX_HOME).
+    if profiles.contains(&Profile::Codex) {
+        if let Some(b) = backends.get(Profile::Codex.backend_name()) {
+            codex_login(p, s, b)?;
+        }
+    }
+
     // 9. Registration with Claude Code.
     p.say("\nAnmeldung bei Claude Code:");
     if let Err(e) = s.register(&claude) {
@@ -384,6 +452,25 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
              `agent-sidekick setup --register-only` ausführen.",
             redact_all(&format!("{e:#}"))
         ));
+    }
+
+    // 9b. Registration with Codex (only offered when the Codex CLI is installed).
+    let mut in_codex = false;
+    if s.find_codex().is_some()
+        && p.confirm(
+            "\nAuch in Codex anmelden? Dann kannst du agent-sidekick auch in der Codex-CLI \
+             nutzen.",
+            true,
+        )?
+    {
+        match s.register_codex(&claude) {
+            Ok(()) => in_codex = true,
+            Err(e) => p.say(&format!(
+                "Die Anmeldung bei Codex ist fehlgeschlagen: {}\nNächster Schritt: \
+                 `agent-sidekick setup --codex` ausführen.",
+                redact_all(&format!("{e:#}"))
+            )),
+        }
     }
 
     // 10. Doctor.
@@ -398,6 +485,12 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
          /mcp prüfen: `{APP_NAME}` sollte als verbunden erscheinen.\n\
          2. Ausprobieren, z. B. mit dem Prompt: „Lass {example} die README zusammenfassen“."
     ));
+    if in_codex {
+        p.say(&format!(
+            "In Codex: eine neue Sitzung starten (`codex`); `/mcp` zeigt `{APP_NAME}`. Vor jedem \
+             sidekick_run fragt Codex nach deiner Zustimmung."
+        ));
+    }
     if profiles.contains(&Profile::Kiconnect) {
         p.say(
             "Hinweis: Ein KI:connect-Schlüssel gilt einen Monat und verlängert sich bei jeder \
@@ -417,10 +510,13 @@ fn version_text(s: &dyn System, tool: Tool, path: &Path) -> String {
     }
 }
 
-fn node_users(profiles: &[Profile], opencode_missing: bool) -> String {
+fn node_users(profiles: &[Profile], opencode_missing: bool, codex_missing: bool) -> String {
     let mut users = Vec::new();
     if opencode_missing && profiles.contains(&Profile::Kiconnect) {
         users.push("die Installation von OpenCode");
+    }
+    if codex_missing && profiles.contains(&Profile::Codex) {
+        users.push("die Installation von Codex");
     }
     if profiles.contains(&Profile::Gemini) {
         users.push("die Gemini CLI");
@@ -677,9 +773,19 @@ fn ask_secret(
 ) -> Result<Option<(SecretId, Token)>> {
     let name = &backend.name;
     let Some(id) = backend.secret_id() else {
-        p.say(&format!(
-            "Backend `{name}`: kein gespeicherter Schlüssel nötig (z. B. Umgebungsvariable)."
-        ));
+        // A ChatGPT login is made after the config is written (see `codex_login`).
+        let chatgpt = matches!(
+            backend.kind,
+            BackendKind::Codex {
+                auth: CodexAuth::Chatgpt,
+                ..
+            }
+        );
+        if !chatgpt {
+            p.say(&format!(
+                "Backend `{name}`: kein gespeicherter Schlüssel nötig (z. B. Umgebungsvariable)."
+            ));
+        }
         return Ok(None);
     };
     p.say(&format!("\n— {} (Backend `{name}`) —", prof.label()));
@@ -697,6 +803,7 @@ fn ask_secret(
         Profile::Kiconnect => "KI:connect-API-Schlüssel einfügen (Eingabe unsichtbar): ",
         Profile::Claude => "OAuth-Token einfügen (Eingabe unsichtbar): ",
         Profile::Gemini => "Gemini-API-Schlüssel einfügen (Eingabe unsichtbar): ",
+        Profile::Codex => "OpenAI-API-Schlüssel einfügen (Eingabe unsichtbar): ",
     };
     loop {
         let Some(token) = read_valid_secret(p, prompt)? else {
@@ -777,8 +884,9 @@ enum Verified {
     Skip,
 }
 
-/// For an opencode backend (KI:connect): `GET {base_url}/models` with the key; 401/403
-/// means rejected. Other backends are not checked.
+/// For an opencode backend with an OpenAI-compatible provider (KI:connect) or a codex
+/// api-key backend: `GET {base_url}/models` with the key; 401/403 means rejected. Other
+/// backends are not checked.
 fn verify_key(
     p: &mut dyn Prompter,
     s: &dyn System,
@@ -786,23 +894,25 @@ fn verify_key(
     backend: &Backend,
     token: &Token,
 ) -> Result<Verified> {
-    let Some(url) = crate::harness::opencode::probe_url(backend) else {
-        return Ok(Verified::Keep);
-    };
-    if !matches!(
-        backend.kind,
+    let url = match &backend.kind {
         BackendKind::OpenCode {
             provider: crate::backends::OpencodeProvider::OpenaiCompatible,
             ..
-        }
-    ) || !p.confirm("Schlüssel jetzt online prüfen?", true)?
-    {
+        } => crate::harness::opencode::probe_url(backend),
+        BackendKind::Codex { .. } => crate::harness::codex::probe_url(backend),
+        _ => None,
+    };
+    let Some(url) = url else {
+        return Ok(Verified::Keep);
+    };
+    if !p.confirm("Schlüssel jetzt online prüfen?", true)? {
         return Ok(Verified::Keep);
     }
     match s.probe_get(&url, Some(token.expose())) {
         ProbeResponse::Status { code, .. } if code == 401 || code == 403 => {
             let hint = match prof {
                 Profile::Kiconnect => " – erstelle einen neuen auf https://chat.kiconnect.nrw",
+                Profile::Codex => " – prüfe ihn auf https://platform.openai.com/api-keys",
                 _ => "",
             };
             p.say(&format!("Schlüssel abgelehnt (HTTP {code}){hint}."));
@@ -858,7 +968,60 @@ fn secret_instructions(prof: Profile, backend: &Backend, os: Os) -> String {
         Profile::Gemini => "Erstelle einen Gemini-API-Schlüssel auf \
              https://aistudio.google.com/apikey (Google-Konto nötig)."
             .to_owned(),
+        Profile::Codex => "Erstelle einen OpenAI-API-Schlüssel auf \
+             https://platform.openai.com/api-keys (Abrechnung pro Token über dein \
+             OpenAI-Konto, unabhängig von einem ChatGPT-Abo)."
+            .to_owned(),
     }
+}
+
+/// The ChatGPT login of a codex backend with `auth = "chatgpt"`: create its `CODEX_HOME`
+/// with the generated config, show the `codex login` command for exactly that directory,
+/// wait for the user and check that the login file exists (never read). Not logged in is
+/// no error: the final steps name the command again.
+fn codex_login(p: &mut dyn Prompter, s: &dyn System, backend: &Backend) -> Result<()> {
+    let BackendKind::Codex {
+        auth: CodexAuth::Chatgpt,
+        ..
+    } = &backend.kind
+    else {
+        return Ok(());
+    };
+    let name = &backend.name;
+    let home = s
+        .prepare_codex_home(backend)
+        .map_err(|e| anyhow::anyhow!("{e}. {DIR_NEXT_STEP}"))?;
+    let auth = home.join(crate::harness::codex::AUTH_FILE);
+    p.say(&format!(
+        "\n— {} (Backend `{name}`) —",
+        Profile::Codex.label()
+    ));
+    if s.file_exists(&auth) {
+        p.say(&format!(
+            "Für `{name}` ist schon eine ChatGPT-Anmeldung vorhanden ({}).",
+            auth.display()
+        ));
+        return Ok(());
+    }
+    p.say(&format!(
+        "Melde dich jetzt einmal mit deinem ChatGPT-Konto an. Die Anmeldung gilt nur für \
+         agent-sidekick und liegt in {} (dein eigenes ~/.codex bleibt unberührt). Führe in \
+         einem separaten Terminal aus:\n{}\nIm Browser mit dem ChatGPT-Konto anmelden, dessen \
+         Abo genutzt werden soll.",
+        home.display(),
+        crate::harness::codex::login_commands(&home)
+    ));
+    let _ = p.confirm("Anmeldung erledigt?", true)?;
+    if s.file_exists(&auth) {
+        p.say("ChatGPT-Anmeldung gefunden.");
+    } else {
+        p.say(&format!(
+            "Noch keine Anmeldung gefunden ({} fehlt). Nächster Schritt: den Befehl oben \
+             ausführen und mit `agent-sidekick backends test {name}` prüfen.",
+            auth.display()
+        ));
+    }
+    Ok(())
 }
 
 fn example_backend(profiles: &[Profile]) -> &'static str {
