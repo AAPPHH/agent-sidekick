@@ -126,9 +126,17 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
                 redact_all(&e)
             ));
             bail!(
-                "Claude Code wurde nicht gefunden. Nächster Schritt: Claude Code installieren \
-                 (https://docs.claude.com/en/docs/claude-code/setup) oder den Pfad in \
-                 AGENT_SIDEKICK_CLAUDE setzen. {RESUME}"
+                "Claude Code wurde nicht gefunden. agent-sidekick braucht die Claude-Code-CLI \
+                 (`claude`); die VS-Code-Erweiterung allein reicht nicht. Nächster Schritt: die \
+                 CLI installieren ({}) mit\n  {}\n(weitere Wege: https://code.claude.com/docs/en/setup). \
+                 Öffne danach ein neues Terminal; nutzt du das Terminal in VS Code, starte VS Code \
+                 komplett neu. Liegt claude woanders, setze den Pfad in AGENT_SIDEKICK_CLAUDE. \
+                 {RESUME}",
+                match s.os() {
+                    Os::Windows => "in PowerShell",
+                    Os::Unix => "im Terminal",
+                },
+                claude_install_command(s.os())
             );
         }
     };
@@ -163,7 +171,8 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
             p.say(&node_instructions(s.os()));
             bail!(
                 "Node.js fehlt (gebraucht für {}). Nächster Schritt: Node.js installieren, ein \
-                 neues Terminal öffnen. {RESUME} Es wurde nichts geändert.",
+                 neues Terminal öffnen (nutzt du das Terminal in VS Code: VS Code komplett neu \
+                 starten). {RESUME} Es wurde nichts geändert.",
                 node_users(&profiles, opencode.is_none())
             );
         }
@@ -205,6 +214,7 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
         match entry {
             Some(e) => {
                 p.say(&format!("  Gemini CLI: {}", e.display()));
+                p.say(GEMINI_WARNING);
                 gemini_entry = Some((node.to_path_buf(), e));
             }
             None => {
@@ -434,9 +444,27 @@ pub fn node_instructions(os: Os) -> String {
     };
     format!(
         "\nNode.js wird gebraucht, ist aber nicht installiert. So installierst du es:\n{how}\n\
-         Öffne danach ein neues Terminal. {RESUME}"
+         Öffne danach ein neues Terminal. Nutzt du das Terminal in VS Code, starte VS Code \
+         komplett neu: Ein neues Terminal in VS Code kennt Node.js sonst noch nicht. {RESUME}"
     )
 }
+
+/// The official native installer of the Claude Code CLI for this platform (the same
+/// commands as the `claude` harness's install hint, from code.claude.com/docs/en/setup).
+pub fn claude_install_command(os: Os) -> &'static str {
+    match os {
+        Os::Windows => "irm https://claude.ai/install.ps1 | iex",
+        Os::Unix => "curl -fsSL https://claude.ai/install.sh | bash",
+    }
+}
+
+/// Shown when the Gemini profile is set up (see docs/REFERENCE.md, Command backends).
+pub const GEMINI_WARNING: &str = "Achtung, Gemini: Das Backend startet die Gemini CLI mit \
+    --skip-trust, sonst bricht sie in nicht vertrauten Ordnern ab. Sie vertraut damit jedem \
+    Projektordner: Eine \
+    `.env`, `.gemini/.env` oder `.gemini/settings.json` im Projekt kann deinen Gemini-Schlüssel an \
+    einen fremden Server schicken oder Code ausführen. Nutze Gemini nur in Ordnern, denen du \
+    vertraust, und einen Schlüssel, den du widerrufen kannst.";
 
 fn choose_profiles(p: &mut dyn Prompter) -> Result<Vec<Profile>> {
     let options: Vec<String> = Profile::ALL.iter().map(|x| x.label().to_owned()).collect();

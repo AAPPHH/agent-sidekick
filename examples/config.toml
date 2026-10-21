@@ -29,7 +29,7 @@ default_timeout_s = 1800
 # default_model = "sonnet"  # only applies to the implicit backend (no [backends] section)
 
 # 1) The second Claude account (subscription OAuth token).
-#    Token: `agent-sidekick setup` (asks for every claude-oauth backend) or
+#    Token: `agent-sidekick setup --no-wizard` (asks for every claude-oauth backend) or
 #    `agent-sidekick setup --backend sidekick`. A claude-oauth backend named "sidekick"
 #    uses the v0.1 secret (keyring user `oauth-token`, file `token`), so an existing
 #    installation keeps its token.

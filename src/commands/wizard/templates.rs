@@ -16,6 +16,22 @@ pub const GEMINI: &str = include_str!("../../../templates/gemini.toml");
 /// placeholders and are rejected in `command[0]`).
 pub const NODE_PLACEHOLDER: &str = "{{NODE}}";
 pub const GEMINI_ENTRY_PLACEHOLDER: &str = "{{GEMINI_ENTRY}}";
+/// Placeholder of the header for the documentation base URL (see [`docs_base_url`]).
+pub const DOCS_PLACEHOLDER: &str = "{{DOCS}}";
+
+/// The repository's files at this version's release tag, e.g.
+/// `https://github.com/AAPPHH/agent-sidekick/blob/v0.3.0`: the installed binary comes
+/// without `examples/` and `docs/`, so the header links to them.
+pub fn docs_base_url() -> String {
+    let repo = crate::commands::update::REPOSITORY.trim_end_matches('/');
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    format!("{repo}/blob/v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The header of a new config.toml, with the documentation links filled in.
+pub fn header() -> String {
+    HEADER.replace(DOCS_PLACEHOLDER, &docs_base_url())
+}
 
 /// Paths the Gemini template needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +95,7 @@ pub fn section(
 
 /// A complete new config.toml: the header and the given sections in order.
 pub fn fresh_config(sections: &[String]) -> String {
-    let mut out = HEADER.to_owned();
+    let mut out = header();
     for s in sections {
         out.push_str(s);
     }
@@ -124,6 +140,30 @@ mod tests {
             legacy_agent_config_dir: Some(dir.join("home").join(".claude-sidekick")),
             config_dir: Some(dir.join("cfg")),
         }
+    }
+
+    #[test]
+    fn header_links_to_the_docs_of_this_version() {
+        let h = header();
+        assert!(!h.contains(DOCS_PLACEHOLDER), "{h}");
+        let base = format!(
+            "https://github.com/AAPPHH/agent-sidekick/blob/v{}",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(docs_base_url(), base);
+        assert!(
+            h.contains(&format!("#   {base}/examples/config.toml\n")),
+            "{h}"
+        );
+        assert!(
+            h.contains(&format!("#   {base}/docs/REFERENCE.md#backends\n")),
+            "{h}"
+        );
+        // Both files exist in the repository at these paths.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(root.join("examples").join("config.toml").is_file());
+        let reference = std::fs::read_to_string(root.join("docs").join("REFERENCE.md")).unwrap();
+        assert!(reference.replace("\r\n", "\n").contains("\n## Backends\n"));
     }
 
     fn gemini_paths(dir: &Path) -> (PathBuf, PathBuf) {

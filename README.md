@@ -37,7 +37,7 @@ Der erste Befehl installiert das Programm nach `~/.local/bin`. Er bietet an, die
 
 - Die Installation prüft den Download gegen `SHA256SUMS` und braucht weder Rust noch Git noch Node.js.
 - In einem interaktiven Terminal startet die Installation am Ende selbst `agent-sidekick setup`. Den zweiten Befehl brauchst du nur, wenn das Setup nicht lief oder du es abgebrochen hast.
-- Der Setup-Assistent prüft Claude Code, Node.js und OpenCode. Du wählst ein oder mehrere Profile: „KI:connect.nrw (Hochschul-Kontingent, kostenlos)“ (Vorschlag), „Claude-Zweitkonto“, „Gemini“. Ein fehlendes OpenCode oder Gemini CLI installiert er nach Rückfrage mit `npm install -g`. Dann fragt er nach dem Standard-Backend (Vorschlag: `kiconnect`), schreibt die Konfiguration, fragt die Schlüssel verdeckt ab (den KI:connect-Schlüssel kann er gleich online prüfen), meldet den Server bei Claude Code an und führt `agent-sidekick doctor` aus.
+- Der Setup-Assistent prüft Claude Code, Node.js und OpenCode. Du wählst ein oder mehrere Profile: „KI:connect.nrw (Hochschul-Kontingent, kostenlos)“ (Vorschlag), „Claude-Zweitkonto“, „Gemini“. Ein fehlendes OpenCode oder Gemini CLI installiert er nach Rückfrage mit `npm install -g`. Wählst du mehrere neue Profile, fragt er nach dem Standard-Backend (Vorschlag: `kiconnect`). Dann fragt er die Schlüssel verdeckt ab (den KI:connect-Schlüssel kann er gleich online prüfen), schreibt erst danach die Konfiguration, meldet den Server bei Claude Code an und führt `agent-sidekick doctor` aus.
 - Eine vorhandene `config.toml` wird nie stillschweigend überschrieben: Du wählst Zusammenführen, Sichern und neu schreiben oder Abbrechen.
 - Eine bestimmte Version installierst du in PowerShell mit `$env:VERSION = 'v0.3.0'` vor dem ersten Befehl, unter Linux mit `curl -fsSL https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.sh | VERSION=v0.3.0 sh`.
 
@@ -45,7 +45,11 @@ Danach VS Code neu laden (siehe [Erster Test](#erster-test)).
 
 ## Voraussetzungen
 
-- Claude Code (die VS-Code-Erweiterung oder die CLI), angemeldet mit deinem Hauptkonto.
+- Die Claude-Code-CLI (`claude`), angemeldet mit deinem Hauptkonto. Die VS-Code-Erweiterung allein reicht nicht: Das Setup und der Server brauchen das Programm `claude`. Installiere es mit dem offiziellen Installer:
+  - Windows (PowerShell): `irm https://claude.ai/install.ps1 | iex`
+  - Linux: `curl -fsSL https://claude.ai/install.sh | bash`
+
+  Öffne danach ein neues Terminal. Nutzt du das Terminal in VS Code, starte VS Code komplett neu. Weitere Wege stehen unter <https://code.claude.com/docs/en/setup>.
 - Node.js, nur für KI:connect (OpenCode) und Gemini: Download unter <https://nodejs.org/en/download>, unter Windows auch mit `winget install OpenJS.NodeJS.LTS`.
 - Für KI:connect: ein Konto an einer teilnehmenden Hochschule (Anmeldung über das Single Sign-On deiner Hochschule).
 - Für das Profil „Claude-Zweitkonto“: ein zweites Claude-Abonnement.
@@ -97,10 +101,14 @@ Die Ergebnisse der kostenlosen KI:connect-Modelle sind Entwürfe: Prüf die Änd
 
 ## FAQ
 
+### Claude Code wurde nicht gefunden
+
+Das Setup braucht die Claude-Code-CLI. Installiere sie wie unter [Voraussetzungen](#voraussetzungen) beschrieben, öffne ein neues Terminal (im VS-Code-Terminal: VS Code komplett neu starten) und starte `agent-sidekick setup` erneut.
+
 ### OpenCode oder Node.js fehlt
 
 - **OpenCode fehlt:** Das Setup bietet `npm install -g opencode-ai` an. Du kannst den Befehl auch selbst ausführen und danach `agent-sidekick setup` erneut starten.
-- **Node.js fehlt:** Das Setup bricht ab, bevor es etwas schreibt. Installiere Node.js (siehe [Voraussetzungen](#voraussetzungen)), öffne ein **neues** Terminal und starte `agent-sidekick setup` erneut.
+- **Node.js fehlt:** Das Setup bricht ab, bevor es etwas schreibt. Installiere Node.js (siehe [Voraussetzungen](#voraussetzungen)), öffne ein **neues** Terminal und starte `agent-sidekick setup` erneut. Nutzt du das Terminal in VS Code, starte VS Code komplett neu. Ein neues Terminal in VS Code reicht nicht, es kennt Node.js sonst noch nicht.
 
 ### /mcp zeigt agent-sidekick nicht an
 
@@ -126,6 +134,15 @@ Claude Code startet den Server über den absoluten Pfad, der beim Setup eingetra
 
 - **Aktualisieren:** `agent-sidekick update` prüft, ob es eine neue Version gibt, und zeigt den passenden Installationsbefehl an. Führe ihn aus und lade VS Code neu. `agent-sidekick doctor` weist höchstens einmal am Tag auf ein Update hin.
 - **Deinstallieren:** `agent-sidekick uninstall` entfernt die gespeicherten Schlüssel und die Anmeldung bei Claude Code. `agent-sidekick uninstall --purge` löscht zusätzlich den Konfigurationsordner. Danach das Programm löschen: unter Windows den Ordner `%LOCALAPPDATA%\Programs\agent-sidekick`, unter Linux die Datei `~/.local/bin/agent-sidekick`.
+
+## Sicherheit beim Gemini-Profil
+
+Das Gemini-Profil startet die Gemini CLI mit `--skip-trust`. Ohne diese Option bricht sie in Ordnern ab, denen du nicht ausdrücklich vertraut hast. Mit `--skip-trust` vertraut sie aber jedem Projektordner, in dem sie arbeitet:
+
+- Sie liest dort und in den Ordnern darüber eine `.env` oder `.gemini/.env`. Ein Projekt kann so zum Beispiel `GOOGLE_GEMINI_BASE_URL` auf einen fremden Server setzen. Dein Gemini-Schlüssel geht dann an diesen Server.
+- Sie lädt `.gemini/settings.json` mit MCP-Servern und Hooks. Das ist fremder Code, der deinen Schlüssel sehen kann.
+
+Nutze Gemini deshalb nur in Projektordnern, denen du vertraust, zum Beispiel nicht in frisch geklonten fremden Repositories. Nimm einen Schlüssel, den du jederzeit widerrufen kannst. Findet agent-sidekick solche Dateien, schreibt es eine Warnung ins Run-Log.
 
 ## Nutzungsbedingungen
 

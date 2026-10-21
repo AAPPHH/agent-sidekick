@@ -40,7 +40,7 @@ fn handshake_lists_tools_and_validates_params() {
     assert!(run["description"]
         .as_str()
         .unwrap()
-        .contains("headless Claude Code"));
+        .contains("configured default backend"));
     let schema = &run["inputSchema"];
     let props = schema["properties"].as_object().expect("properties");
     for key in [

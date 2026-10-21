@@ -1,5 +1,6 @@
-//! agent-sidekick: local MCP server (stdio) that delegates prompts to a second,
-//! headless Claude Code instance running with its own credentials.
+//! agent-sidekick: local MCP server (stdio) that delegates prompts to a second, headless
+//! agent running with its own credentials (a configured backend: Claude Code, OpenCode or
+//! another agent CLI).
 
 pub mod backends;
 pub mod cli;

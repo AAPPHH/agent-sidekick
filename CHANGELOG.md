@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `{model}` placeholder for `command` backends, substituted in the same single pass as `{prompt}`, `{cwd}` and `{max_turns}` (never in `command[0]`). A command using `{model}` requires `models`; `models` or `model` without `{model}` is a config error.
 - A `model` not offered by the selected backend is rejected before anything runs (the error lists the allowed models; no fallback). A fallback that does not offer the requested model runs with its own default model, and the result notes it.
 - `sidekick_backends` returns `models` and `default_model` per backend; `sidekick_status` shows each backend's default model and allowlist; `backends list` has a MODELS column (default first, marked `*`); `backends test` prints the default model and the models.
-- README section "Models"; `examples/config.toml` and `examples/CLAUDE.md` configure `kiconnect` as one backend offering `openai-gpt-oss-120b` and `qwen-qwen3-8-27b`.
+- [docs/REFERENCE.md section "Models"](docs/REFERENCE.md#models); `examples/config.toml` and `examples/CLAUDE.md` configure `kiconnect` as one backend offering `openai-gpt-oss-120b` and `qwen-qwen3-8-27b`.
 - Harness adapters (step 1): `src/harness/` with a common `Harness` trait (locate, `--version`, credential, launch building, output normalization, reachability check, install hint) and the adapters `claude` and `command`. The launch, credential and reachability logic of `claude-oauth`, `claude-endpoint` and `command` backends moved behind them unchanged (same argv, environment, session isolation, secrets, fallback, results and logs).
 - `harness = "claude" | "command"` per backend. `claude` without `base_url` is the claude-oauth mode, with `base_url` the claude-endpoint mode. The legacy `type` keeps working; `type` and `harness` together must agree.
 - `agent-sidekick harness list` (installed, path, version, backends using it) and `agent-sidekick harness install <name>` (prints the official install command, never runs it).
@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The note about ignored parameters of command backends names only what was actually ignored (`model` only when the command has no `{model}`).
 - The `secret_env` of a command backend is now removed from every backend's inherited environment, like an `api_key_env` (the command backend itself still gets its stored value).
 - `sidekick_run` treats a harness-reported failure (exit 0 without an answer) as an error and as a fallback trigger; such results contain a `failed: ...` line after `exit_code`.
+- The MCP instructions, the `sidekick_run` description and `--help` no longer say the default is a second Claude Code instance; a run without `backend` goes to the configured default backend (see `sidekick_backends`).
+- `agent-sidekick update` and the `doctor` update hint print `cargo install --locked --git https://github.com/AAPPHH/agent-sidekick` on macOS and other non-Linux Unix systems (no prebuilt binary; `install.sh` stops there) instead of the `install.sh` one-liner.
+- Setup wizard: "Claude Code wurde nicht gefunden" names the platform's native installer command, says that the VS Code extension alone is not enough and to open a new terminal (or restart VS Code); the Node.js instructions say to restart VS Code when its terminal is used; choosing Gemini shows a warning about `--skip-trust` (project `.env` / `.gemini/settings.json`).
+- The header of a wizard-written `config.toml` links to `examples/config.toml` and `docs/REFERENCE.md#backends` on GitHub at this version's tag (the installed binary comes without them).
+- A warning in the run log and the server log when a command backend whose `command` contains `gemini` runs in a project with `.env`, `.gemini/.env` or `.gemini/settings.json` up to the repository root (the Gemini CLI loads them because the workspace is trusted).
+
+### Fixed
+
+- The setup wizard looked up `node` and `npm` with a plain PATH search, which on Unix resolves an empty or relative PATH entry against the current directory; it now uses only the absolute PATH entries, like command backends.
 
 ## [0.2.0] - 2026-10-21
 

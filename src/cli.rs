@@ -8,7 +8,7 @@ use crate::{commands, logging};
 #[command(
     name = "agent-sidekick",
     version,
-    about = "MCP server that delegates tasks to a second, headless Claude Code instance",
+    about = "MCP server that delegates tasks from Claude Code to a second, headless agent (configured backends)",
     propagate_version = true
 )]
 pub struct Cli {

@@ -9,7 +9,7 @@ It does **not** contain the binary. Install agent-sidekick first.
 ## 1. Install the binary
 
 ```sh
-# Linux / macOS (installs to ~/.local/bin)
+# Linux (installs to ~/.local/bin)
 curl -fsSL https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.sh | sh
 ```
 
@@ -18,7 +18,9 @@ curl -fsSL https://github.com/AAPPHH/agent-sidekick/releases/latest/download/ins
 irm https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.ps1 | iex
 ```
 
-Or from source: `cargo install --path .` in a clone. See the main
+No prebuilt macOS binary is published; on macOS build from source:
+`cargo install --locked --git https://github.com/AAPPHH/agent-sidekick` (or `cargo install --path .`
+in a clone). See the main
 [README](https://github.com/AAPPHH/agent-sidekick#installation-zwei-befehle) for details.
 
 ## 2. Store the tokens, without registering
@@ -103,7 +105,7 @@ first:
    ```
 
    ```sh
-   # Linux / macOS default location
+   # Linux default location (from source on macOS: ~/.cargo/bin/agent-sidekick)
    claude plugin install agent-sidekick@agent-sidekick --config "binary=$HOME/.local/bin/agent-sidekick"
    ```
 
