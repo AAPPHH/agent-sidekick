@@ -283,7 +283,7 @@ No parameters. Returns a JSON object:
   "config_error": null,
   "backends": [
     { "name": "local", "type": "claude-endpoint", "description": "...", "cost": "free", "default": false,
-      "reachable": true, "detail": "...", "max_concurrent": 1, "running": 0, "queued": 0 }
+      "reachable": true, "detail": "...", "max_concurrent": null, "running": 0, "queued": 0 }
   ]
 }
 ```
