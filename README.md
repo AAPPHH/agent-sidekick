@@ -25,27 +25,35 @@ It is a single binary with no runtime dependencies besides the official `claude`
    in place. When the terminal is interactive the installer finishes by running `agent-sidekick setup`; set
    `AGENT_SIDEKICK_NO_SETUP=1` to skip that. More options are listed at the top of `install.sh` / `install.ps1`.
 
-2. **Create a token for the agent account.** Log in with the account the sidekick should use:
-
-   ```sh
-   CLAUDE_CONFIG_DIR=~/.claude-sidekick claude setup-token
-   ```
-
-   ```powershell
-   $env:CLAUDE_CONFIG_DIR = "$HOME\.claude-sidekick"; claude setup-token; Remove-Item Env:CLAUDE_CONFIG_DIR
-   ```
-
-3. **Store the token and register the MCP server** with Claude Code:
+2. **Run the setup wizard** in a terminal:
 
    ```sh
    agent-sidekick setup
    ```
 
+   In an interactive terminal, `setup` without flags starts a guided setup (in German; the target audience is
+   universities in NRW). It checks Claude Code, Node.js and OpenCode, lets you pick one or more profiles
+   ("KI:connect.nrw (Hochschul-Kontingent, kostenlos)", "Claude-Zweitkonto", "Gemini"), offers to install a missing
+   OpenCode or Gemini CLI with `npm install -g` (after confirmation, run through node without a shell), asks for the
+   default backend, writes `config.toml` from built-in templates, asks for the keys with hidden input (the KI:connect
+   key can be checked online right away), registers the MCP server with Claude Code and finishes with `doctor`.
+   An existing `config.toml` is never overwritten silently: you choose between merging (only missing backends are
+   appended, existing text stays byte-identical), backup (`config.toml.bak-<timestamp>`) and rewrite, or cancel.
+   For the second Claude account the wizard explains `claude setup-token`; run it in a separate terminal and log in
+   with that account. A KI:connect key expires after one month; store a new one with
+   `agent-sidekick setup --backend kiconnect`.
+
+   Without a terminal, or with any flag, `setup` works non-interactively as before (`--no-wizard` forces that in a
+   terminal): it asks for the token of every `claude-oauth` backend, e.g. after
+   `CLAUDE_CONFIG_DIR=~/.claude-sidekick claude setup-token`
+   (PowerShell: `$env:CLAUDE_CONFIG_DIR = "$HOME\.claude-sidekick"; claude setup-token; Remove-Item Env:CLAUDE_CONFIG_DIR`),
+   and registers the MCP server.
+
    Alternative: register the server through the Claude Code plugin instead (adds a `delegate` skill; use either the plugin or `setup`'s registration, not both). Run `agent-sidekick setup --no-register`, then in Claude Code `/plugin marketplace add AAPPHH/agent-sidekick` and `/plugin install agent-sidekick@agent-sidekick`. See [plugin/README.md](plugin/README.md).
 
-4. **Reload VS Code** (Command Palette: "Developer: Reload Window") or restart Claude Code, then check that the agent-sidekick server shows up as connected in `/mcp`.
+3. **Reload VS Code** (Command Palette: "Developer: Reload Window") or restart Claude Code, then check that the agent-sidekick server shows up as connected in `/mcp`.
 
-5. **Optional: add backends** (local model, other agent CLIs) in `config.toml`, see [Backends](#backends).
+4. **Optional: add backends** (local model, other agent CLIs) in `config.toml`, see [Backends](#backends).
    Without a `[backends]` section everything works as described above.
 
 ## Updating
@@ -403,7 +411,8 @@ Without a `[backends]` section it also shows the global `default model` and the 
 
 | Command | Purpose |
 |---------|---------|
-| `agent-sidekick setup [--token-stdin] [--no-register] [--claude PATH]` | Ask for the token of every `claude-oauth` backend that has none yet (backends with a stored token are skipped) and register the MCP server. Endpoint keys and command secrets are not asked here (a hint names the `setup --backend` call). Re-registering keeps the extra `-e` variables of the existing user-scope registration and prints their names (never their values); `CLAUDE_CODE_OAUTH_TOKEN` and `AGENT_SIDEKICK_TOKEN` found there are dropped with a warning. |
+| `agent-sidekick setup` (interactive terminal, no flags) | Guided setup (wizard, German): prerequisites, profiles (KI:connect.nrw, second Claude account, Gemini), optional `npm install -g` of OpenCode/Gemini CLI, default backend, `config.toml` from templates (merge, backup + rewrite, or cancel for an existing file), keys, registration and `doctor`. |
+| `agent-sidekick setup [--token-stdin] [--no-register] [--claude PATH] [--no-wizard]` | Non-interactive setup (also a bare `setup` without a terminal): ask for the token of every `claude-oauth` backend that has none yet (backends with a stored token are skipped) and register the MCP server. Endpoint keys and command secrets are not asked here (a hint names the `setup --backend` call). Re-registering keeps the extra `-e` variables of the existing user-scope registration and prints their names (never their values); `CLAUDE_CODE_OAUTH_TOKEN` and `AGENT_SIDEKICK_TOKEN` found there are dropped with a warning. |
 | `agent-sidekick setup --register-only [--claude PATH]` | Only (re-)register the MCP server: no token prompts and no terminal needed, e.g. after storing each token with `setup --backend <name> --token-stdin`. |
 | `agent-sidekick setup --backend <name> [--token-stdin]` | Set up one backend only: `claude-oauth` token, `claude-endpoint` API key (or a note that `api_key_env` is used), the `secret_env` value of a `command` backend (nothing to store without `secret_env`), the provider key of an `opencode` backend (keyring user `backend-<name>`; nothing to store for ollama or with `api_key_env`). The MCP registration is not changed. |
 | `agent-sidekick backends list [--check]` | Table of name, type, cost, default and description; `--check` adds reachability. |
