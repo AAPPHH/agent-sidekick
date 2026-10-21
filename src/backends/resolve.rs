@@ -509,9 +509,15 @@ fn is_reserved_env(name: &str) -> bool {
 /// Checks `http(s)://host...` and trims trailing `/`.
 fn normalize_base_url(url: &str) -> Result<String, String> {
     let u = url.trim();
+    // Never echo a URL that may carry credentials (`user:password@host`).
+    let shown = if u.contains('@') {
+        "(not shown: it contains '@')".to_owned()
+    } else {
+        format!("{url:?}")
+    };
     if u.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(format!(
-            "`base_url` must not contain whitespace, got {url:?}"
+            "`base_url` must not contain whitespace, got {shown}"
         ));
     }
     let rest = ["http://", "https://"].iter().find_map(|s| {
@@ -521,13 +527,21 @@ fn normalize_base_url(url: &str) -> Result<String, String> {
     });
     let Some(rest) = rest else {
         return Err(format!(
-            "`base_url` must start with http:// or https://, got {url:?}"
+            "`base_url` must start with http:// or https://, got {shown}"
         ));
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.rsplit('@').next().unwrap_or("");
-    if host.is_empty() || host.starts_with(':') {
-        return Err(format!("`base_url` has no host, got {url:?}"));
+    if authority.contains('@') {
+        // Credentials in the URL would end up in CLI output, logs and the probe; keys
+        // belong in the keyring (`setup --backend`) or in `api_key_env`.
+        return Err(
+            "`base_url` must not contain credentials (`user:password@`); store the key with \
+             `agent-sidekick setup --backend <name>` or use `api_key_env`"
+                .to_owned(),
+        );
+    }
+    if authority.is_empty() || authority.starts_with(':') {
+        return Err(format!("`base_url` has no host, got {shown}"));
     }
     Ok(u.trim_end_matches('/').to_owned())
 }
@@ -939,9 +953,30 @@ prompt_via_stdin = true
         assert!(normalize_base_url("http://a b").is_err());
         assert_eq!(normalize_base_url("HTTP://h:1//").unwrap(), "HTTP://h:1");
         assert_eq!(
-            normalize_base_url(" https://u@h/v1/ ").unwrap(),
-            "https://u@h/v1"
+            normalize_base_url(" https://h/v1/ ").unwrap(),
+            "https://h/v1"
         );
+        // An '@' later in the path is fine.
+        assert!(normalize_base_url("https://h/v1/@x").is_ok());
+    }
+
+    #[test]
+    fn base_url_with_credentials_is_rejected_without_echoing_them() {
+        for url in [
+            "https://user:s3cretpw@proxy.example/v1",
+            "http://u@h",
+            "https://user:s3cretpw@ bad",
+            "user:s3cretpw@host",
+        ] {
+            let e = normalize_base_url(url).unwrap_err();
+            assert!(!e.contains("s3cretpw"), "{url}: {e}");
+            assert!(!e.contains("proxy.example"), "{url}: {e}");
+        }
+        let e = err_of(&one(
+            "type = \"claude-endpoint\"\ndescription = \"d\"\nbase_url = \"https://user:s3cretpw@proxy.example\"\n",
+        ));
+        assert!(e.contains("must not contain credentials"), "{e}");
+        assert!(!e.contains("s3cretpw"), "{e}");
     }
 
     #[test]

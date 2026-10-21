@@ -250,6 +250,10 @@ fn run_error_message(err: &RunError, ty: BackendType) -> String {
              AGENT_SIDEKICK_CLAUDE to the absolute path of the claude executable."
         ),
         RunError::Io(_) => err.to_string(),
+        RunError::Wait(_) => format!(
+            "{err}. It may have changed files in cwd; no fallback is attempted for a run that \
+             already started."
+        ),
     }
 }
 
@@ -974,7 +978,8 @@ impl SidekickServer {
                     redact_with(secrets, &msg)
                 );
                 match e {
-                    RunError::CwdMissing(_) => Attempt::Stopped(msg),
+                    // Wait: the process ran, so retrying elsewhere could duplicate its work.
+                    RunError::CwdMissing(_) | RunError::Wait(_) => Attempt::Stopped(msg),
                     _ => Attempt::NotStarted(msg),
                 }
             }

@@ -185,6 +185,10 @@ pub enum RunError {
     Spawn { path: PathBuf, reason: String },
     #[error("i/o error: {0}")]
     Io(String),
+    /// The process was started, but waiting for it failed; its tree was killed. It may have
+    /// done work (e.g. changed files in cwd) before that.
+    #[error("the agent process was started, but waiting for it failed ({0}); its process tree was killed")]
+    Wait(String),
 }
 
 /// Arguments after the executable:
@@ -1128,11 +1132,18 @@ pub async fn run_launch(
         _ = cancel.cancelled() => Ended::Cancelled,
     };
     let (status, timed_out, cancelled) = match ended {
-        Ended::Exited(status) => (
-            Some(status.map_err(|e| io_err("waiting for claude", e))?),
-            false,
-            false,
-        ),
+        Ended::Exited(Ok(status)) => (Some(status), false, false),
+        Ended::Exited(Err(e)) => {
+            killer.kill_now();
+            readers.iter().for_each(JoinHandle::abort);
+            let err = RunError::Wait(e.to_string());
+            lock(&sink).push(&format!(
+                "
+[agent-sidekick] {err}
+"
+            ));
+            return Err(err);
+        }
         Ended::TimedOut => {
             killer.kill_graceful(&mut child).await;
             (None, true, false)

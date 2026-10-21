@@ -325,6 +325,16 @@ fn cancelled_running_run_is_killed() {
 
     let id = server.send_request("tools/call", setup.run_args(120));
     server.wait_counts((1, 0), Duration::from_secs(15));
+    // `running` is counted before the spawn: wait until the fake claude has really started,
+    // otherwise the cancel can win the race and the process never runs.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while setup.starts() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake claude never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     server.cancel(id);
     server.wait_counts((0, 0), Duration::from_secs(15));
     assert_eq!(setup.starts(), 1);

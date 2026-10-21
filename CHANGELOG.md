@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Long runs could hit Claude Code's MCP tool idle timeout; the server now sends progress notifications every 30 s.
 - On SIGTERM/SIGINT or client disconnect, running process trees are killed before the server exits.
 - Unix: process trees survived when a run ended other than by timeout; timeout and cancellation send SIGTERM, then SIGKILL after 3 s. Linux: the server is a child subreaper and sweeps descendants that left the process group (e.g. `setsid` background commands).
-- Prompts over 8000 characters failed on Windows (command-line limit); they are passed via stdin. "Command line too long" errors are reported clearly.
+- Very long prompts failed (Windows command line limit of about 32K characters, Linux 128 KiB per argument). Prompts over 8000 characters (and every prompt to a `.cmd` shim) are now passed via stdin; "command line too long" errors are reported clearly.
 - `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_USE_BEDROCK`/`VERTEX`/`FOUNDRY` inherited from the caller could outrank the agent's token; they are removed.
 - Very long output lines bypassed the memory cap; secrets are still redacted across the split points.
 - Logging no longer panics when the log file cannot be created (stderr only, with a warning).
