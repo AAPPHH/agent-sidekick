@@ -43,6 +43,12 @@ pub fn run(args: UninstallArgs) -> Result<ExitCode> {
             remove_secret(id, &mut removed_any),
         );
     }
+    for file in codex_logins(&resolved) {
+        step(
+            &format!("removing the ChatGPT login {}", file.display()),
+            remove_codex_login(&file, &mut removed_any),
+        );
+    }
     if !removed_any {
         println!("No stored tokens or API keys found.");
     }
@@ -58,6 +64,16 @@ pub fn run(args: UninstallArgs) -> Result<ExitCode> {
                     "Note: {} holds an opencode backend's sessions, logs and generated config \
                      (no keys); it was left in place. `uninstall --purge` removes it with the \
                      config directory.",
+                    dir.display()
+                );
+            }
+        }
+        for dir in codex_dirs(&resolved) {
+            if dir.exists() {
+                println!(
+                    "Note: {} is a codex backend's CODEX_HOME (generated config, Codex's state \
+                     databases and helper files; its login was removed above); it was left in \
+                     place. `uninstall --purge` removes it with the config directory.",
                     dir.display()
                 );
             }
@@ -96,7 +112,9 @@ pub fn secrets_to_delete(resolved: &Result<Backends, String>) -> (Vec<SecretId>,
                     BackendKind::ClaudeOauth { .. } => SecretId::Oauth(b.name.clone()),
                     BackendKind::ClaudeEndpoint { .. } => SecretId::Endpoint(b.name.clone()),
                     BackendKind::Command { .. } => SecretId::Command(b.name.clone()),
-                    BackendKind::OpenCode { .. } => SecretId::Backend(b.name.clone()),
+                    BackendKind::OpenCode { .. } | BackendKind::Codex { .. } => {
+                        SecretId::Backend(b.name.clone())
+                    }
                 });
             }
         }
@@ -125,6 +143,42 @@ fn opencode_dirs(resolved: &Result<Backends, String>) -> Vec<PathBuf> {
             })
             .collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+/// `CODEX_HOME`s of the codex backends (`<config-dir>/codex/<name>`).
+fn codex_dirs(resolved: &Result<Backends, String>) -> Vec<PathBuf> {
+    match resolved {
+        Ok(backends) => backends
+            .iter()
+            .filter_map(|b| match &b.kind {
+                BackendKind::Codex { base_dir, .. } => Some(base_dir.clone()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The ChatGPT login files (`auth.json`) of every codex backend, also of api-key backends
+/// (a login may have been made before the backend was switched).
+fn codex_logins(resolved: &Result<Backends, String>) -> Vec<PathBuf> {
+    codex_dirs(resolved)
+        .into_iter()
+        .map(|d| d.join(crate::harness::codex::AUTH_FILE))
+        .collect()
+}
+
+/// Delete a codex backend's `auth.json` if it exists (never read).
+fn remove_codex_login(file: &std::path::Path, removed_any: &mut bool) -> Result<()> {
+    match std::fs::remove_file(file) {
+        Ok(()) => {
+            *removed_any = true;
+            println!("Removed ChatGPT login {}", file.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("deleting {}: {e}", file.display())),
     }
 }
 

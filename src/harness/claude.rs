@@ -110,9 +110,9 @@ impl Harness for ClaudeHarness {
                     )),
                 }
             }
-            BackendKind::Command { .. } | BackendKind::OpenCode { .. } => {
-                Err(wrong_harness(self, backend))
-            }
+            BackendKind::Command { .. }
+            | BackendKind::OpenCode { .. }
+            | BackendKind::Codex { .. } => Err(wrong_harness(self, backend)),
         }
     }
 
@@ -129,7 +129,7 @@ impl Harness for ClaudeHarness {
         } = input;
         if matches!(
             backend.kind,
-            BackendKind::Command { .. } | BackendKind::OpenCode { .. }
+            BackendKind::Command { .. } | BackendKind::OpenCode { .. } | BackendKind::Codex { .. }
         ) {
             return Err(wrong_harness(self, backend));
         }
@@ -217,9 +217,9 @@ impl Harness for ClaudeHarness {
                 }
                 (deps.probe)(base_url)
             }
-            BackendKind::Command { .. } | BackendKind::OpenCode { .. } => {
-                Reachability::unreachable(wrong_harness(self, backend))
-            }
+            BackendKind::Command { .. }
+            | BackendKind::OpenCode { .. }
+            | BackendKind::Codex { .. } => Reachability::unreachable(wrong_harness(self, backend)),
         }
     }
 

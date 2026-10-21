@@ -261,7 +261,10 @@ fn harness_checks(backends: &Backends) -> Vec<Check> {
     let mut users: Vec<Vec<String>> = Vec::new();
     for b in backends.iter() {
         let kind = b.harness_kind();
-        if !matches!(kind, crate::harness::HarnessKind::OpenCode) {
+        if !matches!(
+            kind,
+            crate::harness::HarnessKind::OpenCode | crate::harness::HarnessKind::Codex
+        ) {
             continue;
         }
         let located = backends::resolve_program(b, None);
@@ -398,6 +401,44 @@ fn backend_check(
                          official commands) or set `harness_path` in [backends.{}]",
                         b.name
                     ),
+                )
+            } else if credential.is_err() {
+                match api_key_env {
+                    Some(var) => severe(
+                        detail,
+                        format!(
+                            "set {var} in the MCP server's environment and in this terminal, \
+                             or remove api_key_env and {setup}"
+                        ),
+                    ),
+                    None => severe(detail, setup),
+                }
+            } else if reach.detail.contains("rejected the key") {
+                severe(detail, format!("{setup} to store the correct key"))
+            } else {
+                Check::warn(
+                    name,
+                    detail,
+                    "check `base_url` and the network/proxy; the provider did not answer",
+                )
+            }
+        }
+        BackendKind::Codex {
+            auth, api_key_env, ..
+        } => {
+            if reach.detail.starts_with("codex not installed") {
+                severe(
+                    detail,
+                    format!(
+                        "install Codex (`{APP_NAME} harness install codex` shows the official \
+                         commands) or set `harness_path` in [backends.{}]",
+                        b.name
+                    ),
+                )
+            } else if *auth == backends::CodexAuth::Chatgpt {
+                severe(
+                    detail,
+                    format!("{setup} and log in with the `codex login` command it shows"),
                 )
             } else if credential.is_err() {
                 match api_key_env {

@@ -101,6 +101,9 @@ pub enum Step {
     ProviderUsesEnv { name: String, var: String },
     /// opencode with provider `ollama`: no key.
     ProviderNoKey { name: String },
+    /// codex with `auth = "chatgpt"`: create its `CODEX_HOME` with the generated config,
+    /// print the `codex login` commands and report whether the login exists.
+    CodexLogin { name: String, home: PathBuf },
 }
 
 impl Step {
@@ -128,7 +131,8 @@ impl Step {
             | Step::ProviderKey { .. }
             | Step::ProviderKeyHint { .. }
             | Step::ProviderUsesEnv { .. }
-            | Step::ProviderNoKey { .. } => None,
+            | Step::ProviderNoKey { .. }
+            | Step::CodexLogin { .. } => None,
         }
     }
 }
@@ -222,6 +226,23 @@ pub fn plan(backends: &Backends, only: Option<&str>) -> Result<Vec<Step>, String
                 },
                 BackendKind::OpenCode { .. } if single => Step::ProviderKey { name },
                 BackendKind::OpenCode { .. } => Step::ProviderKeyHint { name },
+                BackendKind::Codex {
+                    auth: backends::CodexAuth::Chatgpt,
+                    base_dir,
+                    ..
+                } => Step::CodexLogin {
+                    name,
+                    home: base_dir.clone(),
+                },
+                BackendKind::Codex {
+                    api_key_env: Some(var),
+                    ..
+                } => Step::ProviderUsesEnv {
+                    name,
+                    var: var.clone(),
+                },
+                BackendKind::Codex { .. } if single => Step::ProviderKey { name },
+                BackendKind::Codex { .. } => Step::ProviderKeyHint { name },
             }
         })
         .collect())
@@ -278,7 +299,8 @@ fn step_name(step: &Step) -> &str {
         | Step::ProviderKey { name }
         | Step::ProviderKeyHint { name }
         | Step::ProviderUsesEnv { name, .. }
-        | Step::ProviderNoKey { name } => name,
+        | Step::ProviderNoKey { name }
+        | Step::CodexLogin { name, .. } => name,
     }
 }
 
@@ -359,7 +381,7 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
     }
 
     for step in &steps {
-        run_step(step, &backends, args.token_stdin)?;
+        run_step(step, &backends, args.token_stdin, single)?;
     }
 
     if single {
@@ -418,7 +440,7 @@ fn stored_message(name: &str, source: &str) -> String {
     )
 }
 
-fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
+fn run_step(step: &Step, backends: &Backends, token_stdin: bool, single: bool) -> Result<()> {
     match step {
         Step::OauthStored { name, source, .. } => println!("{}", stored_message(name, source)),
         Step::OauthToken { name, config_dir } => {
@@ -487,13 +509,58 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
             println!("Provider key for backend `{name}` stored in {source}.");
         }
         Step::ProviderKeyHint { name } => println!(
-            "Backend `{name}` (opencode): run `{APP_NAME} setup --backend {name}` to store its \
-             provider API key."
+            "Backend `{name}` ({}): run `{APP_NAME} setup --backend {name}` to store its \
+             provider API key.",
+            harness_of(backends, name)
         ),
         Step::ProviderUsesEnv { name, var } => println!(
-            "Backend `{name}` (opencode): the provider key is read from the environment \
-             variable {var}; nothing is stored. It must be set in the MCP server's environment."
+            "Backend `{name}` ({}): the provider key is read from the environment \
+             variable {var}; nothing is stored. It must be set in the MCP server's environment.",
+            harness_of(backends, name)
         ),
+        Step::CodexLogin { name, home } => {
+            let backend = backends
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown backend `{name}`"))?;
+            let config = crate::harness::codex::prepare_home(backend).map_err(|e| anyhow!(e))?;
+            println!(
+                "\nBackend `{name}` (codex, ChatGPT login): its own CODEX_HOME is {}\n\
+                 (generated config: {}; your own ~/.codex is not used).",
+                home.display(),
+                config.display()
+            );
+            let auth = home.join(crate::harness::codex::AUTH_FILE);
+            if auth.is_file() {
+                println!(
+                    "Logged in: {} exists. To log in with another account, run:\n{}",
+                    auth.display(),
+                    crate::harness::codex::login_commands(home)
+                );
+            } else {
+                println!(
+                    "Not logged in yet. Log in with your ChatGPT account (Plus, Pro, Business, \
+                     Edu or Enterprise) in a terminal:\n{}\n\
+                     The login is stored only in this backend's CODEX_HOME.",
+                    crate::harness::codex::login_commands(home)
+                );
+                if single && std::io::stdin().is_terminal() {
+                    let mut line = String::new();
+                    print!("Press Enter when the login is done (or Ctrl+C to stop here): ");
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                    std::io::stdin().read_line(&mut line).ok();
+                }
+                if auth.is_file() {
+                    println!("Login found: {}.", auth.display());
+                } else {
+                    println!(
+                        "No login found yet ({} is missing). After logging in, check with \
+                         `{APP_NAME} backends test {name}`.",
+                        auth.display()
+                    );
+                }
+            }
+        }
         Step::ProviderNoKey { name } => println!(
             "Backend `{name}` (opencode, provider ollama): no key needed; nothing to store."
         ),
@@ -514,6 +581,14 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The harness name of backend `name` (for messages).
+fn harness_of(backends: &Backends, name: &str) -> &'static str {
+    backends
+        .get(name)
+        .map(|b| b.harness_kind().as_str())
+        .unwrap_or("backend")
 }
 
 /// Prompt for the `secret_env` value of a command backend.

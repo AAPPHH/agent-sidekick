@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use super::{
-    wrong_harness, CheckDeps, Harness, HarnessKind, LaunchInput, Normalized, SecretLoader,
-    VERSION_ENV_KEEP, VERSION_TIMEOUT,
+    batch_safe, create_private_dir, write_if_changed, wrong_harness, CheckDeps, Harness,
+    HarnessKind, LaunchInput, Normalized, SecretLoader, VERSION_ENV_KEEP, VERSION_TIMEOUT,
 };
 use crate::backends::launch::{child_env, eq_name, set_var, PROVIDER_KEY_ENV};
 use crate::backends::reach::{ProbeResponse, PROBE_TIMEOUT};
@@ -196,22 +196,6 @@ fn split_drive(path: &Path) -> Option<(OsString, OsString)> {
     Some((drive, rest))
 }
 
-#[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)
-}
-
 /// The OpenCode permission set: never "ask" (run mode rejects every ask automatically and
 /// ends the run without an answer). `read_only`: edit, bash and webfetch denied (OpenCode
 /// then does not offer those tools at all).
@@ -338,33 +322,6 @@ fn provider_options(mut options: Value, request_timeout_s: Option<u64>) -> Value
 /// runner's timeout is the hard limit.
 pub fn run_config(max_turns: u32) -> Value {
     json!({"agent": {"build": {"steps": max_turns}}})
-}
-
-/// Write `contents` to `path` unless it already holds exactly that (then nothing is
-/// written, so concurrent runs of one backend never race on an identical file). Written
-/// through a temp file in the same directory and renamed into place.
-fn write_if_changed(path: &Path, contents: &str) -> std::io::Result<()> {
-    if std::fs::read_to_string(path).is_ok_and(|old| old == contents) {
-        return Ok(());
-    }
-    let tmp = path.with_extension(format!(
-        "json.tmp-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::write(&tmp, contents)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            // Another run may have written the same content meanwhile.
-            if std::fs::read_to_string(path).is_ok_and(|old| old == contents) {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
-    }
 }
 
 /// Where opencode is looked for, in order:
@@ -536,13 +493,6 @@ fn names_plugins(text: &str) -> bool {
             compact.contains("\"plugin\":") || compact.contains("\"plugins\":")
         }
     }
-}
-
-/// Characters a model name may contain when the program is a `.cmd`/`.bat` wrapper
-/// (cmd.exe re-parses arguments).
-fn batch_safe(s: &str) -> bool {
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_./:@+".contains(c))
 }
 
 impl Harness for OpencodeHarness {

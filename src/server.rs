@@ -1333,7 +1333,8 @@ impl SidekickServer {
                             Some(("(endpoint default)", config_dir))
                         }
                         backends::BackendKind::Command { .. }
-                        | backends::BackendKind::OpenCode { .. } => None,
+                        | backends::BackendKind::OpenCode { .. }
+                        | backends::BackendKind::Codex { .. } => None,
                     };
                     let allowlist = b
                         .models
@@ -1350,6 +1351,8 @@ impl SidekickServer {
                     } else if let Some(m) = &b.model {
                         // A command backend with `{model}` (it then always has a default).
                         let _ = write!(s, ", model {m}{allowlist}");
+                    } else if matches!(b.kind, backends::BackendKind::Codex { .. }) {
+                        let _ = write!(s, ", model (codex default){allowlist}");
                     }
                     s.push('\n');
                 }
