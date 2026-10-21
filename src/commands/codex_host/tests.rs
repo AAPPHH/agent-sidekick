@@ -228,6 +228,7 @@ fn needed_vars_come_from_the_config() {
         "OAI_KEY",
         "HTTPS_PROXY",
         "SSL_CERT_FILE",
+        "CLAUDE_CODE_GIT_BASH_PATH",
     ] {
         assert!(all.iter().any(|x| x == v), "{v}: {all:?}");
     }

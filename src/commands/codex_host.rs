@@ -46,9 +46,11 @@ pub const STARTUP_TIMEOUT_SEC: u64 = 30;
 
 /// Variables Codex should forward to the server when they are set in its environment
 /// (`env_vars`), besides those named in config.toml: proxies and CA bundles (for provider
-/// probes and the agents), the locale, and on Unix what the OS keyring (Secret Service over
-/// D-Bus) and the XDG config dir need.
+/// probes and the agents), the locale, Claude Code's Git Bash location (a claude backend on
+/// Windows may need it and Codex's allowlist drops it), and on Unix what the OS keyring
+/// (Secret Service over D-Bus) and the XDG config dir need.
 const FORWARDED_VARS: &[&str] = &[
+    "CLAUDE_CODE_GIT_BASH_PATH",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
