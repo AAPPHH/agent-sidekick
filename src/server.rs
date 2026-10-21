@@ -298,13 +298,14 @@ impl SidekickServer {
         let state = &self.state;
 
         // Pure validation first: cheap, and independent of the claude install and the token.
-        let base_dir =
-            match std::env::current_dir() {
-                Ok(d) => d,
-                Err(e) => return tool_error(format!(
+        let base_dir = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                return tool_error(format!(
                     "Cannot determine the server's current directory: {e}. Pass an absolute 'cwd'."
-                )),
-            };
+                ))
+            }
+        };
         let home = crate::paths::home_dir().ok();
         let req = match resolve_request(params, &state.config, &base_dir, home.as_deref()) {
             Ok(r) => r,

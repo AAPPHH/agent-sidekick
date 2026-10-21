@@ -191,7 +191,6 @@ fn handshake_lists_tools_and_validates_params() {
 
 /// Needs the real `token` and `locate` modules (stubs panic in the server branch).
 #[test]
-#[ignore = "enable after merge"]
 fn status_reports_token_source_without_leaking() {
     let dir = tempfile::tempdir().unwrap();
     let missing_claude = dir.path().join("no-claude.exe");
