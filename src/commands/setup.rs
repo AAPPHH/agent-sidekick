@@ -514,8 +514,8 @@ enum EnvToKeep {
     Unknown,
 }
 
-const UNKNOWN_ENV_WARNING: &str = "could not read the environment variables of the user-scope \
-    registration (another entry shadows it here, or `claude mcp get` failed); variables added \
+const UNKNOWN_ENV_WARNING: &str = "could not read the environment variables of a user-scope \
+    registration, if there is one (another entry shadows it here, or `claude mcp get` failed); variables added \
     to it with `-e` are not carried over. Set them in the OS environment or add them again.";
 
 /// Only a user-scope entry is replaced, so only its variables are carried over; a local or
