@@ -87,13 +87,17 @@ pub fn fresh_config(sections: &[String]) -> String {
 }
 
 /// `existing` unchanged (byte for byte) with the sections appended; a missing final line
-/// break is added first.
+/// break is added first, and each section is set off by one empty line (the templates
+/// start with one; it is added when a section does not).
 pub fn merged_config(existing: &str, sections: &[String]) -> String {
     let mut out = existing.to_owned();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
     for s in sections {
+        if !out.is_empty() && !out.ends_with("\n\n") && !s.starts_with('\n') {
+            out.push('\n');
+        }
         out.push_str(s);
     }
     out
@@ -262,6 +266,27 @@ mod tests {
     fn merge_adds_a_missing_line_break() {
         assert_eq!(merged_config("a = 1", &["\nb\n".into()]), "a = 1\n\nb\n");
         assert_eq!(merged_config("a = 1\n", &[]), "a = 1\n");
+    }
+
+    #[test]
+    fn merge_puts_an_empty_line_before_each_section() {
+        // Existing text ending in a comment line, the real templates appended: the comment
+        // block of each new section is set off by exactly one empty line.
+        let existing = "[backends.x]\n# config_dir = \"~/.claude-sidekick\"\n";
+        let merged = merged_config(existing, &[KICONNECT.to_owned(), SIDEKICK.to_owned()]);
+        assert!(
+            merged.contains("\"~/.claude-sidekick\"\n\n# KI:connect.nrw"),
+            "{merged}"
+        );
+        assert!(merged.contains("\n\n# The second Claude account"), "{merged}");
+        assert!(!merged.contains("\n\n\n"), "{merged}");
+        // Sections without a leading empty line get one; no doubled empty lines.
+        assert_eq!(
+            merged_config("a = 1", &["b\n".into(), "c\n".into()]),
+            "a = 1\n\nb\n\nc\n"
+        );
+        assert_eq!(merged_config("a = 1\n\n", &["b\n".into()]), "a = 1\n\nb\n");
+        assert_eq!(merged_config("", &["b\n".into()]), "b\n");
     }
 
     #[test]
