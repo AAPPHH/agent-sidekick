@@ -40,6 +40,7 @@ In Claude Code:
 /plugin install agent-sidekick@agent-sidekick
 ```
 
+On Claude Code 2.1.275 or later, `/plugin install agent-sidekick --marketplace AAPPHH/agent-sidekick` does both in one step.
 (`/plugin install agent-sidekick` also works as long as no other added marketplace has a
 plugin of that name.) From a shell, the same is `claude plugin marketplace add
 AAPPHH/agent-sidekick` and `claude plugin install agent-sidekick@agent-sidekick`.

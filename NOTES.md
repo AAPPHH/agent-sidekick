@@ -228,4 +228,5 @@ Verification (claude 2.1.296, temporary `CLAUDE_CONFIG_DIR` in the session scrat
 Open points:
 
 - For feat/harness (doctor/setup owners): `doctor` should recognise the plugin registration (e.g. `claude plugin list` shows `agent-sidekick@...` enabled, or `claude mcp list` has `plugin:agent-sidekick:agent-sidekick`) and then warn about a duplicate user-scope registration instead of failing; `setup` could skip registering (or warn) when the plugin is enabled. Not changed here to keep this branch out of src/.
+- Depends on the scripts step: plugin/README.md and the README pointer use `https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.{sh,ps1}`, but `install.sh`/`install.ps1` still default `REPO` to `OWNER/agent-sidekick`; until that default is derived from Cargo.toml, the one-liners download the script and then fail to fetch the archive.
 - Not tested: install from the GitHub marketplace (`/plugin marketplace add AAPPHH/agent-sidekick`) since the repo is not published; the interactive `/plugin` dialogs and the userConfig prompt on enable; VS Code with a GUI-reduced PATH.
