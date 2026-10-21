@@ -601,15 +601,16 @@ fn descendants(procs: &[ProcStat], roots: &[i32]) -> Vec<ProcStat> {
 ///   descendants, and their process groups if they lead one,
 /// - if we are a subreaper (see [`init_process_supervision`]) and this is the only active
 ///   run: kill everything reparented to us that is not a tracked claude, because only
-///   descendants of our runs can be reparented to us. With concurrent runs this step is
-///   skipped, since an orphan could belong to another, still running, run.
+///   descendants of our runs can be reparented to us. With concurrent runs (or a run
+///   currently spawning) this step is skipped, since an orphan could belong to another,
+///   still running, run.
 ///
 /// Processes reparented to us are reaped with `waitpid(pid, WNOHANG)` for exactly those
 /// pids -- never `waitpid(-1)`, which would steal exit statuses from tokio.
 /// Assumption: in the server process only this module spawns long-lived children.
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
@@ -620,6 +621,25 @@ mod linux {
     /// Killed processes reparented to us that still need reaping.
     static TO_REAP: Mutex<Vec<i32>> = Mutex::new(Vec::new());
     static SUBREAPER: AtomicBool = AtomicBool::new(false);
+    /// Runs between just before `spawn` and their claude being registered in [`ACTIVE`].
+    static SPAWNING: AtomicUsize = AtomicUsize::new(0);
+
+    /// Held around `spawn` + `TreeKiller::attach`, so a concurrent sweep never mistakes a
+    /// claude that exists but is not yet in [`ACTIVE`] for an orphan.
+    pub struct SpawnGuard(());
+
+    impl SpawnGuard {
+        pub fn new() -> Self {
+            SPAWNING.fetch_add(1, Ordering::SeqCst);
+            SpawnGuard(())
+        }
+    }
+
+    impl Drop for SpawnGuard {
+        fn drop(&mut self) {
+            SPAWNING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         m.lock().unwrap_or_else(|e| e.into_inner())
@@ -693,7 +713,11 @@ mod linux {
             let my_pgrp = unsafe { libc::getpgrp() };
             for _ in 0..2 {
                 let procs = scan();
+                // Read after the scan: a claude visible in `procs` was forked after its run
+                // incremented SPAWNING, and that run decrements only after registering it
+                // in ACTIVE. So here it is either still counted as spawning or in `active`.
                 let active: Vec<i32> = lock(&ACTIVE).iter().map(|p| *p as i32).collect();
+                let spawning = SPAWNING.load(Ordering::SeqCst);
                 // Only processes that are verifiably still the ones we saw.
                 let mut roots: Vec<i32> = self
                     .claude
@@ -702,7 +726,7 @@ mod linux {
                     .filter(|s| procs.iter().any(|p| p.same(s)))
                     .map(|p| p.pid)
                     .collect();
-                if SUBREAPER.load(Ordering::SeqCst) && active.len() <= 1 {
+                if SUBREAPER.load(Ordering::SeqCst) && active.len() <= 1 && spawning == 0 {
                     roots.extend(
                         procs
                             .iter()
@@ -997,6 +1021,8 @@ pub async fn run(
     cmd.creation_flags(CREATE_NO_WINDOW);
 
     let started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let spawn_guard = linux::SpawnGuard::new();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1006,6 +1032,8 @@ pub async fn run(
         }
     };
     let mut killer = TreeKiller::attach(&child);
+    #[cfg(target_os = "linux")]
+    drop(spawn_guard);
     tracing::info!(log = %log_path.display(), pid = ?child.id(), "started claude");
 
     if let (Some(prompt), Some(mut stdin)) = (stdin_prompt, child.stdin.take()) {
@@ -1446,6 +1474,15 @@ mod tests {
         assert!(!log.contains("sk-ant"));
         assert_eq!(log.matches("[REDACTED]").count(), 4);
         assert_eq!(log, reference(std::str::from_utf8(&data).unwrap(), token));
+    }
+
+    #[test]
+    fn token_pattern_matches_redact_module() {
+        // TOKEN_PATTERN_PREFIX / is_token_byte mirror redact::redact_all; fail on drift.
+        let prefix = std::str::from_utf8(TOKEN_PATTERN_PREFIX).unwrap();
+        assert_eq!(redact(&format!("x {prefix}a_B-9!"), None), "x [REDACTED]!");
+        assert!(b"a_B-9".iter().all(|b| is_token_byte(*b)));
+        assert!(!is_token_byte(b'!'));
     }
 
     #[test]
