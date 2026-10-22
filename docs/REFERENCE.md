@@ -131,12 +131,24 @@ agent-sidekick does no routing of its own, so write descriptions for that reader
 
 `sidekick_run` accepts `fallback`, the name of a second backend that is used when the primary one fails:
 
-- **Triggers:** the primary backend is not reachable (endpoint probe failed), its credential is missing, its executable is not found or cannot be started, or the primary run **exits with a non-zero exit code**, or (opencode) exits 0 **without an answer** (e.g. a permission was auto-rejected; the result shows `failed: no answer: ...`).
+- **Triggers:** the primary backend is not reachable (endpoint probe failed), its credential is missing, its executable is not found or cannot be started, or the primary run **exits with a non-zero exit code**, or (opencode) exits 0 **without an answer** (e.g. a permission was auto-rejected; the result shows `failed: no answer: ...`). A detected rate limit is a trigger too (see [Rate limits](#rate-limits-http-429)).
 - **Never** after a timeout or a cancellation, and not for invalid parameters (`prompt`, `cwd`, `max_turns`, ...).
 - **The primary may have changed files.** After a non-zero exit the primary agent did run; the result says so explicitly, with its exit code and log path. Only use a fallback for tasks that are safe to retry, and check `git status` afterwards.
 - Single level: the fallback has no fallback of its own. `fallback` equal to `backend` is an error.
 - **A fallback from a `claude-oauth` backend to another `claude-oauth` backend is rejected** with an explanatory error: switching from one Claude account to another when the first one fails (for example because its usage limit is reached) would be account switching / rate-limit circumvention, which agent-sidekick does not do (see [Terms of use](#terms-of-use)).
 - The primary run's concurrency slots (per backend and global) are released before the fallback waits for its own.
+
+### Rate limits (HTTP 429)
+
+Runs that hit provider rate limits are detected and handled specially.
+
+- **Detection:** opencode and codex runs are checked in their error events only (not in tool output), claude and command runs in the output tail, but only for unambiguous API markers ("rate_limit_error", "rate limit reached", "429 Too Many Requests"). A detected rate limit adds the line `rate_limited: yes (retry after Ns)` (or `rate_limited: yes` when no wait time is given) to the result.
+- **Wait time:** taken from "retry-after: N" or "try again in ..." in the error message (formats like 22.5s, 1m2.3s, 450ms, 5 minutes); rounded up to whole seconds.
+- **Fallback:** a rate-limited run counts as failed, so `fallback` takes over; the result says `fallback reason: rate limited`.
+- **Cooldown:** after a rate limit the backend is in cooldown for the wait time (60 s when unknown, at most 3600 s). During the cooldown `sidekick_backends` reports it as not reachable with "rate limited, retry in Ns", `sidekick_status` lists it ("cooldown: <name> retry in Ns"), and `sidekick_run` does not start it: with a `fallback` that is not cooling down itself the fallback runs directly (`fallback reason: primary <name> rate limited, retry in Ns`), otherwise the call fails with a tool error naming the remaining time. A fallback that is cooling down is skipped (`fallback '<name>' skipped: rate limited, retry in Ns`).
+- **Scope:** the cooldown is per backend name and kept in memory only (a server restart clears it); two backends on the same provider account cool down separately.
+- **Not rate-limit circumvention:** the cooldown makes agent-sidekick stop sending requests to a provider that asked it to wait; a fallback from one claude-oauth backend to another stays rejected (see Fallback).
+- **Typical case:** Groq's free tier, with about 8000 tokens per minute per model, and an agent step sends about 4000 to 6000 tokens.
 
 ### Concurrency
 
