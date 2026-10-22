@@ -14,9 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrading
 
+- Without a `[backends]` section the token, login and `default_model` stay, but the backend's name changes: `backend: "sidekick"` in `sidekick_run` and `setup --backend sidekick` / `backends test sidekick` now fail with "unknown backend" (there is no alias). Replace `sidekick` with `claude` in your CLAUDE.md delegation rules and scripts.
 - A config.toml with `[backends.sidekick]` keeps working unchanged (same token, same config dir), and the wizard treats it as the existing Claude profile. Rename the section to `[backends.claude]` to use the new name; the stored token stays valid.
 - `claude` and `sidekick` may not both be claude-oauth backends (they share one token); such a config is rejected with a message naming both.
-- A config.toml that already declared its own claude-oauth backend named `claude` used `oauth-token-claude` and `~/.claude-sidekick-claude`; it now uses the shared v0.1 token and `~/.claude-sidekick`. To keep the old account, set `config_dir = "~/.claude-sidekick-claude"` and run `agent-sidekick setup --backend claude` once.
+- A config.toml that already declared its own claude-oauth backend named `claude` used `oauth-token-claude` and `~/.claude-sidekick-claude`; it now uses the shared v0.1 token and `~/.claude-sidekick`. To keep the old account, set `config_dir = "~/.claude-sidekick-claude"` and run `agent-sidekick setup --backend claude` once (this writes the shared token, replacing one that is already stored). The old secret (keyring user `oauth-token-claude`, file `token-claude`) is no longer used, and `uninstall` does not remove it; delete it by hand.
+- The wizard counts an existing `[backends.claude]` as the Claude profile only if it is a claude-oauth backend; another backend type with that name makes the wizard skip the profile with a hint.
 
 ## [0.5.0] - 2026-10-22
 

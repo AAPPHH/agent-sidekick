@@ -1072,6 +1072,26 @@ fn merge_keeps_an_old_sidekick_backend() {
     let id = SecretId::Oauth("sidekick".into());
     assert!(id.is_legacy());
     assert_eq!(fake.secret(&id).as_deref(), Some(CLAUDE_TOKEN));
+    // The closing hint names the backend as it is called in this config.
+    assert!(
+        out.contains("Lass sidekick die README zusammenfassen"),
+        "{out}"
+    );
+}
+
+/// An existing `claude` that is not a claude-oauth backend is not the Claude profile: the
+/// profile is skipped and no OAuth token goes into that backend's secret.
+#[test]
+fn merge_skips_claude_profile_when_the_name_is_taken() {
+    let fake = Fake::new();
+    let old = "[backends.claude]\ntype = \"command\"\ndescription = \"x\"\ndefault = true\n\
+               command = [\"x\", \"{prompt}\"]\nsecret_env = \"X_KEY\"\n";
+    fake.seed_config(old);
+    let (_, out) = run_ok(&fake, vec![A::Many(vec![1]), A::One(0)]);
+    assert_eq!(fake.written(), old);
+    assert!(out.contains("ist aber kein Claude-Zweitkonto"), "{out}");
+    assert_eq!(fake.secret(&SecretId::Command("claude".into())), None);
+    assert_eq!(fake.secret(&SecretId::legacy()), None);
 }
 
 #[test]
