@@ -954,11 +954,7 @@ fn stale_config_note(snap: &Snapshot) -> Option<String> {
 
 fn tool_error_with(snap: &Snapshot, msg: impl AsRef<str>) -> Result<CallToolResult, McpError> {
     match stale_config_note(snap) {
-        Some(note) => tool_error(format!(
-            "{}
-{note}",
-            msg.as_ref()
-        )),
+        Some(note) => tool_error(format!("{}\n{note}", msg.as_ref())),
         None => tool_error(msg),
     }
 }
