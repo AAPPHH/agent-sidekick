@@ -12,6 +12,7 @@ pub const KICONNECT: &str = include_str!("../../../templates/kiconnect.toml");
 pub const SIDEKICK: &str = include_str!("../../../templates/sidekick.toml");
 pub const GEMINI: &str = include_str!("../../../templates/gemini.toml");
 pub const CODEX: &str = include_str!("../../../templates/codex.toml");
+pub const GROQ: &str = include_str!("../../../templates/groq.toml");
 
 /// Placeholder of the Codex template for the `auth` value.
 pub const AUTH_PLACEHOLDER: &str = "{{AUTH}}";
@@ -73,6 +74,7 @@ pub fn section(
 ) -> Result<String, String> {
     let mut text = match profile {
         Profile::Kiconnect => KICONNECT.to_owned(),
+        Profile::Groq => GROQ.to_owned(),
         Profile::Claude => SIDEKICK.to_owned(),
         Profile::Codex => CODEX.replace(AUTH_PLACEHOLDER, &toml_string(codex_auth.as_str())),
         Profile::Gemini => {
@@ -218,7 +220,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let text = fresh_config(&all_sections(dir.path(), Profile::Kiconnect));
         let (_, b) = validate(&text, &defaults(dir.path())).unwrap();
-        assert_eq!(b.names(), ["codex", "gemini", "kiconnect", "sidekick"]);
+        assert_eq!(
+            b.names(),
+            ["codex", "gemini", "groq", "kiconnect", "sidekick"]
+        );
         assert_eq!(b.default_backend().name, "kiconnect");
 
         let k = b.get("kiconnect").unwrap();
@@ -241,6 +246,18 @@ mod tests {
         assert!(k
             .description
             .starts_with("OpenCode agent via KI:connect.nrw"));
+
+        let q = b.get("groq").unwrap();
+        let BackendKind::OpenCode {
+            provider, base_url, ..
+        } = &q.kind
+        else {
+            panic!("{q:?}")
+        };
+        assert_eq!(*provider, OpencodeProvider::OpenaiCompatible);
+        assert_eq!(base_url.as_deref(), Some("https://api.groq.com/openai/v1"));
+        assert_eq!(q.secret_id(), Some(SecretId::Backend("groq".into())));
+        assert_eq!(q.cost.as_str(), "free");
 
         let s = b.get("sidekick").unwrap();
         assert!(matches!(s.kind, BackendKind::ClaudeOauth { .. }), "{s:?}");
