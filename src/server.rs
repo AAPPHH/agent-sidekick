@@ -1476,7 +1476,7 @@ impl SidekickServer {
                     // build_launch: the backend's model, for the implicit backend
                     // `default_model`).
                     let claude = match &b.kind {
-                        backends::BackendKind::ClaudeOauth { config_dir } => {
+                        backends::BackendKind::ClaudeOauth { config_dir, .. } => {
                             Some(("(account default)", config_dir))
                         }
                         backends::BackendKind::ClaudeEndpoint { config_dir, .. } => {
@@ -2133,6 +2133,7 @@ mod tests {
             name,
             backends::BackendKind::ClaudeOauth {
                 config_dir: PathBuf::from("/cfg"),
+                permissions: Default::default(),
             },
             is_default,
         )
@@ -2158,6 +2159,7 @@ mod tests {
                 api_key_env: None,
                 auth: Default::default(),
                 config_dir: PathBuf::from("/cfg-local"),
+                permissions: Default::default(),
             },
             false,
         )

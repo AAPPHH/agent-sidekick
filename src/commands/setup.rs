@@ -183,7 +183,7 @@ pub fn plan(backends: &Backends, only: Option<&str>) -> Result<Vec<Step>, String
         .map(|b| {
             let name = b.name.clone();
             match &b.kind {
-                BackendKind::ClaudeOauth { config_dir } => Step::OauthToken {
+                BackendKind::ClaudeOauth { config_dir, .. } => Step::OauthToken {
                     name,
                     config_dir: config_dir.clone(),
                 },

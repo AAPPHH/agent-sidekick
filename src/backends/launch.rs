@@ -428,7 +428,7 @@ fn child_env_inner(
     }
 
     let mismatch = match (&backend.kind, credential) {
-        (BackendKind::ClaudeOauth { config_dir }, cred) => {
+        (BackendKind::ClaudeOauth { config_dir, .. }, cred) => {
             set_var(&mut env, CONFIG_DIR_ENV, config_dir.as_os_str());
             match cred {
                 Credential::OauthToken(t) => {
@@ -683,6 +683,7 @@ mod tests {
             name,
             BackendKind::ClaudeOauth {
                 config_dir: PathBuf::from("/cfg/oauth"),
+                permissions: Default::default(),
             },
         )
     }
@@ -695,6 +696,7 @@ mod tests {
                 api_key_env: None,
                 auth,
                 config_dir: PathBuf::from("/cfg/endpoint"),
+                permissions: Default::default(),
             },
         )
     }

@@ -7,3 +7,16 @@ description = "Second Claude subscription account (Claude Code). Best quality fo
 cost = "quota"
 max_concurrent = 1
 # config_dir = "~/.claude-sidekick"   # default for a backend named "sidekick"
+# Permissions of the headless `claude -p` run (without them it may only read):
+# acceptEdits lets it edit files; allowed_tools is used when a sidekick_run request names
+# none (a request's own allowed_tools replace it). disallowed_tools always applies, also
+# against a request, and blocks irreversible or outward actions and secrets.
+# Tighten: drop "Bash"/"Write" or use permission_mode = "plan" (read and plan only).
+# Loosen: add rules to allowed_tools or remove entries from disallowed_tools.
+# "bypassPermissions" skips all prompts (doctor warns about it).
+permission_mode = "acceptEdits"
+allowed_tools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit", "WebFetch",
+  "WebSearch", "TodoWrite"]
+disallowed_tools = ["Bash(git push:*)", "Bash(sudo:*)", "Bash(npm publish:*)",
+  "Bash(cargo publish:*)", "Bash(twine upload:*)", "Read(~/.ssh/**)",
+  "Read(~/.config/agent-sidekick/**)", "Read(~/.claude-sidekick/.credentials.json)"]

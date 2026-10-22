@@ -839,7 +839,7 @@ fn backup_path(path: &Path, timestamp: &str) -> PathBuf {
 /// The Claude config dirs of the added claude-oauth backends (as `setup` does).
 fn create_claude_dirs(s: &dyn System, backends: &Backends, added: &[Profile]) -> Result<()> {
     for prof in added {
-        if let Some(BackendKind::ClaudeOauth { config_dir }) =
+        if let Some(BackendKind::ClaudeOauth { config_dir, .. }) =
             backends.get(prof.backend_name()).map(|b| &b.kind)
         {
             s.create_dir(config_dir)?;
@@ -1035,7 +1035,7 @@ fn secret_instructions(prof: Profile, backend: &Backend, os: Os) -> String {
         }
         Profile::Claude => {
             let dir = match &backend.kind {
-                BackendKind::ClaudeOauth { config_dir } => config_dir.display().to_string(),
+                BackendKind::ClaudeOauth { config_dir, .. } => config_dir.display().to_string(),
                 _ => "~/.claude-sidekick".to_owned(),
             };
             let cmd = match os {
