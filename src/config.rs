@@ -36,7 +36,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_concurrent: 2,
+            max_concurrent: 16,
             default_max_turns: 30,
             default_model: None,
             default_timeout_s: 1800,
@@ -55,8 +55,12 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
+        Self::parse(&text, path)
+    }
+
+    pub fn parse(text: &str, path: &Path) -> Result<Self> {
         let mut cfg: Self =
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            toml::from_str(text).with_context(|| format!("parsing {}", path.display()))?;
         cfg.clamp();
         Ok(cfg)
     }
@@ -88,6 +92,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::load_from(&dir.path().join("nope.toml")).unwrap();
         assert_eq!(cfg, Config::default());
+        assert_eq!(cfg.max_concurrent, 16);
     }
 
     #[test]

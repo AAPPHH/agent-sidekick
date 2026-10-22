@@ -2550,7 +2550,7 @@ mod tests {
             text.contains("token (other): missing - run 'agent-sidekick setup --backend other'"),
             "{text}"
         );
-        assert!(text.contains("max_concurrent: 2"), "{text}");
+        assert!(text.contains("max_concurrent: 16"), "{text}");
     }
 
     #[test]

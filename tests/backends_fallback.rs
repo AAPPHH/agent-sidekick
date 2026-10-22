@@ -320,7 +320,7 @@ fn per_backend_max_concurrent_queues_runs() {
         "sleep 6\necho SLOW-DONE",
         "ping -n 7 127.0.0.1 >nul\necho SLOW-DONE",
     );
-    // Global max_concurrent stays 2: only the backend's own limit can queue the second run.
+    // Global max_concurrent stays at its default (16): only the backend's own limit can queue the second run.
     let config = command_backend("slow", &slow, true, "max_concurrent = 1\n");
     let mut server = start(&config, &dir);
     let args = |server: &mut Server| {
