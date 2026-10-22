@@ -1000,6 +1000,20 @@ fn normalize_turn_failed_and_missing_answers() {
 }
 
 #[test]
+fn normalize_ignores_rate_limit_text_in_tool_output() {
+    use serde_json::json;
+    let raw = [
+        ev(json!({"type":"item.completed","item":{"type":"command_execution","command":"grep -r rate_limit_error","aggregated_output":"src/a.rs: rate_limit_error 429 Too Many Requests","exit_code":0,"status":"completed"}})),
+        ev(json!({"type":"turn.failed","error":{"message":"Missing environment variable: `AS_MISSING_KEY`."}})),
+    ]
+    .join("\n");
+    let n = normalize_json_lines(&raw);
+    assert!(n.failure.is_some());
+    assert_eq!(n.rate_limit, None);
+    assert!(!n.text.contains("rate_limited"), "{}", n.text);
+}
+
+#[test]
 fn normalize_tolerates_a_cut_off_first_line_and_bounds_activity() {
     use serde_json::json;
     let mut raw = String::from("utput\":\"x\",\"exit_code\":0,\"status\":\"completed\"}}\n");

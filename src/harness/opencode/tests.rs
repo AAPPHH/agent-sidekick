@@ -6,6 +6,7 @@ use std::time::Duration;
 use super::*;
 use crate::backends::{resolve_with, BackendType, Backends, Cost, ResolveDefaults};
 use crate::config::Config;
+use crate::harness::RateLimit;
 use crate::runner::RunRequest;
 use crate::token::TokenSource;
 
@@ -1035,6 +1036,47 @@ fn normalizes_text_after_last_step_and_usage() {
         "The answer is 42.\n[usage] steps 2, tokens in 250 / out 30, cost 0.0030"
     );
     assert_eq!(n.failure, None);
+}
+
+#[test]
+fn rate_limit_without_answer_is_a_failure() {
+    let raw = ev(
+        json!({"type":"error","sessionID":"s","error":{"name":"APIError","data":{"message":"Rate limit reached for model `m1` on tokens per minute (TPM): Limit 8000, Used 7000, Requested 4000. Please try again in 7.66s.","statusCode":429}}}),
+    );
+    let n = normalize_json_lines(&raw);
+    assert!(n.failure.is_some());
+    assert_eq!(
+        n.rate_limit,
+        Some(RateLimit {
+            retry_after_s: Some(8)
+        })
+    );
+    assert!(
+        n.text.ends_with("\nrate_limited: yes (retry after 8s)"),
+        "{}",
+        n.text
+    );
+
+    let with_answer = format!(
+        "{raw}\n{}",
+        ev(json!({"type":"text","sessionID":"s","part":{"type":"text","text":"done"}}))
+    );
+    let n = normalize_json_lines(&with_answer);
+    assert_eq!(n.failure, None);
+    assert_eq!(n.rate_limit, None);
+}
+
+#[test]
+fn rate_limit_text_in_tool_output_is_not_a_rate_limit() {
+    let raw = [
+        ev(json!({"type":"tool_use","sessionID":"s","part":{"tool":"bash","state":{"status":"completed","output":"grep: rate_limit_error 429 Too Many Requests"}}})),
+        ev(json!({"type":"error","sessionID":"s","error":{"name":"APIError","data":{"message":"Internal server error","statusCode":500}}})),
+    ]
+    .join("\n");
+    let n = normalize_json_lines(&raw);
+    assert!(n.failure.is_some());
+    assert_eq!(n.rate_limit, None);
+    assert!(!n.text.contains("rate_limited"), "{}", n.text);
 }
 
 #[test]

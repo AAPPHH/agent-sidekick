@@ -67,9 +67,11 @@ impl Prompter for Script {
         }
     }
 
-    fn choose_one(&mut self, question: &str, options: &[String], _default: usize) -> Result<usize> {
-        self.out
-            .push_str(&format!("? {question} {}\n", options.join(" | ")));
+    fn choose_one(&mut self, question: &str, options: &[String], default: usize) -> Result<usize> {
+        self.out.push_str(&format!(
+            "? {question} {} default {default}\n",
+            options.join(" | ")
+        ));
         match self.next(question) {
             A::One(i) => {
                 assert!(i < options.len());
@@ -132,6 +134,7 @@ const CLAUDE_TOKEN: &str = "sk-ant-oat01-SECRETclaudeTOKEN123";
 const KIC_KEY: &str = "kic-SECRET-key-0123456789";
 const KIC_KEY2: &str = "kic-SECRET-key-second-999";
 const GEMINI_KEY: &str = "AIzaSECRETgeminiKEY42";
+const GROQ_KEY: &str = "gsk_SECRET-groq-key-0123456789";
 
 impl Fake {
     /// Everything installed, npm available, the provider accepts every key.
@@ -341,7 +344,14 @@ impl System for Fake {
 
 /// No secret value ever appears in the wizard's output or error.
 fn assert_no_secrets(text: &str) {
-    for s in [CLAUDE_TOKEN, KIC_KEY, KIC_KEY2, GEMINI_KEY, "SECRET"] {
+    for s in [
+        CLAUDE_TOKEN,
+        KIC_KEY,
+        KIC_KEY2,
+        GEMINI_KEY,
+        GROQ_KEY,
+        "SECRET",
+    ] {
         assert!(!text.contains(s), "secret {s} printed:\n{text}");
     }
 }
@@ -412,7 +422,7 @@ fn fresh_kiconnect_only() {
         "2.1.296",
         "Node.js: ",
         "OpenCode: ",
-        "KI:connect.nrw (Hochschul-Kontingent, kostenlos) | Claude-Zweitkonto | Gemini | OpenAI Codex (ChatGPT-Abo oder API-Key) default [0]",
+        "KI:connect.nrw (Hochschul-Kontingent, kostenlos) | Claude-Zweitkonto | Gemini | OpenAI Codex (ChatGPT-Abo oder API-Key) | Groq (kostenlos, mit Limits) default [0]",
         "Codex: nicht gefunden (nur für OpenAI Codex nötig)",
         "FAKE DOCTOR REPORT",
         "Developer: Reload Window",
@@ -545,6 +555,95 @@ fn fresh_kiconnect_and_claude() {
 }
 
 #[test]
+fn fresh_groq_only() {
+    let fake = Fake::new();
+    let (outcome, out) = run_ok(&fake, vec![A::Many(vec![4]), A::Secret(GROQ_KEY), A::Yes]);
+    assert_eq!(outcome, Outcome::Done);
+    let b = fake.resolved();
+    assert_eq!(b.names(), ["groq"]);
+    assert_eq!(b.default_backend().name, "groq");
+    assert!(fake.written().contains("[backends.groq]\ndefault = true\n"));
+    let id = SecretId::Backend("groq".into());
+    assert_eq!(id.keyring_user(), "backend-groq");
+    assert_eq!(fake.secret(&id).as_deref(), Some(GROQ_KEY));
+    assert_eq!(fake.secrets.borrow().len(), 1);
+    assert_eq!(
+        *fake.probes.borrow(),
+        [(
+            "https://api.groq.com/openai/v1/models".to_owned(),
+            Some(GROQ_KEY.to_owned())
+        )]
+    );
+    assert!(fake.runs.borrow().is_empty());
+    for needle in [
+        "— Groq (kostenlos, mit Limits) (Backend `groq`) —",
+        "https://console.groq.com/keys",
+        "ohne Kreditkarte",
+        "8000",
+        "? Groq-API-Schlüssel einfügen (Eingabe unsichtbar): ",
+        "Schlüssel geprüft: HTTP 200",
+        "Provider-Schlüssel von Backend `groq` gespeichert",
+        "Lass groq die README zusammenfassen",
+    ] {
+        assert!(out.contains(needle), "missing {needle:?}:\n{out}");
+    }
+    assert!(!out.contains("verlängert sich bei jeder"), "{out}");
+}
+
+#[test]
+fn fresh_groq_and_kiconnect_suggests_kiconnect_as_default() {
+    let fake = Fake::new();
+    let (_, out) = run_ok(
+        &fake,
+        vec![
+            A::Many(vec![4, 0]),
+            A::One(1),
+            A::Secret(GROQ_KEY),
+            A::Yes,
+            A::Secret(KIC_KEY),
+            A::Yes,
+        ],
+    );
+    assert!(
+        out.contains(
+            "groq (Groq (kostenlos, mit Limits)) | kiconnect (KI:connect.nrw \
+             (Hochschul-Kontingent, kostenlos)) default 1"
+        ),
+        "{out}"
+    );
+    let b = fake.resolved();
+    assert_eq!(b.names(), ["groq", "kiconnect"]);
+    assert_eq!(b.default_backend().name, "kiconnect");
+    assert_eq!(fake.written().matches("default = true").count(), 1);
+    assert_eq!(
+        fake.secret(&SecretId::Backend("groq".into())).as_deref(),
+        Some(GROQ_KEY)
+    );
+    assert_eq!(
+        fake.secret(&SecretId::Backend("kiconnect".into()))
+            .as_deref(),
+        Some(KIC_KEY)
+    );
+    assert_eq!(
+        *fake.probes.borrow(),
+        [
+            (
+                "https://api.groq.com/openai/v1/models".to_owned(),
+                Some(GROQ_KEY.to_owned())
+            ),
+            (
+                "https://chat.kiconnect.nrw/api/v1/models".to_owned(),
+                Some(KIC_KEY.to_owned())
+            ),
+        ]
+    );
+    assert!(
+        out.contains("Lass kiconnect die README zusammenfassen"),
+        "{out}"
+    );
+}
+
+#[test]
 fn nothing_selected_is_asked_again_then_aborts() {
     let fake = Fake::new();
     let (_, out) = run_ok(
@@ -646,7 +745,7 @@ fn claude_missing_with_codex_registers_only_in_codex() {
     assert!(
         out.contains(
             "KI:connect.nrw (Hochschul-Kontingent, kostenlos) | Gemini | OpenAI Codex \
-             (ChatGPT-Abo oder API-Key) default [0]"
+             (ChatGPT-Abo oder API-Key) | Groq (kostenlos, mit Limits) default [0]"
         ),
         "{out}"
     );
@@ -741,6 +840,29 @@ fn opencode_missing_is_installed_with_the_exact_argv() {
     assert!(out.contains("npm install -g opencode-ai"), "{out}");
     assert!(out.contains("OpenCode installiert"), "{out}");
     assert!(fake.cfg().exists());
+}
+
+#[test]
+fn groq_needs_node_and_opencode() {
+    let mut fake = Fake::new();
+    fake.node = None;
+    *fake.opencode.borrow_mut() = None;
+    let (err, _) = run_err(&fake, vec![A::Many(vec![4])]);
+    assert!(err.contains("Node.js fehlt"), "{err}");
+    assert!(err.contains("die Installation von OpenCode"), "{err}");
+    assert_nothing_written(&fake);
+
+    let fake = Fake::new();
+    *fake.opencode.borrow_mut() = None;
+    let (_, out) = run_ok(
+        &fake,
+        vec![A::Many(vec![4]), A::No, A::Secret(GROQ_KEY), A::No],
+    );
+    assert!(
+        out.contains("Hinweis: Groq braucht OpenCode. Installiere es später mit `npm install -g opencode-ai`"),
+        "{out}"
+    );
+    assert_eq!(fake.resolved().names(), ["groq"]);
 }
 
 #[test]
@@ -1181,6 +1303,28 @@ fn rejected_key_declined_stores_nothing() {
     // The rest of the setup still ran.
     assert!(fake.cfg().exists());
     assert_eq!(fake.doctor_runs.get(), 1);
+}
+
+#[test]
+fn rejected_groq_key_names_the_groq_console() {
+    let mut fake = Fake::new();
+    fake.probe = local_probe(status_server(&[401]));
+    let (_, out) = run_ok(
+        &fake,
+        vec![A::Many(vec![4]), A::Secret(GROQ_KEY), A::Yes, A::No],
+    );
+    assert!(
+        out.contains(
+            "Schlüssel abgelehnt (HTTP 401) – erstelle einen neuen auf https://console.groq.com/keys"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("`agent-sidekick setup --backend groq`"),
+        "{out}"
+    );
+    assert!(fake.secrets.borrow().is_empty());
+    assert!(fake.cfg().exists());
 }
 
 #[test]

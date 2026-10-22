@@ -149,6 +149,16 @@ Das trägt agent-sidekick in deine Codex-Konfiguration ein (`~/.codex/config.tom
 
 Die Nutzung über die API zählt auf dasselbe Kontingent wie das Webinterface, und die Zahl paralleler Anfragen pro Person ist begrenzt.
 
+## Groq-API-Schlüssel erzeugen
+
+Groq ist ein zweites kostenloses Backend mit denselben offenen Modellen wie KI:connect (gpt-oss-120b, Qwen 3.8 27B), sehr schnell, aber eng begrenzt.
+
+1. Öffne https://console.groq.com/keys und melde dich an (kostenlos, ohne Kreditkarte; Anmeldung z. B. mit Google oder GitHub).
+2. Klicke auf "Create API Key", gib einen Namen ein und kopiere den Schlüssel; er wird nur einmal angezeigt.
+3. Wähle im Setup das Profil "Groq (kostenlos, mit Limits)" oder speichere den Schlüssel später mit `agent-sidekick setup --backend groq`.
+
+**Grenzen:** Pro Modell gelten in der kostenlosen Stufe 30 Anfragen pro Minute, 1000 pro Tag, 8000 Tokens pro Minute und 200.000 Tokens pro Tag (Stand Oktober 2026, aktuelle Werte unter https://console.groq.com/settings/limits). Ein Agentenschritt braucht etwa 4000 bis 6000 Tokens, längere Aufgaben stoßen daher an das Limit (HTTP 429). Nutze Groq für kleine Aufgaben oder wenn KI:connect langsam ist.
+
 ## Token für das Claude-Zweitkonto erzeugen
 
 Öffne ein separates Terminal und führe aus:
@@ -195,6 +205,10 @@ Das Codex-Backend hat noch keine Anmeldung in seinem eigenen Codex-Ordner. Führ
 ### Codex bricht `sidekick_run` nach 60 Sekunden ab
 
 Der Eintrag in der Codex-Konfiguration hat kein ausreichendes `tool_timeout_sec`, etwa weil er mit `codex mcp add` angelegt wurde. Führe `agent-sidekick setup --codex` aus; `agent-sidekick doctor` prüft den Eintrag.
+
+### Groq oder KI:connect meldet 429 (Rate-Limit)
+
+Das Kontingent pro Minute oder pro Tag ist erschöpft. Warte die angegebene Zeit ab oder gib die Aufgabe an ein anderes Backend ab, zum Beispiel mit `fallback`. Bei Groq hilft es, die Aufgabe kleiner zu schneiden. Die aktuellen Limits stehen bei Groq unter https://console.groq.com/settings/limits.
 
 ### /mcp zeigt agent-sidekick nicht an
 

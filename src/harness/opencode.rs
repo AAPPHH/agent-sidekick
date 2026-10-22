@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use super::{
-    batch_safe, create_private_dir, write_if_changed, wrong_harness, CheckDeps, Harness,
-    HarnessKind, LaunchInput, Normalized, SecretLoader, VERSION_ENV_KEEP, VERSION_TIMEOUT,
+    batch_safe, create_private_dir, detect_rate_limit, write_if_changed, wrong_harness, CheckDeps,
+    Harness, HarnessKind, LaunchInput, Normalized, SecretLoader, VERSION_ENV_KEEP, VERSION_TIMEOUT,
 };
 use crate::backends::launch::{child_env, eq_name, set_var, PROVIDER_KEY_ENV};
 use crate::backends::reach::{ProbeResponse, PROBE_TIMEOUT};
@@ -1009,6 +1009,13 @@ pub fn normalize_json_lines(raw: &str) -> Normalized {
              permission that was not granted)",
         );
     }
+    let rate_limit = answer
+        .is_empty()
+        .then(|| detect_rate_limit(&errors.join("\n")))
+        .flatten();
+    if let Some(rl) = &rate_limit {
+        push(&rl.line());
+    }
     if usage.steps > 0 {
         push(&format!(
             "[usage] steps {}, tokens in {} / out {}, cost {:.4}",
@@ -1026,7 +1033,11 @@ pub fn normalize_json_lines(raw: &str) -> Normalized {
             "no answer: no opencode JSON output".to_owned()
         }
     });
-    Normalized { text: out, failure }
+    Normalized {
+        text: out,
+        failure,
+        rate_limit,
+    }
 }
 
 #[cfg(test)]

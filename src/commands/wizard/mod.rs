@@ -41,15 +41,17 @@ pub enum Profile {
     Claude,
     Gemini,
     Codex,
+    Groq,
 }
 
 impl Profile {
     /// In the order the wizard offers them.
-    pub const ALL: [Profile; 4] = [
+    pub const ALL: [Profile; 5] = [
         Profile::Kiconnect,
         Profile::Claude,
         Profile::Gemini,
         Profile::Codex,
+        Profile::Groq,
     ];
 
     pub fn backend_name(self) -> &'static str {
@@ -58,6 +60,7 @@ impl Profile {
             Profile::Claude => "sidekick",
             Profile::Gemini => "gemini",
             Profile::Codex => "codex",
+            Profile::Groq => "groq",
         }
     }
 
@@ -67,6 +70,7 @@ impl Profile {
             Profile::Claude => "Claude-Zweitkonto",
             Profile::Gemini => "Gemini",
             Profile::Codex => "OpenAI Codex (ChatGPT-Abo oder API-Key)",
+            Profile::Groq => "Groq (kostenlos, mit Limits)",
         }
     }
 
@@ -78,6 +82,7 @@ impl Profile {
             Profile::Claude => Some(SecretId::legacy()),
             Profile::Gemini => Some(SecretId::Command("gemini".into())),
             Profile::Codex => None,
+            Profile::Groq => Some(SecretId::Backend("groq".into())),
         }
     }
 }
@@ -97,7 +102,7 @@ pub fn run_interactive() -> Result<ExitCode> {
 
 const INTRO: &str = "Willkommen beim Einrichtungsassistenten von agent-sidekick.\n\
     agent-sidekick lässt Claude Code (oder Codex) Aufgaben an einen zweiten Agenten abgeben, \
-    zum Beispiel an KI:connect.nrw, ein zweites Claude-Konto, Gemini oder OpenAI Codex.\n\
+    zum Beispiel an KI:connect.nrw, Groq, ein zweites Claude-Konto, Gemini oder OpenAI Codex.\n\
     Der Assistent prüft die Voraussetzungen, schreibt die Konfiguration, speichert deine \
     Schlüssel sicher im Schlüsselbund und meldet den Server bei Claude Code an (auf Wunsch \
     auch bei Codex; ohne Claude Code nur bei Codex).";
@@ -157,7 +162,7 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
             path.display(),
             version_text(s, Tool::OpenCode, path)
         )),
-        None => p.say("  OpenCode: nicht gefunden (nur für KI:connect.nrw nötig)"),
+        None => p.say("  OpenCode: nicht gefunden (nur für KI:connect.nrw und Groq nötig)"),
     }
     let mut codex = s.find_codex();
     match &codex {
@@ -183,7 +188,7 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     let mut profiles = choose_profiles(p, &available)?;
 
     // 3. Tools for the profiles (nothing is written before this step succeeds).
-    let needs_node = (profiles.contains(&Profile::Kiconnect) && opencode.is_none())
+    let needs_node = (needs_opencode(&profiles) && opencode.is_none())
         || (profiles.contains(&Profile::Codex) && codex.is_none())
         || profiles.contains(&Profile::Gemini);
     let node = match node {
@@ -199,7 +204,7 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
         }
         None => None,
     };
-    if profiles.contains(&Profile::Kiconnect) && opencode.is_none() {
+    if needs_opencode(&profiles) && opencode.is_none() {
         let node = node.as_deref().expect("checked above");
         if offer_install(p, s, node, npm::OPENCODE_PACKAGE, "OpenCode")? {
             opencode = s.find_opencode();
@@ -212,8 +217,9 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
             }
         } else {
             p.say(&format!(
-                "Hinweis: KI:connect.nrw braucht OpenCode. Installiere es später mit \
+                "Hinweis: {} OpenCode. Installiere es später mit \
                  `npm install -g {}` und prüfe dann mit `agent-sidekick doctor`.",
+                opencode_users(&profiles),
                 npm::OPENCODE_PACKAGE
             ));
         }
@@ -546,7 +552,7 @@ fn version_text(s: &dyn System, tool: Tool, path: &Path) -> String {
 
 fn node_users(profiles: &[Profile], opencode_missing: bool, codex_missing: bool) -> String {
     let mut users = Vec::new();
-    if opencode_missing && profiles.contains(&Profile::Kiconnect) {
+    if opencode_missing && needs_opencode(profiles) {
         users.push("die Installation von OpenCode");
     }
     if codex_missing && profiles.contains(&Profile::Codex) {
@@ -556,6 +562,23 @@ fn node_users(profiles: &[Profile], opencode_missing: bool, codex_missing: bool)
         users.push("die Gemini CLI");
     }
     users.join(" und ")
+}
+
+fn needs_opencode(profiles: &[Profile]) -> bool {
+    profiles
+        .iter()
+        .any(|x| matches!(x, Profile::Kiconnect | Profile::Groq))
+}
+
+fn opencode_users(profiles: &[Profile]) -> String {
+    match (
+        profiles.contains(&Profile::Kiconnect),
+        profiles.contains(&Profile::Groq),
+    ) {
+        (true, true) => "KI:connect.nrw und Groq brauchen".to_owned(),
+        (false, true) => "Groq braucht".to_owned(),
+        _ => "KI:connect.nrw braucht".to_owned(),
+    }
 }
 
 /// How to install Node.js on this platform.
@@ -866,6 +889,7 @@ fn ask_secret(
         Profile::Claude => "OAuth-Token einfügen (Eingabe unsichtbar): ",
         Profile::Gemini => "Gemini-API-Schlüssel einfügen (Eingabe unsichtbar): ",
         Profile::Codex => "OpenAI-API-Schlüssel einfügen (Eingabe unsichtbar): ",
+        Profile::Groq => "Groq-API-Schlüssel einfügen (Eingabe unsichtbar): ",
     };
     loop {
         let Some(token) = read_valid_secret(p, prompt)? else {
@@ -975,6 +999,7 @@ fn verify_key(
             let hint = match prof {
                 Profile::Kiconnect => " – erstelle einen neuen auf https://chat.kiconnect.nrw",
                 Profile::Codex => " – prüfe ihn auf https://platform.openai.com/api-keys",
+                Profile::Groq => " – erstelle einen neuen auf https://console.groq.com/keys",
                 _ => "",
             };
             p.say(&format!("Schlüssel abgelehnt (HTTP {code}){hint}."));
@@ -1033,6 +1058,10 @@ fn secret_instructions(prof: Profile, backend: &Backend, os: Os) -> String {
         Profile::Codex => "Erstelle einen OpenAI-API-Schlüssel auf \
              https://platform.openai.com/api-keys (Abrechnung pro Token über dein \
              OpenAI-Konto, unabhängig von einem ChatGPT-Abo)."
+            .to_owned(),
+        Profile::Groq => "Erstelle einen Groq-API-Schlüssel auf https://console.groq.com/keys \
+             (kostenlos, ohne Kreditkarte). Die kostenlose Stufe ist eng begrenzt (etwa 8000 \
+             Tokens pro Minute und Modell), nutze Groq daher nur für kleine Aufgaben."
             .to_owned(),
     }
 }

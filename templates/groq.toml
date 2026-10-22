@@ -1,0 +1,14 @@
+
+# Groq (OpenAI-compatible API, free tier without a credit card) through the OpenCode agent CLI.
+# Key from https://console.groq.com/keys, stored with `agent-sidekick setup --backend groq`
+# (keyring user `backend-groq`). Free-tier limits per model (console.groq.com/docs/rate-limits,
+# checked 2026-10-22): 30 requests per minute, 1000 per day, 8000 tokens per minute, 200000
+# tokens per day. One agent step sends about 4000 to 6000 tokens, so longer runs hit HTTP 429.
+[backends.groq]
+harness = "opencode"
+provider = "openai-compatible"
+base_url = "https://api.groq.com/openai/v1"
+models = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]   # the first one is the default
+description = "OpenCode agent on Groq's free tier (very fast inference, open models). Free but tightly rate-limited (about 8000 tokens per minute and 200000 per day per model), so only small tasks with few steps; long runs hit HTTP 429. Same model family as kiconnect (gpt-oss-120b, Qwen 3.8 27B), useful when kiconnect is slow or busy. Reads, edits and runs commands in cwd without asking; check the diff."
+cost = "free"
+max_concurrent = 1

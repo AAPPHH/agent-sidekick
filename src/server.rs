@@ -235,6 +235,12 @@ pub fn format_outcome(outcome: &RunOutcome, timeout: Duration) -> String {
     if let Some(f) = &outcome.failure {
         let _ = writeln!(s, "failed: {f}");
     }
+    if let Some(rl) = &outcome.rate_limit {
+        let line = rl.line();
+        if !outcome.tail.lines().any(|l| l == line) {
+            let _ = writeln!(s, "{line}");
+        }
+    }
     let _ = writeln!(s, "log: {}", outcome.log_path.display());
     let _ = writeln!(s, "duration_s: {:.1}", outcome.duration.as_secs_f64());
     let _ = writeln!(s, "--- output (last {TAIL_CHARS} chars) ---");
@@ -481,6 +487,9 @@ fn format_run_result(
                     "primary: exit_code {code}, log {} — it ran and may have left changes in cwd",
                     o.log_path.display()
                 );
+                if o.rate_limit.is_some() {
+                    let _ = writeln!(s, "fallback reason: rate limited");
+                }
             }
         }
     }
@@ -735,6 +744,52 @@ fn spawn_progress_ticker(
     }))
 }
 
+const COOLDOWN_DEFAULT_S: u64 = 60;
+const COOLDOWN_MAX_S: u64 = 3600;
+
+type CooldownMap = HashMap<String, Instant>;
+
+fn cooldown_until(retry_after_s: Option<u64>, now: Instant) -> Instant {
+    let secs = retry_after_s
+        .unwrap_or(COOLDOWN_DEFAULT_S)
+        .min(COOLDOWN_MAX_S);
+    now + Duration::from_secs(secs)
+}
+
+fn remaining_s(until: Instant, now: Instant) -> Option<u64> {
+    let left = until.checked_duration_since(now)?;
+    let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+    (secs > 0).then_some(secs)
+}
+
+fn fallback_skipped_line(name: &str, secs: u64) -> String {
+    format!("fallback '{name}' skipped: rate limited, retry in {secs}s")
+}
+
+fn set_cooldown(map: &mut CooldownMap, name: &str, retry_after_s: Option<u64>, now: Instant) {
+    let until = cooldown_until(retry_after_s, now);
+    let entry = map.entry(name.to_owned()).or_insert(until);
+    *entry = (*entry).max(until);
+}
+
+fn cooldown_remaining(map: &mut CooldownMap, name: &str, now: Instant) -> Option<u64> {
+    let left = map.get(name).and_then(|&until| remaining_s(until, now));
+    if left.is_none() {
+        map.remove(name);
+    }
+    left
+}
+
+fn active_cooldowns(map: &mut CooldownMap, now: Instant) -> Vec<(String, u64)> {
+    map.retain(|_, until| remaining_s(*until, now).is_some());
+    let mut list: Vec<_> = map
+        .iter()
+        .filter_map(|(name, &until)| Some((name.clone(), remaining_s(until, now)?)))
+        .collect();
+    list.sort();
+    list
+}
+
 #[derive(Debug)]
 struct State {
     config: Config,
@@ -752,6 +807,8 @@ struct State {
     /// Cancelled when the server shuts down (client disconnect or signal); every run's
     /// cancellation token is a child of it, so in-flight process trees get killed.
     shutdown: CancellationToken,
+    /// Backend name -> end of its rate-limit cooldown.
+    cooldowns: std::sync::Mutex<CooldownMap>,
 }
 
 #[derive(Debug, Clone)]
@@ -819,6 +876,7 @@ impl SidekickServer {
                 counters: Counters::default(),
                 per_backend,
                 shutdown: CancellationToken::new(),
+                cooldowns: std::sync::Mutex::default(),
             }),
         }
     }
@@ -876,6 +934,19 @@ impl SidekickServer {
         if let Err(msg) = primary.effective_model(req.model.as_deref()) {
             return tool_error(msg);
         }
+        let direct = match state.cooldown(&primary.name) {
+            None => None,
+            Some(secs) => match fallback.filter(|fb| state.cooldown(&fb.name).is_none()) {
+                Some(fb) => Some((secs, fb)),
+                None => {
+                    return tool_error(format!(
+                        "backend {} is rate limited, retry in {secs}s; choose another backend \
+                         (see sidekick_backends) or set fallback",
+                        primary.name
+                    ))
+                }
+            },
+        };
         let timeout = req.timeout;
 
         let (cancel, _forward) = run_cancel_token(&ctx.ct, &state.shutdown);
@@ -892,75 +963,126 @@ impl SidekickServer {
         });
 
         let mut secrets = Vec::new();
-        let first = self
-            .attempt(primary, &req, &cancel, &ctx.ct, &phase, &mut secrets)
-            .await;
-        let (text, is_error) = match (first, fallback) {
-            (first, Some(fb)) if fallback_eligible(&first) => {
-                let why = match &first {
-                    Attempt::Ran(o) => exit_reason(o),
-                    Attempt::NotStarted(r) | Attempt::Stopped(r) => short_reason(r),
-                };
-                tracing::warn!(
-                    primary = %primary.name,
-                    fallback = %fb.name,
-                    "primary backend failed ({}); trying the fallback",
-                    redact_with(&secrets, &why)
-                );
-                // The fallback gets its own queue wait and its own full timeout.
-                with_phase(&phase, |p| *p = RunPhase::fallback(&fb.name));
-                let (fb_req, model_note) = fallback_request(fb, &req);
-                let second = self
-                    .attempt(fb, &fb_req, &cancel, &ctx.ct, &phase, &mut secrets)
-                    .await;
-                match (second, &first) {
-                    (Attempt::Ran(o), _) => (
-                        format_run_result(
-                            fb,
-                            &o,
-                            &fb_req,
-                            Some((primary, &first)),
-                            model_note.as_slice(),
-                        ),
-                        outcome_is_error(&o),
-                    ),
-                    (Attempt::NotStarted(r) | Attempt::Stopped(r), Attempt::Ran(o)) => {
-                        let line = format!(
-                            "fallback '{}' ({}) failed too: {}",
-                            fb.name,
-                            fb.backend_type(),
-                            short_reason(&r)
-                        );
-                        (format_run_result(primary, o, &req, None, &[line]), true)
-                    }
-                    (
-                        Attempt::NotStarted(r2) | Attempt::Stopped(r2),
-                        Attempt::NotStarted(r1) | Attempt::Stopped(r1),
-                    ) => (
-                        format!(
-                            "backend '{}' ({}) failed: {r1}\nfallback '{}' ({}) failed: {r2}",
-                            primary.name,
-                            primary.backend_type(),
-                            fb.name,
-                            fb.backend_type()
-                        ),
-                        true,
-                    ),
-                }
-            }
-            (Attempt::Ran(o), _) => (
-                format_run_result(primary, &o, &req, None, &[]),
-                outcome_is_error(&o),
-            ),
-            (Attempt::NotStarted(r), _) => (
-                format!(
-                    "backend '{}' ({}) failed: {r}",
-                    primary.name,
-                    primary.backend_type()
+        let (text, is_error) = if let Some((secs, fb)) = direct {
+            with_phase(&phase, |p| *p = RunPhase::fallback(&fb.name));
+            let (fb_req, model_note) = fallback_request(fb, &req);
+            let reason = format!(
+                "fallback reason: primary {} rate limited, retry in {secs}s",
+                primary.name
+            );
+            let mut lines = vec![reason.clone()];
+            lines.extend(model_note);
+            match self
+                .attempt(fb, &fb_req, &cancel, &ctx.ct, &phase, &mut secrets)
+                .await
+            {
+                Attempt::Ran(o) => (
+                    format_run_result(fb, &o, &fb_req, None, &lines),
+                    outcome_is_error(&o),
                 ),
-                true,
-            ),
-            (Attempt::Stopped(r), fb) => (stopped_text(primary, &req, &r, fb), true),
+                Attempt::NotStarted(r) => (
+                    format!(
+                        "backend '{}' ({}) failed: {r}\n{reason}",
+                        fb.name,
+                        fb.backend_type()
+                    ),
+                    true,
+                ),
+                Attempt::Stopped(r) => (
+                    format!("{}\n{reason}", stopped_text(fb, &fb_req, &r, None)),
+                    true,
+                ),
+            }
+        } else {
+            let first = self
+                .attempt(primary, &req, &cancel, &ctx.ct, &phase, &mut secrets)
+                .await;
+            match (first, fallback) {
+                (first, Some(fb))
+                    if fallback_eligible(&first) && state.cooldown(&fb.name).is_some() =>
+                {
+                    let secs = state.cooldown(&fb.name).unwrap_or(1);
+                    let line = fallback_skipped_line(&fb.name, secs);
+                    match &first {
+                        Attempt::Ran(o) => {
+                            (format_run_result(primary, o, &req, None, &[line]), true)
+                        }
+                        Attempt::NotStarted(r) | Attempt::Stopped(r) => (
+                            format!(
+                                "backend '{}' ({}) failed: {r}\n{line}",
+                                primary.name,
+                                primary.backend_type()
+                            ),
+                            true,
+                        ),
+                    }
+                }
+                (first, Some(fb)) if fallback_eligible(&first) => {
+                    let why = match &first {
+                        Attempt::Ran(o) => exit_reason(o),
+                        Attempt::NotStarted(r) | Attempt::Stopped(r) => short_reason(r),
+                    };
+                    tracing::warn!(
+                        primary = %primary.name,
+                        fallback = %fb.name,
+                        "primary backend failed ({}); trying the fallback",
+                        redact_with(&secrets, &why)
+                    );
+                    // The fallback gets its own queue wait and its own full timeout.
+                    with_phase(&phase, |p| *p = RunPhase::fallback(&fb.name));
+                    let (fb_req, model_note) = fallback_request(fb, &req);
+                    let second = self
+                        .attempt(fb, &fb_req, &cancel, &ctx.ct, &phase, &mut secrets)
+                        .await;
+                    match (second, &first) {
+                        (Attempt::Ran(o), _) => (
+                            format_run_result(
+                                fb,
+                                &o,
+                                &fb_req,
+                                Some((primary, &first)),
+                                model_note.as_slice(),
+                            ),
+                            outcome_is_error(&o),
+                        ),
+                        (Attempt::NotStarted(r) | Attempt::Stopped(r), Attempt::Ran(o)) => {
+                            let line = format!(
+                                "fallback '{}' ({}) failed too: {}",
+                                fb.name,
+                                fb.backend_type(),
+                                short_reason(&r)
+                            );
+                            (format_run_result(primary, o, &req, None, &[line]), true)
+                        }
+                        (
+                            Attempt::NotStarted(r2) | Attempt::Stopped(r2),
+                            Attempt::NotStarted(r1) | Attempt::Stopped(r1),
+                        ) => (
+                            format!(
+                                "backend '{}' ({}) failed: {r1}\nfallback '{}' ({}) failed: {r2}",
+                                primary.name,
+                                primary.backend_type(),
+                                fb.name,
+                                fb.backend_type()
+                            ),
+                            true,
+                        ),
+                    }
+                }
+                (Attempt::Ran(o), _) => (
+                    format_run_result(primary, &o, &req, None, &[]),
+                    outcome_is_error(&o),
+                ),
+                (Attempt::NotStarted(r), _) => (
+                    format!(
+                        "backend '{}' ({}) failed: {r}",
+                        primary.name,
+                        primary.backend_type()
+                    ),
+                    true,
+                ),
+                (Attempt::Stopped(r), fb) => (stopped_text(primary, &req, &r, fb), true),
+            }
         };
         drop(ticker);
         Ok(text_result(redact_with(&secrets, &text), is_error))
@@ -1154,13 +1276,27 @@ impl SidekickServer {
                 // would undercount steps and tokens); the buffer is the fallback.
                 let full = runner::read_logged_output(&outcome.log_path, outcome.output_offset);
                 let raw = full.as_deref().unwrap_or(&outcome.output);
+                let stopped = outcome.timed_out || outcome.cancelled;
                 if let Some(n) = backend.harness().normalize_output(raw) {
                     // Redacted again: decoding JSON escapes could have revealed a secret.
                     outcome.tail =
                         redact_with(secrets, &runner::truncate_tail(&n.text, runner::TAIL_CHARS));
-                    if outcome.exit_code == Some(0) && !outcome.timed_out && !outcome.cancelled {
+                    if outcome.exit_code == Some(0) && !stopped {
                         outcome.failure = n.failure;
                     }
+                    if !stopped {
+                        outcome.rate_limit = n.rate_limit;
+                    }
+                } else if !stopped && outcome.exit_code != Some(0) {
+                    outcome.rate_limit = crate::harness::detect_rate_limit_strict(&outcome.tail);
+                }
+                if let Some(rl) = &outcome.rate_limit {
+                    set_cooldown(
+                        &mut st.cooldowns(),
+                        &backend.name,
+                        rl.retry_after_s,
+                        Instant::now(),
+                    );
                 }
                 outcome.output.clear();
                 tracing::info!(
@@ -1206,16 +1342,26 @@ impl SidekickServer {
         let checks: Vec<_> = backends
             .iter()
             .map(|b| {
+                if let Some(secs) = st.cooldown(&b.name) {
+                    return Err(secs);
+                }
                 let b = b.clone();
                 let claude_path = st.config.claude_path.clone();
-                tokio::task::spawn_blocking(move || {
+                Ok(tokio::task::spawn_blocking(move || {
                     backends::check_backend(&b, claude_path.as_deref())
-                })
+                }))
             })
             .collect();
         let mut list = Vec::new();
         for (b, check) in backends.iter().zip(checks) {
-            let (reachable, detail) = match tokio::time::timeout_at(deadline, check).await {
+            let check = match check {
+                Ok(check) => tokio::time::timeout_at(deadline, check).await,
+                Err(secs) => Ok(Ok(backends::Reachability {
+                    reachable: false,
+                    detail: format!("rate limited, retry in {secs}s"),
+                })),
+            };
+            let (reachable, detail) = match check {
                 Ok(Ok(r)) => (r.reachable, r.detail),
                 Ok(Err(e)) => (false, format!("check failed: {e}")),
                 Err(_) => (
@@ -1260,6 +1406,9 @@ impl SidekickServer {
         let _ = writeln!(s, "agent-sidekick {}", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(s, "running: {}", st.counters.running());
         let _ = writeln!(s, "queued: {}", st.counters.queued());
+        for (name, secs) in active_cooldowns(&mut st.cooldowns(), Instant::now()) {
+            let _ = writeln!(s, "cooldown: {name} retry in {secs}s");
+        }
         let _ = writeln!(s, "max_concurrent: {}", cfg.max_concurrent);
         let _ = writeln!(s, "default max_turns: {}", cfg.default_max_turns);
         let _ = writeln!(s, "default timeout_s: {}", cfg.default_timeout_s);
@@ -1462,6 +1611,16 @@ pub async fn serve() -> anyhow::Result<()> {
 }
 
 impl State {
+    fn cooldowns(&self) -> std::sync::MutexGuard<'_, CooldownMap> {
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn cooldown(&self, name: &str) -> Option<u64> {
+        cooldown_remaining(&mut self.cooldowns(), name, Instant::now())
+    }
+
     /// Cancel every queued and running run and wait (bounded) until they have returned, so
     /// their process trees are killed and their logs closed.
     async fn shutdown_runs(&self) {
@@ -1544,6 +1703,59 @@ async fn termination_signal() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_skipped_line_names_backend_and_wait() {
+        assert_eq!(
+            fallback_skipped_line("oc", 42),
+            "fallback 'oc' skipped: rate limited, retry in 42s"
+        );
+    }
+
+    #[test]
+    fn cooldown_uses_retry_after_default_and_cap() {
+        let now = Instant::now();
+        assert_eq!(cooldown_until(Some(30), now), now + Duration::from_secs(30));
+        assert_eq!(cooldown_until(None, now), now + Duration::from_secs(60));
+        assert_eq!(
+            cooldown_until(Some(99_999), now),
+            now + Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn cooldown_remaining_rounds_up_and_expires() {
+        let now = Instant::now();
+        let mut map = CooldownMap::new();
+        set_cooldown(&mut map, "oc", Some(30), now);
+        assert_eq!(cooldown_remaining(&mut map, "oc", now), Some(30));
+        let later = now + Duration::from_millis(10_500);
+        assert_eq!(cooldown_remaining(&mut map, "oc", later), Some(20));
+        assert_eq!(cooldown_remaining(&mut map, "other", now), None);
+        assert_eq!(
+            active_cooldowns(&mut map, later),
+            vec![("oc".to_owned(), 20)]
+        );
+        let expired = now + Duration::from_secs(30);
+        assert_eq!(cooldown_remaining(&mut map, "oc", expired), None);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn cooldown_keeps_the_later_end_and_prunes_expired() {
+        let now = Instant::now();
+        let mut map = CooldownMap::new();
+        set_cooldown(&mut map, "a", Some(100), now);
+        set_cooldown(&mut map, "a", Some(10), now);
+        set_cooldown(&mut map, "b", Some(5), now);
+        let later = now + Duration::from_secs(6);
+        assert_eq!(
+            active_cooldowns(&mut map, later),
+            vec![("a".to_owned(), 94)]
+        );
+        assert!(!map.contains_key("b"));
+        assert_eq!(remaining_s(now, later), None);
+    }
 
     fn params(prompt: &str) -> RunParams {
         RunParams {
@@ -1691,6 +1903,7 @@ mod tests {
             tail: "done".into(),
             output: "done".into(),
             failure: None,
+            rate_limit: None,
             duration: Duration::from_millis(12_340),
             output_offset: 0,
         }
