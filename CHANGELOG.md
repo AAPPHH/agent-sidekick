@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The second Claude account's backend is now called `claude` (was `sidekick`): the implicit backend of a config.toml without `[backends]`, the wizard's Claude profile, its template and the examples. Use `agent-sidekick setup --backend claude` and `backend: "claude"` in `sidekick_run`.
+- A claude-oauth backend named `claude` uses the v0.1 token (keyring user `oauth-token`, file `token`, `AGENT_SIDEKICK_TOKEN`) and the config dir `~/.claude-sidekick`, as `sidekick` did. Existing installations keep their token and login; nothing needs to be set up again.
+
+### Upgrading
+
+- A config.toml with `[backends.sidekick]` keeps working unchanged (same token, same config dir), and the wizard treats it as the existing Claude profile. Rename the section to `[backends.claude]` to use the new name; the stored token stays valid.
+- `claude` and `sidekick` may not both be claude-oauth backends (they share one token); such a config is rejected with a message naming both.
+- A config.toml that already declared its own claude-oauth backend named `claude` used `oauth-token-claude` and `~/.claude-sidekick-claude`; it now uses the shared v0.1 token and `~/.claude-sidekick`. To keep the old account, set `config_dir = "~/.claude-sidekick-claude"` and run `agent-sidekick setup --backend claude` once.
+
 ## [0.5.0] - 2026-10-22
 
 ### Added

@@ -1,4 +1,4 @@
-# agent-sidekick config.toml with four backends: sidekick, local and aider (the example in
+# agent-sidekick config.toml with four backends: claude, local and aider (the example in
 # docs/REFERENCE.md) plus the optional kiconnect (section 4), which needs a stored key. The routing
 # rules in examples/CLAUDE.md cover the same four backends. Section 5 shows a commented-out
 # alternative for kiconnect with the OpenCode harness.
@@ -9,7 +9,7 @@
 #   macOS:   ~/Library/Application Support/agent-sidekick/config.toml
 #
 # Without a [backends] section agent-sidekick behaves exactly like v0.1 (one implicit
-# claude-oauth backend named "sidekick"). As soon as [backends] exists, only the backends
+# claude-oauth backend named "claude"). As soon as [backends] exists, only the backends
 # listed here are available and exactly one of them must have `default = true`.
 #
 # The calling Claude session chooses a backend by reading `description` and `cost` from the
@@ -30,16 +30,16 @@ default_timeout_s = 1800
 
 # 1) The second Claude account (subscription OAuth token).
 #    Token: `agent-sidekick setup --no-wizard` (asks for every claude-oauth backend) or
-#    `agent-sidekick setup --backend sidekick`. A claude-oauth backend named "sidekick"
-#    uses the v0.1 secret (keyring user `oauth-token`, file `token`), so an existing
-#    installation keeps its token.
-[backends.sidekick]
+#    `agent-sidekick setup --backend claude`. A claude-oauth backend named "claude" (or
+#    "sidekick", its name before v0.6) uses the v0.1 secret (keyring user `oauth-token`,
+#    file `token`), so an existing installation keeps its token.
+[backends.claude]
 type = "claude-oauth"
 description = "Second Claude subscription account (Claude Code). Best quality for complex, multi-file changes and debugging; uses that account's quota."
 default = true
 cost = "quota"
 max_concurrent = 1
-# config_dir = "~/.claude-sidekick"   # default for a backend named "sidekick"
+# config_dir = "~/.claude-sidekick"   # default for a backend named "claude"
 # model = "sonnet"                       # default model (--model)
 # models = ["sonnet", "opus", "haiku"]   # optional allowlist; without it any model is accepted
 

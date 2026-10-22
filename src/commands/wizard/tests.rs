@@ -444,7 +444,7 @@ fn fresh_all_three_with_gemini_as_default() {
         &fake,
         vec![
             A::Many(vec![0, 1, 2]),
-            A::One(2), // default: kiconnect | sidekick | gemini
+            A::One(2), // default: kiconnect | claude | gemini
             A::Secret(KIC_KEY),
             A::No, // no online check
             A::Secret(CLAUDE_TOKEN),
@@ -452,7 +452,7 @@ fn fresh_all_three_with_gemini_as_default() {
         ],
     );
     let b = fake.resolved();
-    assert_eq!(b.names(), ["gemini", "kiconnect", "sidekick"]);
+    assert_eq!(b.names(), ["claude", "gemini", "kiconnect"]);
     assert_eq!(b.default_backend().name, "gemini");
     assert_eq!(fake.written().matches("default = true").count(), 1);
     assert_eq!(
@@ -470,7 +470,7 @@ fn fresh_all_three_with_gemini_as_default() {
     );
     assert!(fake.probes.borrow().is_empty());
     // The Claude config dir of the second account was created (in the fake home).
-    let BackendKind::ClaudeOauth { config_dir, .. } = &b.get("sidekick").unwrap().kind else {
+    let BackendKind::ClaudeOauth { config_dir, .. } = &b.get("claude").unwrap().kind else {
         panic!()
     };
     assert!(config_dir.is_dir(), "{}", config_dir.display());
@@ -502,7 +502,7 @@ fn fresh_claude_only_needs_no_node() {
         vec![A::Many(vec![1]), A::Secret("not-a-claude-token-xyz")],
     );
     let b = fake.resolved();
-    assert_eq!(b.names(), ["sidekick"]);
+    assert_eq!(b.names(), ["claude"]);
     assert!(b.default_backend().is_default);
     assert_eq!(
         fake.secret(&SecretId::legacy()).as_deref(),
@@ -513,7 +513,7 @@ fn fresh_claude_only_needs_no_node() {
         "{out}"
     );
     assert!(
-        out.contains("Lass sidekick die README zusammenfassen"),
+        out.contains("Lass claude die README zusammenfassen"),
         "{out}"
     );
     assert!(!out.contains("verlängert sich bei jeder"), "{out}");
@@ -527,14 +527,14 @@ fn fresh_claude_and_gemini_default_suggestion_without_kiconnect() {
         &fake,
         vec![
             A::Many(vec![1, 2]),
-            A::One(0), // sidekick | gemini
+            A::One(0), // claude | gemini
             A::Secret(CLAUDE_TOKEN),
             A::Secret(GEMINI_KEY),
         ],
     );
     let b = fake.resolved();
-    assert_eq!(b.names(), ["gemini", "sidekick"]);
-    assert_eq!(b.default_backend().name, "sidekick");
+    assert_eq!(b.names(), ["claude", "gemini"]);
+    assert_eq!(b.default_backend().name, "claude");
 }
 
 #[test]
@@ -652,10 +652,10 @@ fn nothing_selected_is_asked_again_then_aborts() {
     );
     assert!(out.contains("Bitte mindestens ein Profil wählen."), "{out}");
     assert!(
-        out.contains("OAuth-Token von Backend `sidekick` gespeichert im Fake-Schlüsselbund."),
+        out.contains("OAuth-Token von Backend `claude` gespeichert im Fake-Schlüsselbund."),
         "{out}"
     );
-    assert_eq!(fake.resolved().names(), ["sidekick"]);
+    assert_eq!(fake.resolved().names(), ["claude"]);
 
     let fake = Fake::new();
     let (err, _) = run_err(
@@ -938,7 +938,7 @@ fn gemini_declined_drops_the_profile() {
         vec![A::Many(vec![1, 2]), A::No, A::Secret(CLAUDE_TOKEN)],
     );
     assert!(out.contains("Gemini wird übersprungen"), "{out}");
-    assert_eq!(fake.resolved().names(), ["sidekick"]);
+    assert_eq!(fake.resolved().names(), ["claude"]);
 
     // Gemini alone and declined: nothing left.
     let fake = Fake::new();
@@ -967,7 +967,7 @@ fn gemini_without_npm_is_skipped_with_one_hint() {
         "{out}"
     );
     assert!(!out.contains(RESUME), "{out}");
-    assert_eq!(fake.resolved().names(), ["sidekick"]);
+    assert_eq!(fake.resolved().names(), ["claude"]);
 }
 
 // ----- existing config -----
@@ -1031,7 +1031,7 @@ fn merge_into_the_example_keeps_existing_backends_byte_identical() {
     assert!(written[EXAMPLE.len()..].contains("[backends.gemini]"));
     assert!(!written[EXAMPLE.len()..].contains("default = true"));
     let b = fake.resolved();
-    assert_eq!(b.default_backend().name, "sidekick");
+    assert_eq!(b.default_backend().name, "claude");
     assert!(matches!(
         b.get("kiconnect").unwrap().kind,
         BackendKind::Command { .. }
@@ -1049,8 +1049,29 @@ fn merge_into_the_example_keeps_existing_backends_byte_identical() {
         out.contains("Backend `kiconnect` steht schon in der config.toml"),
         "{out}"
     );
-    assert!(out.contains("Standard-Backend bleibt `sidekick`"), "{out}");
+    assert!(out.contains("Standard-Backend bleibt `claude`"), "{out}");
     assert_eq!(fake.backups().len(), 1);
+}
+
+/// A config from before v0.6 names the Claude backend `sidekick`: the Claude profile counts
+/// as present (no second Claude section) and its token goes to the shared legacy secret.
+#[test]
+fn merge_keeps_an_old_sidekick_backend() {
+    let fake = Fake::new();
+    let old = EXAMPLE.replace("[backends.claude]", "[backends.sidekick]");
+    fake.seed_config(&old);
+    let (_, out) = run_ok(
+        &fake,
+        vec![A::Many(vec![1]), A::One(0), A::Secret(CLAUDE_TOKEN)],
+    );
+    assert_eq!(fake.written(), old);
+    assert!(
+        out.contains("Backend `sidekick` steht schon in der config.toml"),
+        "{out}"
+    );
+    let id = SecretId::Oauth("sidekick".into());
+    assert!(id.is_legacy());
+    assert_eq!(fake.secret(&id).as_deref(), Some(CLAUDE_TOKEN));
 }
 
 #[test]
@@ -1072,7 +1093,7 @@ fn merge_with_nothing_missing_leaves_the_file_alone() {
 }
 
 #[test]
-fn merge_into_an_implicit_config_keeps_sidekick() {
+fn merge_into_an_implicit_config_keeps_claude() {
     let fake = Fake::new();
     let old = "max_concurrent = 3\n# my comment\ndefault_timeout_s = 900";
     fake.seed_config(old);
@@ -1081,7 +1102,7 @@ fn merge_into_an_implicit_config_keeps_sidekick() {
         vec![
             A::Many(vec![0]),
             A::One(0), // merge
-            A::One(1), // default: kiconnect | sidekick -> sidekick
+            A::One(1), // default: kiconnect | claude -> claude
             A::Secret(KIC_KEY),
             A::Yes,
         ],
@@ -1089,10 +1110,10 @@ fn merge_into_an_implicit_config_keeps_sidekick() {
     let written = fake.written();
     assert!(written.starts_with(old));
     let b = fake.resolved();
-    assert_eq!(b.names(), ["kiconnect", "sidekick"]);
-    assert_eq!(b.default_backend().name, "sidekick");
-    assert!(out.contains("eingebaute Backend `sidekick`"), "{out}");
-    // No token prompt for the carried-over sidekick.
+    assert_eq!(b.names(), ["claude", "kiconnect"]);
+    assert_eq!(b.default_backend().name, "claude");
+    assert!(out.contains("eingebaute Backend `claude`"), "{out}");
+    // No token prompt for the carried-over implicit backend.
     assert_eq!(fake.secret(&SecretId::legacy()), None);
 }
 
@@ -1116,7 +1137,7 @@ fn unreadable_config_offers_only_rewrite_or_cancel() {
         &fake,
         vec![A::Many(vec![1]), A::One(0), A::Secret(CLAUDE_TOKEN)],
     );
-    assert_eq!(fake.resolved().names(), ["sidekick"]);
+    assert_eq!(fake.resolved().names(), ["claude"]);
     assert_eq!(fake.backups().len(), 1);
 }
 

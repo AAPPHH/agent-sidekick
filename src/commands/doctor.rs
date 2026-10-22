@@ -111,7 +111,7 @@ pub(crate) fn run_checks() -> Vec<Check> {
 /// installed (agent-sidekick is then used from Codex) and no claude-* backend is
 /// configured; `backends`: `None` when config.toml could not be loaded or resolved (then
 /// it cannot be told, so claude counts as needed). A config without `[backends]` has the
-/// implicit claude-oauth backend `sidekick`, so it needs claude.
+/// implicit claude-oauth backend `claude`, so it needs claude.
 fn claude_needed(backends: Option<&Backends>, codex_found: bool) -> bool {
     if !codex_found {
         return true;

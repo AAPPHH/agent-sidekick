@@ -1,12 +1,12 @@
 
 # The second Claude account (subscription OAuth token from `claude setup-token`).
-# Token: `agent-sidekick setup --backend sidekick` (keyring user `oauth-token`).
-[backends.sidekick]
+# Token: `agent-sidekick setup --backend claude` (keyring user `oauth-token`).
+[backends.claude]
 harness = "claude"
 description = "Second Claude subscription account (Claude Code). Best quality for complex, multi-file changes and debugging; uses that account's quota."
 cost = "quota"
 # Parallel runs share the account's quota and need separate working dirs (e.g. git worktrees).
-# config_dir = "~/.claude-sidekick"   # default for a backend named "sidekick"
+# config_dir = "~/.claude-sidekick"   # default for a backend named "claude"
 # Permissions of the headless `claude -p` run (without them it may only read):
 # acceptEdits lets it edit files; allowed_tools is used when a sidekick_run request names
 # none (a request's own allowed_tools replace it). disallowed_tools always applies, also

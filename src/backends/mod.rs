@@ -5,7 +5,7 @@
 //! [`BackendType`] (shown in results and logs as before):
 //!
 //! - `claude-oauth`: the official `claude` CLI with a Claude account's OAuth token
-//!   (the v0.1 behaviour; implicit backend `sidekick` when config.toml has no `[backends]`).
+//!   (the v0.1 behaviour; implicit backend `claude` when config.toml has no `[backends]`).
 //! - `claude-endpoint`: the `claude` CLI against an Anthropic-compatible endpoint
 //!   (`ANTHROPIC_BASE_URL`, e.g. Ollama or LM Studio) with an API key.
 //! - `command`: any other agent CLI, configured as an argument array with placeholders;
@@ -33,7 +33,16 @@ pub use reach::{check_backend, probe_http, Reachability};
 pub use resolve::{resolve, resolve_with, ResolveDefaults};
 
 /// Name of the implicit backend (and of the legacy secret locations).
-pub const IMPLICIT_BACKEND: &str = "sidekick";
+pub const IMPLICIT_BACKEND: &str = "claude";
+/// Name of the implicit backend before v0.6. A claude-oauth backend with this name (declared
+/// in an older config.toml) keeps the same token and config dir as [`IMPLICIT_BACKEND`].
+pub const OLD_IMPLICIT_BACKEND: &str = "sidekick";
+
+/// `true` for the names whose claude-oauth backend uses the v0.1 token and the default
+/// config dir `~/.claude-sidekick`: [`IMPLICIT_BACKEND`] and [`OLD_IMPLICIT_BACKEND`].
+pub fn is_primary_oauth_name(name: &str) -> bool {
+    name == IMPLICIT_BACKEND || name == OLD_IMPLICIT_BACKEND
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -377,7 +386,7 @@ pub struct Backend {
     pub models: Option<Vec<String>>,
     pub env: BTreeMap<String, String>,
     pub pass_env: Vec<String>,
-    /// True for the implicit `sidekick` backend created when `[backends]` is absent.
+    /// True for the implicit `claude` backend created when `[backends]` is absent.
     pub implicit: bool,
     pub kind: BackendKind,
     /// Names of every configured `api_key_env` and `secret_env` (of all backends, this one

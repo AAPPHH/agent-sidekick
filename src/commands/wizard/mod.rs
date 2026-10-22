@@ -24,7 +24,9 @@ use std::process::ExitCode;
 use anyhow::{bail, Context, Result};
 
 use crate::backends::reach::ProbeResponse;
-use crate::backends::{Backend, BackendKind, Backends, CodexAuth};
+use crate::backends::{
+    Backend, BackendKind, Backends, CodexAuth, IMPLICIT_BACKEND, OLD_IMPLICIT_BACKEND,
+};
 use crate::config::Config;
 use crate::locate::Os;
 use crate::redact::{redact_all, MIN_SECRET_LEN};
@@ -57,10 +59,22 @@ impl Profile {
     pub fn backend_name(self) -> &'static str {
         match self {
             Profile::Kiconnect => "kiconnect",
-            Profile::Claude => "sidekick",
+            Profile::Claude => "claude",
             Profile::Gemini => "gemini",
             Profile::Codex => "codex",
             Profile::Groq => "groq",
+        }
+    }
+
+    /// Names under which an existing backend counts as this profile: the Claude profile also
+    /// matches `sidekick`, its backend name before v0.6.
+    pub fn backend_names(self) -> &'static [&'static str] {
+        match self {
+            Profile::Claude => &[IMPLICIT_BACKEND, OLD_IMPLICIT_BACKEND],
+            Profile::Kiconnect => &["kiconnect"],
+            Profile::Gemini => &["gemini"],
+            Profile::Codex => &["codex"],
+            Profile::Groq => &["groq"],
         }
     }
 
@@ -308,17 +322,16 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     let merging = matches!(mode, Mode::Merge { .. });
 
     // Backends to add: the chosen profiles that do not exist yet, plus (merging into a
-    // config without [backends]) the implicit `sidekick`, which a [backends] section would
+    // config without [backends]) the implicit `claude`, which a [backends] section would
     // otherwise remove.
     let mut add: Vec<Profile> = Vec::new();
     for &prof in &profiles {
         let exists = existing_backends
             .as_ref()
-            .is_some_and(|m| m.contains_key(prof.backend_name()));
-        if exists {
+            .and_then(|m| prof.backend_names().iter().find(|n| m.contains_key(**n)));
+        if let Some(name) = exists {
             p.say(&format!(
-                "Backend `{}` steht schon in der config.toml und bleibt unverändert.",
-                prof.backend_name()
+                "Backend `{name}` steht schon in der config.toml und bleibt unverändert."
             ));
         } else {
             add.push(prof);
@@ -330,13 +343,13 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
         && !add.is_empty();
     if implicit_sidekick && claude.is_none() {
         p.say(
-            "Die bisherige Konfiguration nutzt das eingebaute Backend `sidekick` (zweites \
+            "Die bisherige Konfiguration nutzt das eingebaute Backend `claude` (zweites \
              Claude-Konto). Ohne Claude Code kann es nicht laufen und wird deshalb nicht \
              übernommen.",
         );
     } else if implicit_sidekick {
         p.say(
-            "Die bisherige Konfiguration nutzt das eingebaute Backend `sidekick` (zweites \
+            "Die bisherige Konfiguration nutzt das eingebaute Backend `claude` (zweites \
              Claude-Konto). Es wird als eigener Abschnitt übernommen, damit es erhalten bleibt; \
              sein gespeicherter Token gilt weiter.",
         );
@@ -417,7 +430,7 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     // 7. Secrets (asked before writing, so a cancelled prompt leaves nothing behind).
     let mut secrets: Vec<(String, SecretId, Token)> = Vec::new();
     for &prof in &profiles {
-        let Some(backend) = backends.get(prof.backend_name()) else {
+        let Some(backend) = prof.backend_names().iter().find_map(|n| backends.get(n)) else {
             continue;
         };
         if let Some((id, token)) = ask_secret(p, s, prof, backend)? {

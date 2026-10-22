@@ -1,7 +1,7 @@
 //! Validation of `[backends]` into [`Backends`].
 //!
 //! Rules (see also README / NOTES):
-//! - no `[backends]` section: the implicit claude-oauth backend `sidekick` (v0.1 behaviour);
+//! - no `[backends]` section: the implicit claude-oauth backend `claude` (v0.1 behaviour);
 //!   the top-level `default_model` applies only to this implicit backend.
 //! - `[backends]` present: at least one backend, exactly one with `default = true`.
 //! - `cost` is optional and defaults by type: claude-oauth `quota`, claude-endpoint `paid`,
@@ -16,8 +16,9 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    command_uses_model, Backend, BackendKind, BackendType, Backends, ClaudePermissions, CodexAuth,
-    Cost, EndpointAuth, OpencodeProvider, RawAuth, RawBackend, IMPLICIT_BACKEND,
+    command_uses_model, is_primary_oauth_name, Backend, BackendKind, BackendType, Backends,
+    ClaudePermissions, CodexAuth, Cost, EndpointAuth, OpencodeProvider, RawAuth, RawBackend,
+    IMPLICIT_BACKEND, OLD_IMPLICIT_BACKEND,
 };
 use crate::config::Config;
 use crate::harness::HarnessKind;
@@ -27,7 +28,7 @@ use crate::harness::HarnessKind;
 pub struct ResolveDefaults {
     /// Home directory for `~` expansion and `~/.claude-sidekick-<name>` defaults.
     pub home: Option<PathBuf>,
-    /// Config dir of the implicit/`sidekick` claude-oauth backend when none is configured
+    /// Config dir of the implicit/`claude`/`sidekick` claude-oauth backend when none is configured
     /// (`AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` or `~/.claude-sidekick`).
     pub legacy_agent_config_dir: Option<PathBuf>,
     /// agent-sidekick's own config dir (`paths::config_dir`); opencode backends keep their
@@ -219,6 +220,22 @@ fn resolve_explicit(
             "backends: more than one default backend ({}); exactly one may have `default = true`",
             defaults_set.join(", ")
         )),
+    }
+
+    // `claude` and `sidekick` (its name before v0.6) use the same stored token, so only one
+    // of them may be a claude-oauth backend.
+    let primary: Vec<&str> = list
+        .iter()
+        .filter(|b| matches!(b.kind, BackendKind::ClaudeOauth { .. }))
+        .map(|b| b.name.as_str())
+        .filter(|n| is_primary_oauth_name(n))
+        .collect();
+    if primary.len() > 1 {
+        errors.push(format!(
+            "backends: `{IMPLICIT_BACKEND}` and `{OLD_IMPLICIT_BACKEND}` are both claude-oauth \
+             backends, but they share one stored token; remove \
+             `[backends.{OLD_IMPLICIT_BACKEND}]` (or rename one of them)"
+        ));
     }
 
     // A claude-endpoint must not share its CLAUDE_CONFIG_DIR with a claude-oauth backend:
@@ -1023,7 +1040,7 @@ fn resolve_models(
 }
 
 /// `config_dir` of a claude-* backend: configured (with `~` expanded, must be absolute) or
-/// the default (`sidekick` oauth: the legacy dir; else `~/.claude-sidekick-<name>`).
+/// the default (`claude` or `sidekick` oauth: the legacy dir; else `~/.claude-sidekick-<name>`).
 fn config_dir_for(
     name: &str,
     raw: &RawBackend,
@@ -1054,7 +1071,7 @@ fn config_dir_for(
                 None
             }
         }
-        None if oauth && name == IMPLICIT_BACKEND => {
+        None if oauth && is_primary_oauth_name(name) => {
             let dir = defaults.legacy_agent_config_dir.clone();
             if dir.is_none() {
                 errs.push(
@@ -1332,7 +1349,7 @@ pass_env = ["OPENAI_API_BASE"]
         let b = resolve_with(&cfg, &defaults()).unwrap();
         assert_eq!(b.len(), 1);
         let s = b.default_backend();
-        assert_eq!(s.name, "sidekick");
+        assert_eq!(s.name, "claude");
         assert!(s.implicit && s.is_default);
         assert_eq!(s.cost, Cost::Quota);
         assert_eq!(s.description, IMPLICIT_DESCRIPTION);
@@ -1356,7 +1373,45 @@ pass_env = ["OPENAI_API_BASE"]
             config_dir: None,
         };
         let e = resolve_with(&Config::default(), &d).unwrap_err();
-        assert!(e.starts_with("backends.sidekick: "), "{e}");
+        assert!(e.starts_with("backends.claude: "), "{e}");
+    }
+
+    #[test]
+    fn declared_claude_and_sidekick_default_to_the_legacy_dir() {
+        for name in ["claude", "sidekick"] {
+            let b = resolve_str(&format!(
+                "[backends.{name}]\ntype = \"claude-oauth\"\ndescription = \"d\"\ndefault = true\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                b.get(name).unwrap().kind,
+                BackendKind::ClaudeOauth {
+                    config_dir: abs("home").join(".claude-sidekick"),
+                    permissions: Default::default(),
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_and_sidekick_oauth_together_is_an_error() {
+        let e = err_of(
+            "[backends.claude]\ntype = \"claude-oauth\"\ndescription = \"a\"\ndefault = true\n\
+             [backends.sidekick]\ntype = \"claude-oauth\"\ndescription = \"b\"\n\
+             config_dir = \"~/.claude-sidekick-old\"\n",
+        );
+        assert!(
+            e.contains("`claude` and `sidekick` are both claude-oauth"),
+            "{e}"
+        );
+        // A non-oauth backend named `sidekick` does not share the token.
+        resolve_str(
+            "[backends.claude]\ntype = \"claude-oauth\"\ndescription = \"a\"\ndefault = true\n\
+             [backends.sidekick]\ntype = \"command\"\ndescription = \"b\"\n\
+             command = [\"x\", \"{prompt}\"]\n",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1927,7 +1982,7 @@ prompt_via_stdin = true
     #[test]
     fn example_config_is_valid() {
         let b = resolve_str(include_str!("../../examples/config.toml")).unwrap();
-        assert_eq!(b.names(), vec!["aider", "kiconnect", "local", "sidekick"]);
+        assert_eq!(b.names(), vec!["aider", "claude", "kiconnect", "local"]);
         assert!(matches!(
             &b.get("kiconnect").unwrap().kind,
             BackendKind::Command { secret_env: Some(v), .. } if v == "OPENAI_API_KEY"

@@ -31,7 +31,7 @@ A backend is a place where `sidekick_run` executes a prompt. Backends are config
 
 **Harnesses (since 0.3.0):** instead of `type`, a backend can name the agent CLI that runs it with `harness`: `harness = "claude"` without `base_url` is the same as `type = "claude-oauth"`, `harness = "claude"` with `base_url` the same as `type = "claude-endpoint"`, and `harness = "command"` the same as `type = "command"`. `harness = "opencode"` and `harness = "codex"` have no `type` equivalent (`type = "opencode"` / `type = "codex"` are config errors). Existing configs with `type` keep working unchanged; if both are set they must agree (otherwise it is a config error). `agent-sidekick harness list` shows whether each harness is installed (path, version), `agent-sidekick harness install <name>` prints its official install command (it never runs it).
 
-**Upgrading from v0.1:** without a `[backends]` section nothing changes. There is one implicit backend named `sidekick` of type `claude-oauth` that uses the existing token, config dir and `default_model`.
+**Upgrading from v0.1:** without a `[backends]` section nothing changes. There is one implicit backend named `claude` of type `claude-oauth` that uses the existing token, config dir and `default_model`. Before v0.6 this backend was called `sidekick`; a config.toml that declares `[backends.sidekick]` keeps working with the same token and config dir (see [Secrets per backend](#secrets-per-backend)).
 As soon as `[backends]` exists, only the backends listed there are available.
 
 ### Example
@@ -41,7 +41,7 @@ Three backends: the second Claude account (default), Claude Code against a local
 ```toml
 max_concurrent = 16         # global limit over all backends (default 16)
 
-[backends.sidekick]
+[backends.claude]
 type = "claude-oauth"
 description = "Second Claude subscription account (Claude Code). Best quality for complex, multi-file changes and debugging; uses that account's quota."
 default = true
@@ -179,7 +179,7 @@ Loopback hosts are probed directly; other hosts go through the proxy from `HTTPS
 
 | Backend | Keyring (service `agent-sidekick`), user | File fallback in the config dir | Environment override |
 |---------|------------------------------------------|---------------------------------|----------------------|
-| `claude-oauth` named `sidekick` (implicit or declared) | `oauth-token` | `token` | `AGENT_SIDEKICK_TOKEN` |
+| `claude-oauth` named `claude` or `sidekick` (implicit or declared) | `oauth-token` | `token` | `AGENT_SIDEKICK_TOKEN` |
 | other `claude-oauth` | `oauth-token-<name>` | `token-<name>` | none |
 | `claude-endpoint` | `endpoint-<name>` | `endpoint-<name>.key` | `api_key_env` (a variable of the MCP server's environment) |
 | `command` with `secret_env` | `cmd-<name>` | `cmd-<name>.key` | none (the value goes into the variable `secret_env` names) |
@@ -189,7 +189,7 @@ Loopback hosts are probed directly; other hosts go through the proxy from `HTTPS
 | `codex` with `auth = "api-key"` | `backend-<name>` | `backend-<name>.key` | `api_key_env` (a variable of the MCP server's environment) |
 | `codex` with `auth = "chatgpt"` | none (Codex keeps the login in `<config-dir>/codex/<name>/auth.json`, written by `codex login`) | none | none |
 
-A backend named `sidekick` therefore keeps using the token of a v0.1 installation. Files are created with mode 0600 (Unix) or a user-only ACL (Windows).
+A backend named `claude` (or `sidekick`, its name before v0.6) therefore keeps using the token of a v0.1 installation. Because they share that token, a config may not declare both as `claude-oauth` backends. Files are created with mode 0600 (Unix) or a user-only ACL (Windows).
 `api_key_env` is read from the environment of the MCP server, i.e. what Claude Code passes to it; set the variable in the user or OS environment that Claude Code inherits, or add it to the registration (`claude mcp add ... -e NAME=value`). Re-running `agent-sidekick setup` keeps such extra `-e` variables of the user-scope registration (it prints their names, never their values), see [CLI reference](#cli-reference).
 The variable is removed from the environment of every other backend's runs, see [session isolation](#child-environment-and-session-isolation).
 
@@ -371,7 +371,7 @@ Put rules like these into the `CLAUDE.md` of your projects (or `~/.claude/CLAUDE
 
 - Before delegating, call `sidekick_backends`; only use backends that are reachable.
 - `local` (free): boilerplate, test scaffolding, docs, mechanical refactors.
-- `sidekick` (second Claude account, quota): complex multi-file changes and debugging.
+- `claude` (second Claude account, quota): complex multi-file changes and debugging.
 - `aider` (free, edits without asking): small edits to files you name; review the diff.
 - Pick the model from the backend's `models` in `sidekick_backends` (or omit `model` for
   its `default_model`); a model the backend does not list is rejected.
@@ -442,7 +442,7 @@ Without a `[backends]` section it also shows the global `default model` and the 
 | `agent-sidekick backends test <name>` | Reachability with details (claude version, resolved program, HTTP status). Exit code 0 if reachable, 1 otherwise. |
 | `agent-sidekick harness list` | Each known harness (`claude`, `opencode`, `codex`, `command`): installed or not, path, `--version` output, and the configured backends using it. `command` is generic (its program is configured per backend), so it shows `n/a`. For `codex` the native `codex.exe` from the npm package is preferred over the `.cmd` shim. `opencode --version` and `codex --version` run in a temporary isolated home that is removed afterwards. |
 | `agent-sidekick harness install <name>` | Prints the official install command(s) of a harness; agent-sidekick never runs them. `command` has nothing to install. |
-| `agent-sidekick doctor [--offline]` | Checks the installation, the harness executables the backends use (`opencode`, `codex`: path and version), every backend and, when the Codex CLI is installed, the [Codex registration](#codex-as-mcp-host) (read-only; not registered is fine, except on a [Codex-only machine](#codex-only-machines)), and prints next steps. A missing `claude` is a failure only if a `claude-*` backend is configured (including the implicit `sidekick` of a config without `[backends]`) or the Codex CLI is not installed; otherwise it is an `[OK]` note and the Claude Code registration check is skipped. Also shows an update hint at most once a day (checked and shown once, later runs that day stay quiet; result kept in `<config-dir>/update-check.json`, only if that directory exists); `--offline` skips the check. A failed check is an info line, never a doctor failure. |
+| `agent-sidekick doctor [--offline]` | Checks the installation, the harness executables the backends use (`opencode`, `codex`: path and version), every backend and, when the Codex CLI is installed, the [Codex registration](#codex-as-mcp-host) (read-only; not registered is fine, except on a [Codex-only machine](#codex-only-machines)), and prints next steps. A missing `claude` is a failure only if a `claude-*` backend is configured (including the implicit `claude` of a config without `[backends]`) or the Codex CLI is not installed; otherwise it is an `[OK]` note and the Claude Code registration check is skipped. Also shows an update hint at most once a day (checked and shown once, later runs that day stay quiet; result kept in `<config-dir>/update-check.json`, only if that directory exists); `--offline` skips the check. A failed check is an info line, never a doctor failure. |
 | `agent-sidekick update` | Checks the latest GitHub release and prints the install command if a newer one exists. Exit code 0 also when up to date or no release exists yet; 1 if the check failed (offline, rate limit, invalid `AGENT_SIDEKICK_UPDATE_URL`). |
 | `agent-sidekick uninstall [--purge]` | Removes the stored secrets of all configured backends (tokens, endpoint keys, command secrets, opencode and codex keys, the ChatGPT login files of codex backends, and the v0.1 token), the MCP registration in Claude Code and the one in Codex (after a backup of the Codex config). The opencode and codex backend directories (`<config-dir>/opencode/<name>`, `<config-dir>/codex/<name>`, no keys left) are only removed with `--purge`. |
 
@@ -475,7 +475,7 @@ The server rereads `config.toml` before every tool call (`sidekick_run`, `sideki
 | `pass_env` | all | none | Inherited variables to keep for this backend, see [session isolation](#child-environment-and-session-isolation). |
 | `model` | all | first of `models`, else CLI default | Default model: `--model` (claude-*) or the value of `{model}` (command; only with `{model}` in `command`). Must be one of `models` when both are set. The `model` parameter of `sidekick_run` overrides it. |
 | `models` | all | none (claude-*: any model) | Models the backend offers; an allowlist for `sidekick_run`'s `model`, see [Models](#models). Required for a command backend that uses `{model}`, an error for one that does not. opencode needs `models` or `model`. |
-| `config_dir` | claude-oauth, claude-endpoint | `sidekick`: `AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` or `~/.claude-sidekick`; others: `~/.claude-sidekick-<name>` | `CLAUDE_CONFIG_DIR` of the agent; absolute or starting with `~`. |
+| `config_dir` | claude-oauth, claude-endpoint | `claude` and `sidekick`: `AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` or `~/.claude-sidekick`; others: `~/.claude-sidekick-<name>` | `CLAUDE_CONFIG_DIR` of the agent; absolute or starting with `~`. |
 | `base_url` | claude-endpoint, opencode, codex (api-key) | (required; opencode: not for openrouter; codex: optional) | `http://` or `https://` URL of the API (Anthropic-compatible, OpenAI-compatible, or for codex Responses-compatible). Must not contain `user:password@` (config error; store the key with `agent-sidekick setup --backend <name>` or set `api_key_env`); ASCII host (`xn--` form for internationalised names) and a valid port. |
 | `auth` | claude-endpoint, codex | `x-api-key` (claude-endpoint), `chatgpt` (codex) | claude-endpoint: `x-api-key` (`ANTHROPIC_API_KEY`) or `bearer` (`ANTHROPIC_AUTH_TOKEN`). codex: `chatgpt` or `api-key`, see [Codex backends](#codex-backends). |
 | `api_key_env` | claude-endpoint, opencode, codex (api-key) | none (stored key) | Name of an environment variable with the key. It is removed from every other backend's environment. Not for opencode with ollama. |
@@ -501,9 +501,9 @@ Environment variables:
 | Variable | Purpose |
 |----------|---------|
 | `AGENT_SIDEKICK_CLAUDE` | Absolute path to the `claude` executable (checked before `claude_path` and PATH). |
-| `AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` | `CLAUDE_CONFIG_DIR` for the `sidekick` backend (default `~/.claude-sidekick`). |
+| `AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` | `CLAUDE_CONFIG_DIR` for the `claude` (or `sidekick`) backend (default `~/.claude-sidekick`). |
 | `AGENT_SIDEKICK_CONFIG_DIR` | Overrides the config directory. |
-| `AGENT_SIDEKICK_TOKEN` | Token of the `sidekick` backend for CI/testing; takes precedence over the keyring and token file. |
+| `AGENT_SIDEKICK_TOKEN` | Token of the `claude` (or `sidekick`) backend for CI/testing; takes precedence over the keyring and token file. |
 | `AGENT_SIDEKICK_DISABLE_KEYRING` | Set to `1` to never use the OS keyring (file fallback only). |
 | `AGENT_SIDEKICK_LOG` | `tracing` filter, e.g. `debug` or `agent_sidekick=trace`. |
 | `AGENT_SIDEKICK_UPDATE_URL` | API base for `update`/`doctor` instead of `https://api.github.com` (tests, GitHub Enterprise or a mirror serving `/repos/<owner>/<repo>/releases/latest`). |

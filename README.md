@@ -175,7 +175,7 @@ Linux:
 CLAUDE_CONFIG_DIR=~/.claude-sidekick claude setup-token
 ```
 
-Melde dich im Browser mit dem **zweiten** Claude-Konto an. Kopiere den ausgegebenen Token (er beginnt mit `sk-ant-oat01-`) und füge ihn ein, wenn das Setup danach fragt, oder speichere ihn später mit `agent-sidekick setup --backend sidekick`.
+Melde dich im Browser mit dem **zweiten** Claude-Konto an. Kopiere den ausgegebenen Token (er beginnt mit `sk-ant-oat01-`) und füge ihn ein, wenn das Setup danach fragt, oder speichere ihn später mit `agent-sidekick setup --backend claude`.
 
 ## Erster Test
 

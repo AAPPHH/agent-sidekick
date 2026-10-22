@@ -96,7 +96,7 @@ pub fn check_format(token: &str) -> FormatCheck {
 }
 
 /// Which stored secret: the OAuth token of a claude-oauth backend, the API key of a
-/// claude-endpoint backend or the `secret_env` value of a command backend. A claude-oauth backend named `sidekick` uses the v0.1
+/// claude-endpoint backend or the `secret_env` value of a command backend. A claude-oauth backend named `claude` (or `sidekick`, its name before v0.6) uses the v0.1
 /// locations (keyring user `oauth-token`, file `token`, env `AGENT_SIDEKICK_TOKEN`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SecretId {
@@ -111,7 +111,7 @@ pub enum SecretId {
 }
 
 impl SecretId {
-    /// The v0.1 secret (claude-oauth backend `sidekick`).
+    /// The v0.1 secret (claude-oauth backend `claude`).
     pub fn legacy() -> Self {
         SecretId::Oauth(crate::backends::IMPLICIT_BACKEND.to_owned())
     }
@@ -146,10 +146,10 @@ impl SecretId {
         self.is_legacy().then_some(ENV_TOKEN)
     }
 
-    /// `true` for the v0.1 secret: any claude-oauth backend named `sidekick`, implicit or
-    /// declared in config.toml.
+    /// `true` for the v0.1 secret: any claude-oauth backend named `claude` or `sidekick`,
+    /// implicit or declared in config.toml.
     pub fn is_legacy(&self) -> bool {
-        matches!(self, SecretId::Oauth(n) if n == crate::backends::IMPLICIT_BACKEND)
+        matches!(self, SecretId::Oauth(n) if crate::backends::is_primary_oauth_name(n))
     }
 }
 
@@ -837,8 +837,14 @@ mod tests {
     fn secret_id_names() {
         let legacy = SecretId::legacy();
         assert_eq!(legacy, oauth(crate::backends::IMPLICIT_BACKEND));
-        assert_eq!(legacy, oauth("sidekick"));
+        assert_eq!(legacy, oauth("claude"));
         assert!(legacy.is_legacy());
+        // `sidekick` (the implicit name before v0.6) uses the same locations.
+        let old = oauth("sidekick");
+        assert!(old.is_legacy());
+        assert_eq!(old.keyring_user(), legacy.keyring_user());
+        assert_eq!(old.file_name(), legacy.file_name());
+        assert_eq!(old.env_override(), legacy.env_override());
         assert_eq!(legacy.keyring_user(), KEYRING_USER);
         assert_eq!(legacy.keyring_user(), "oauth-token");
         assert_eq!(legacy.file_name(), "token");
