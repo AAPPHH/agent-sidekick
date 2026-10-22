@@ -314,7 +314,7 @@ impl System for Fake {
     fn find_codex(&self) -> Option<PathBuf> {
         self.codex.borrow().clone()
     }
-    fn register_codex(&self, _claude: &Path) -> Result<()> {
+    fn register_codex(&self, _claude: Option<&Path>) -> Result<()> {
         self.codex_registered.set(self.codex_registered.get() + 1);
         Ok(())
     }
@@ -368,6 +368,7 @@ fn assert_nothing_written(fake: &Fake) {
     assert!(!fake.cfg().exists(), "config written");
     assert!(fake.secrets.borrow().is_empty(), "secret stored");
     assert_eq!(fake.registered.get(), 0);
+    assert_eq!(fake.codex_registered.get(), 0);
     assert_eq!(fake.doctor_runs.get(), 0);
 }
 
@@ -567,24 +568,38 @@ fn nothing_selected_is_asked_again_then_aborts() {
     assert_nothing_written(&fake);
 }
 
+/// Neither Claude Code nor Codex: abort before anything is written, naming both installs.
 #[test]
-fn claude_code_missing_aborts() {
+fn claude_code_and_codex_missing_aborts() {
     for os in [Os::Windows, Os::Unix] {
         let mut fake = Fake::new();
         fake.os = os;
         fake.claude = None;
-        let (err, _) = run_err(&fake, vec![]);
-        assert!(err.contains("Claude Code wurde nicht gefunden"), "{err}");
+        let (err, out) = run_err(&fake, vec![]);
+        assert!(
+            err.contains("Weder Claude Code noch die Codex-CLI"),
+            "{err}"
+        );
         assert!(
             err.contains("VS-Code-Erweiterung allein reicht nicht"),
             "{err}"
         );
         assert!(err.contains(super::claude_install_command(os)), "{err}");
+        assert!(
+            err.contains(&format!("npm install -g {}", npm::CODEX_PACKAGE)),
+            "{err}"
+        );
+        assert!(err.contains("Node.js"), "{err}");
         assert!(err.contains("neues Terminal"), "{err}");
         assert!(err.contains("VS Code komplett neu"), "{err}");
         assert!(err.contains("setup` erneut"), "{err}");
+        assert!(err.contains("Es wurde nichts geändert"), "{err}");
+        assert!(out.contains("Claude Code: nicht gefunden"), "{out}");
+        assert!(out.contains("Codex: nicht gefunden"), "{out}");
         assert_nothing_written(&fake);
+        assert!(fake.runs.borrow().is_empty());
     }
+    assert_eq!(npm::CODEX_PACKAGE, "@openai/codex");
     assert_eq!(
         super::claude_install_command(Os::Windows),
         "irm https://claude.ai/install.ps1 | iex"
@@ -601,6 +616,72 @@ fn claude_code_missing_aborts() {
     for os in [Os::Windows, Os::Unix] {
         assert!(hint.contains(super::claude_install_command(os)), "{hint}");
     }
+}
+
+/// Codex installed, Claude Code not: the wizard goes on, offers no second Claude account,
+/// registers only in Codex (without asking) and ends with the Codex next steps.
+#[test]
+fn claude_missing_with_codex_registers_only_in_codex() {
+    let mut fake = Fake::new();
+    fake.claude = None;
+    *fake.codex.borrow_mut() = Some(fake.dir.path().join("npm").join("codex.exe"));
+    let (outcome, out) = run_ok(
+        &fake,
+        vec![
+            A::Many(vec![0]), // KI:connect.nrw
+            A::Secret(KIC_KEY),
+            A::Yes, // check online
+        ],
+    );
+    assert_eq!(outcome, Outcome::Done);
+    assert_eq!(fake.resolved().names(), ["kiconnect"]);
+    assert_eq!(fake.registered.get(), 0, "no Claude Code registration");
+    assert_eq!(fake.codex_registered.get(), 1);
+    assert_eq!(fake.doctor_runs.get(), 1);
+    assert!(out.contains(super::CODEX_ONLY_NOTE), "{out}");
+    assert!(out.contains("setup --register-only"), "{out}");
+    assert!(out.contains("Claude Code: nicht gefunden"), "{out}");
+    assert!(out.contains("Codex: "), "{out}");
+    assert!(!out.contains("Claude-Zweitkonto"), "{out}");
+    assert!(
+        out.contains(
+            "KI:connect.nrw (Hochschul-Kontingent, kostenlos) | Gemini | OpenAI Codex \
+             (ChatGPT-Abo oder API-Key) default [0]"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("Auch in Codex anmelden?"), "{out}");
+    assert!(
+        !out.contains("Developer: Reload Window“), dann in Claude Code"),
+        "{out}"
+    );
+    assert!(out.contains("Eine neue Codex-Sitzung starten"), "{out}");
+}
+
+/// Without Claude Code the profile indices map onto the remaining profiles (index 2 is
+/// OpenAI Codex), and an implicit `sidekick` of an existing config is not carried over.
+#[test]
+fn claude_missing_merge_into_implicit_config_drops_sidekick() {
+    let mut fake = Fake::new();
+    fake.claude = None;
+    *fake.codex.borrow_mut() = Some(fake.dir.path().join("npm").join("codex.exe"));
+    fake.seed_config(
+        "max_concurrent = 2
+",
+    );
+    let (_, out) = run_ok(
+        &fake,
+        vec![
+            A::Many(vec![2]), // OpenAI Codex
+            A::One(0),        // merge
+            A::One(0),        // ChatGPT plan
+            A::Yes,           // "Anmeldung erledigt?"
+        ],
+    );
+    assert_eq!(fake.resolved().names(), ["codex"]);
+    assert!(out.contains("wird deshalb nicht"), "{out}");
+    assert_eq!(fake.registered.get(), 0);
+    assert_eq!(fake.codex_registered.get(), 1);
 }
 
 // ----- Node.js and installs -----

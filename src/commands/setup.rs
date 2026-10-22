@@ -342,6 +342,8 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
     }
 
     let self_exe = std::env::current_exe().context("determining the path of this executable")?;
+    // Claude Code missing, Codex installed: register in Codex instead (see `on_missing_claude`).
+    let mut codex_instead = false;
     let claude = if single {
         // Only for the registration hint; never required here.
         resolve_claude(args.claude.as_deref(), cfg.claude_path.as_deref()).ok()
@@ -366,12 +368,23 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
                 eprintln!("warning: {e:#}");
                 None
             }
-            Err(e) => {
-                return Err(e.context(
-                    "Claude Code is required for registration. Next steps: install Claude Code, \
-                     or pass --claude <path>, or set AGENT_SIDEKICK_CLAUDE, or use --no-register",
-                ))
-            }
+            Err(e) => match on_missing_claude(
+                args.claude.is_some(),
+                crate::harness::codex::locate_real(None).is_ok(),
+            ) {
+                MissingClaude::RegisterInCodex => {
+                    println!(
+                        "Claude Code not found ({}); the Codex CLI is installed, so {APP_NAME} is \
+                         registered in Codex instead (as `{APP_NAME} setup --codex` does). To \
+                         use it from Claude Code too: install Claude Code, then run \
+                         `{APP_NAME} setup --register-only`.",
+                        crate::redact::redact_all(&format!("{e:#}"))
+                    );
+                    codex_instead = true;
+                    None
+                }
+                MissingClaude::Fail => return Err(e.context(MISSING_CLAUDE_NEXT_STEPS)),
+            },
         }
     };
 
@@ -410,6 +423,19 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
 
     match &claude {
         Some(found) if !args.no_register => register(&found.path, &self_exe)?,
+        None if codex_instead => {
+            let path = super::codex_host::real_config_path().ok_or_else(|| {
+                anyhow!(
+                    "cannot determine the Codex config (home directory unknown); set CODEX_HOME"
+                )
+            })?;
+            register_codex(&path, &self_exe, None, Some(&cfg))?;
+            println!(
+                "\nDone. Start a new Codex session (`codex`); `/mcp` there lists `{APP_NAME}`.\n\
+                 Run `{APP_NAME} doctor` to verify the installation."
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
         _ => println!("Skipping MCP registration (--no-register)."),
     }
 
@@ -418,6 +444,32 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
          Run `{APP_NAME} doctor` to verify the installation."
     );
     Ok(ExitCode::SUCCESS)
+}
+
+const MISSING_CLAUDE_NEXT_STEPS: &str = "Claude Code is required for registration. Next steps: \
+    install Claude Code, or pass --claude <path>, or set AGENT_SIDEKICK_CLAUDE, or use \
+    --no-register; to use agent-sidekick from Codex instead, install the Codex CLI (`npm install \
+    -g @openai/codex`) and run `agent-sidekick setup --codex`";
+
+/// What `setup` (without `--backend`, `--codex` or `--no-register`) does when Claude Code
+/// cannot be found.
+#[derive(Debug, PartialEq, Eq)]
+enum MissingClaude {
+    /// Register in Codex instead: the least surprising result on a machine that has only
+    /// Codex (the same as `setup --codex`).
+    RegisterInCodex,
+    /// Fail with [`MISSING_CLAUDE_NEXT_STEPS`].
+    Fail,
+}
+
+/// `explicit_claude`: `--claude` was given (a wrong path is an error, never a fallback);
+/// `codex_found`: the Codex CLI is installed.
+fn on_missing_claude(explicit_claude: bool, codex_found: bool) -> MissingClaude {
+    if codex_found && !explicit_claude {
+        MissingClaude::RegisterInCodex
+    } else {
+        MissingClaude::Fail
+    }
 }
 
 /// `base` plus the Claude config dir of every claude-* step (whether or not it prompts),
@@ -957,6 +1009,41 @@ mod tests {
         assert!(home.join("config.toml").is_file());
         assert!(!home.join("auth.json").exists());
         assert_eq!(harness_of(&backends, "key"), "codex");
+    }
+
+    #[test]
+    fn missing_claude_registers_in_codex_or_names_the_next_steps() {
+        assert_eq!(
+            on_missing_claude(false, true),
+            MissingClaude::RegisterInCodex
+        );
+        assert_eq!(on_missing_claude(false, false), MissingClaude::Fail);
+        // A wrong --claude path stays an error even with Codex installed.
+        assert_eq!(on_missing_claude(true, true), MissingClaude::Fail);
+        for needle in [
+            "install Claude Code",
+            "--no-register",
+            "npm install -g @openai/codex",
+            "agent-sidekick setup --codex",
+        ] {
+            assert!(MISSING_CLAUDE_NEXT_STEPS.contains(needle), "{needle}");
+        }
+    }
+
+    /// `setup --codex` (and the Codex fallback of `setup`) registers without Claude Code:
+    /// no AGENT_SIDEKICK_CLAUDE in the entry.
+    #[test]
+    fn codex_registration_without_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("codex").join("config.toml");
+        let exe = dir.path().join("agent-sidekick.exe");
+        std::fs::write(&exe, "").unwrap();
+        register_codex(&path, &exe, None, None).unwrap();
+        let entry = super::super::codex_host::read_entry_at(&path)
+            .unwrap()
+            .expect("registered");
+        assert_eq!(entry.claude(), None);
+        assert!(entry.tool_timeout_sec.is_some());
     }
 
     #[test]

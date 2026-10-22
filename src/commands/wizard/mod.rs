@@ -1,6 +1,8 @@
 //! `agent-sidekick setup` without flags in an interactive terminal: a guided setup.
 //!
-//! Steps: introduction, prerequisites (Claude Code, Node.js, OpenCode), profiles
+//! Steps: introduction, prerequisites (Claude Code or Codex as the MCP host: without
+//! Claude Code the wizard registers only in Codex, without either it aborts; Node.js,
+//! OpenCode), profiles
 //! (KI:connect.nrw, second Claude account, Gemini), installing a missing OpenCode or
 //! Gemini CLI through npm (after confirmation), the default backend, writing config.toml
 //! from the embedded templates (fresh, backup + rewrite, or merge), the secrets, the MCP
@@ -98,7 +100,7 @@ const INTRO: &str = "Willkommen beim Einrichtungsassistenten von agent-sidekick.
     zum Beispiel an KI:connect.nrw, ein zweites Claude-Konto, Gemini oder OpenAI Codex.\n\
     Der Assistent prüft die Voraussetzungen, schreibt die Konfiguration, speichert deine \
     Schlüssel sicher im Schlüsselbund und meldet den Server bei Claude Code an (auf Wunsch \
-    auch bei Codex).";
+    auch bei Codex; ohne Claude Code nur bei Codex).";
 
 const RESUME: &str = "Führe danach `agent-sidekick setup` erneut aus.";
 
@@ -129,26 +131,14 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
                 path.display(),
                 version_text(s, Tool::Claude, &path)
             ));
-            path
+            Some(path)
         }
         Err(e) => {
             p.say(&format!(
                 "  Claude Code: nicht gefunden ({})",
                 redact_all(&e)
             ));
-            bail!(
-                "Claude Code wurde nicht gefunden. agent-sidekick braucht die Claude-Code-CLI \
-                 (`claude`); die VS-Code-Erweiterung allein reicht nicht. Nächster Schritt: die \
-                 CLI installieren ({}) mit\n  {}\n(weitere Wege: https://code.claude.com/docs/en/setup). \
-                 Öffne danach ein neues Terminal; nutzt du das Terminal in VS Code, starte VS Code \
-                 komplett neu. Liegt claude woanders, setze den Pfad in AGENT_SIDEKICK_CLAUDE. \
-                 {RESUME}",
-                match s.os() {
-                    Os::Windows => "in PowerShell",
-                    Os::Unix => "im Terminal",
-                },
-                claude_install_command(s.os())
-            );
+            None
         }
     };
     let node = s.find_node();
@@ -178,9 +168,19 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
         )),
         None => p.say("  Codex: nicht gefunden (nur für OpenAI Codex nötig)"),
     }
+    if claude.is_none() {
+        if codex.is_none() {
+            bail!("{}", no_host_message(s.os()));
+        }
+        p.say(&format!("\n{CODEX_ONLY_NOTE}"));
+    }
 
-    // 2. Profiles.
-    let mut profiles = choose_profiles(p)?;
+    // 2. Profiles (the second Claude account needs the claude CLI).
+    let available: Vec<Profile> = Profile::ALL
+        .into_iter()
+        .filter(|&x| x != Profile::Claude || claude.is_some())
+        .collect();
+    let mut profiles = choose_profiles(p, &available)?;
 
     // 3. Tools for the profiles (nothing is written before this step succeeds).
     let needs_node = (profiles.contains(&Profile::Kiconnect) && opencode.is_none())
@@ -318,8 +318,17 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
             add.push(prof);
         }
     }
-    if merging && existing_backends.is_none() && !add.contains(&Profile::Claude) && !add.is_empty()
-    {
+    let implicit_sidekick = merging
+        && existing_backends.is_none()
+        && !add.contains(&Profile::Claude)
+        && !add.is_empty();
+    if implicit_sidekick && claude.is_none() {
+        p.say(
+            "Die bisherige Konfiguration nutzt das eingebaute Backend `sidekick` (zweites \
+             Claude-Konto). Ohne Claude Code kann es nicht laufen und wird deshalb nicht \
+             übernommen.",
+        );
+    } else if implicit_sidekick {
         p.say(
             "Die bisherige Konfiguration nutzt das eingebaute Backend `sidekick` (zweites \
              Claude-Konto). Es wird als eigener Abschnitt übernommen, damit es erhalten bleibt; \
@@ -444,26 +453,41 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
         }
     }
 
-    // 9. Registration with Claude Code.
+    // 9. Registration with Claude Code (skipped without the claude CLI).
     p.say("\nAnmeldung bei Claude Code:");
-    if let Err(e) = s.register(&claude) {
-        p.say(&format!(
-            "Die Anmeldung bei Claude Code ist fehlgeschlagen: {}\nNächster Schritt: \
-             `agent-sidekick setup --register-only` ausführen.",
-            redact_all(&format!("{e:#}"))
-        ));
+    match &claude {
+        Some(claude) => {
+            if let Err(e) = s.register(claude) {
+                p.say(&format!(
+                    "Die Anmeldung bei Claude Code ist fehlgeschlagen: {}\nNächster Schritt: \
+                     `agent-sidekick setup --register-only` ausführen.",
+                    redact_all(&format!("{e:#}"))
+                ));
+            }
+        }
+        None => p.say(
+            "Übersprungen: Claude Code ist nicht installiert. Installierst du Claude Code \
+             später, führe `agent-sidekick setup --register-only` aus.",
+        ),
     }
 
-    // 9b. Registration with Codex (only offered when the Codex CLI is installed).
+    // 9b. Registration with Codex (only when the Codex CLI is installed; without Claude
+    // Code it is the only host, so it is not asked).
     let mut in_codex = false;
-    if s.find_codex().is_some()
-        && p.confirm(
+    let codex_wanted = match (&claude, s.find_codex().or(codex)) {
+        (_, None) => false,
+        (None, Some(_)) => {
+            p.say("\nAnmeldung bei Codex:");
+            true
+        }
+        (Some(_), Some(_)) => p.confirm(
             "\nAuch in Codex anmelden? Dann kannst du agent-sidekick auch in der Codex-CLI \
              nutzen.",
             true,
-        )?
-    {
-        match s.register_codex(&claude) {
+        )?,
+    };
+    if codex_wanted {
+        match s.register_codex(claude.as_deref()) {
             Ok(()) => in_codex = true,
             Err(e) => p.say(&format!(
                 "Die Anmeldung bei Codex ist fehlgeschlagen: {}\nNächster Schritt: \
@@ -479,16 +503,26 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
 
     // 11. Finish.
     let example = example_backend(&profiles);
-    p.say(&format!(
-        "\nFertig. Nächste Schritte:\n\
-         1. VS Code neu laden (Befehlspalette: „Developer: Reload Window“), dann in Claude Code \
-         /mcp prüfen: `{APP_NAME}` sollte als verbunden erscheinen.\n\
-         2. Ausprobieren, z. B. mit dem Prompt: „Lass {example} die README zusammenfassen“."
-    ));
-    if in_codex {
+    if claude.is_some() {
         p.say(&format!(
-            "In Codex: eine neue Sitzung starten (`codex`); `/mcp` zeigt `{APP_NAME}`. Vor jedem \
-             sidekick_run fragt Codex nach deiner Zustimmung."
+            "\nFertig. Nächste Schritte:\n\
+             1. VS Code neu laden (Befehlspalette: „Developer: Reload Window“), dann in Claude Code \
+             /mcp prüfen: `{APP_NAME}` sollte als verbunden erscheinen.\n\
+             2. Ausprobieren, z. B. mit dem Prompt: „Lass {example} die README zusammenfassen“."
+        ));
+        if in_codex {
+            p.say(&format!(
+                "In Codex: eine neue Sitzung starten (`codex`); `/mcp` zeigt `{APP_NAME}`. Vor \
+                 jedem sidekick_run fragt Codex nach deiner Zustimmung."
+            ));
+        }
+    } else {
+        p.say(&format!(
+            "\nFertig. Nächste Schritte:\n\
+             1. Eine neue Codex-Sitzung starten (`codex`; die Codex-Erweiterung in VS Code nach \
+             „Developer: Reload Window“); `/mcp` zeigt `{APP_NAME}`. Vor jedem sidekick_run \
+             fragt Codex nach deiner Zustimmung.\n\
+             2. Ausprobieren, z. B. mit dem Prompt: „Lass {example} die README zusammenfassen“."
         ));
     }
     if profiles.contains(&Profile::Kiconnect) {
@@ -554,6 +588,34 @@ pub fn claude_install_command(os: Os) -> &'static str {
     }
 }
 
+/// Shown when Claude Code is missing but the Codex CLI is installed.
+pub const CODEX_ONLY_NOTE: &str = "Claude Code nicht gefunden – agent-sidekick wird nur in \
+    Codex angemeldet. Installierst du Claude Code später, führe agent-sidekick setup \
+    --register-only aus.";
+
+/// The abort message when neither Claude Code nor the Codex CLI is installed: agent-sidekick
+/// needs at least one host to register with.
+fn no_host_message(os: Os) -> String {
+    let shell = match os {
+        Os::Windows => "in PowerShell",
+        Os::Unix => "im Terminal",
+    };
+    format!(
+        "Weder Claude Code noch die Codex-CLI wurde gefunden. agent-sidekick braucht \
+         mindestens eines davon, um sich dort anzumelden; die VS-Code-Erweiterung allein reicht \
+         nicht. Nächster Schritt, eins von beiden:\n\
+         \x20 - Claude Code installieren ({shell}): {}\n\
+         \x20   (weitere Wege: https://code.claude.com/docs/en/setup)\n\
+         \x20 - Codex installieren (braucht Node.js): npm install -g {}\n\
+         \x20   danach einmal `codex login` mit deinem Konto.\n\
+         Öffne danach ein neues Terminal; nutzt du das Terminal in VS Code, starte VS Code \
+         komplett neu. Liegt claude woanders, setze den Pfad in AGENT_SIDEKICK_CLAUDE. {RESUME} \
+         Es wurde nichts geändert.",
+        claude_install_command(os),
+        npm::CODEX_PACKAGE
+    )
+}
+
 /// Shown when the Gemini profile is set up (see docs/REFERENCE.md, Command backends).
 pub const GEMINI_WARNING: &str = "Achtung, Gemini: Das Backend startet die Gemini CLI mit \
     --skip-trust, sonst bricht sie in nicht vertrauten Ordnern ab. Sie vertraut damit jedem \
@@ -562,8 +624,8 @@ pub const GEMINI_WARNING: &str = "Achtung, Gemini: Das Backend startet die Gemin
     einen fremden Server schicken oder Code ausführen. Nutze Gemini nur in Ordnern, denen du \
     vertraust, und einen Schlüssel, den du widerrufen kannst.";
 
-fn choose_profiles(p: &mut dyn Prompter) -> Result<Vec<Profile>> {
-    let options: Vec<String> = Profile::ALL.iter().map(|x| x.label().to_owned()).collect();
+fn choose_profiles(p: &mut dyn Prompter, available: &[Profile]) -> Result<Vec<Profile>> {
+    let options: Vec<String> = available.iter().map(|x| x.label().to_owned()).collect();
     for _ in 0..3 {
         let picked = p.choose_many(
             "\nWelche Profile möchtest du einrichten? (mehrere möglich)",
@@ -571,7 +633,7 @@ fn choose_profiles(p: &mut dyn Prompter) -> Result<Vec<Profile>> {
             &[0],
         )?;
         if !picked.is_empty() {
-            return Ok(picked.into_iter().map(|i| Profile::ALL[i]).collect());
+            return Ok(picked.into_iter().map(|i| available[i]).collect());
         }
         p.say("Bitte mindestens ein Profil wählen.");
     }

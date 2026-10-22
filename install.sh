@@ -188,13 +188,13 @@ main() {
 
     if [ "${AGENT_SIDEKICK_NO_SETUP:-}" != 1 ] && has_tty; then
         say ""
-        say "Running '$BIN setup' (stores the token and registers the MCP server with Claude Code) ..."
+        say "Running '$BIN setup' (stores the token and registers the MCP server with Claude Code or Codex) ..."
         "$INSTALL_DIR/$BIN" setup </dev/tty ||
             say "Setup did not finish. Run it again later with: $INSTALL_DIR/$BIN setup"
     else
         say ""
         say "Next step: run '$INSTALL_DIR/$BIN setup' in a terminal (stores the token and registers"
-        say "the MCP server with Claude Code), then reload VS Code. Problems? Run: $BIN doctor"
+        say "the MCP server with Claude Code or Codex), then reload VS Code. Problems? Run: $BIN doctor"
     fi
 }
 

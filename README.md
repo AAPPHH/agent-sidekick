@@ -7,11 +7,15 @@ Es ist ein einzelnes Programm für Windows 11 und Linux. Aktuelle Version und Do
 
 ## Voraussetzungen
 
-- Die Claude-Code-CLI (`claude`), angemeldet mit deinem Hauptkonto. Die VS-Code-Erweiterung allein reicht nicht: Das Setup und der Server brauchen das Programm `claude`. Installiere es mit dem offiziellen Installer:
-  - Windows (PowerShell): `irm https://claude.ai/install.ps1 | iex`
-  - Linux: `curl -fsSL https://claude.ai/install.sh | bash`
+- Mindestens eine Agenten-CLI, in der du agent-sidekick nutzt: die Claude-Code-CLI **oder** die Codex-CLI (oder beide). Die VS-Code-Erweiterungen allein reichen nicht: Das Setup braucht das Programm `claude` bzw. `codex`.
+  - Claude-Code-CLI (`claude`), angemeldet mit deinem Hauptkonto. Installiere sie mit dem offiziellen Installer:
+    - Windows (PowerShell): `irm https://claude.ai/install.ps1 | iex`
+    - Linux: `curl -fsSL https://claude.ai/install.sh | bash`
 
-  Öffne danach ein neues Terminal. Nutzt du das Terminal in VS Code, starte VS Code komplett neu. Weitere Wege stehen unter <https://code.claude.com/docs/en/setup>.
+    Weitere Wege stehen unter <https://code.claude.com/docs/en/setup>.
+  - Codex-CLI (`codex`), angemeldet mit deinem ChatGPT- oder OpenAI-Konto: `npm install -g @openai/codex` (braucht Node.js), dann `codex login`. Ohne Claude Code siehe [Nur mit Codex (ohne Claude Code)](#nur-mit-codex-ohne-claude-code).
+
+  Öffne nach der Installation ein neues Terminal. Nutzt du das Terminal in VS Code, starte VS Code komplett neu.
 - Node.js, nur für KI:connect (OpenCode), Gemini und zum Installieren von Codex: Download unter <https://nodejs.org/en/download>, unter Windows auch mit `winget install OpenJS.NodeJS.LTS`.
 - Für KI:connect: ein Konto an einer teilnehmenden Hochschule (Anmeldung über das Single Sign-On deiner Hochschule).
 - Für das Profil „Claude-Zweitkonto“: ein zweites Claude-Abonnement.
@@ -49,7 +53,7 @@ Der erste Befehl installiert das Programm nach `~/.local/bin`. Er bietet an, die
 
 - Die Installation prüft den Download gegen `SHA256SUMS` und braucht weder Rust noch Git noch Node.js.
 - In einem interaktiven Terminal startet die Installation am Ende selbst `agent-sidekick setup`. Den zweiten Befehl brauchst du nur, wenn das Setup nicht lief oder du es abgebrochen hast.
-- Der Setup-Assistent prüft Claude Code, Node.js, OpenCode und Codex. Du wählst ein oder mehrere Profile: „KI:connect.nrw (Hochschul-Kontingent, kostenlos)“ (Vorschlag), „Claude-Zweitkonto“, „Gemini“, „OpenAI Codex (ChatGPT-Abo oder API-Key)“. Ein fehlendes OpenCode, Gemini CLI oder Codex installiert er nach Rückfrage mit `npm install -g`. Wählst du mehrere neue Profile, fragt er nach dem Standard-Backend (Vorschlag: `kiconnect`). Dann fragt er die Schlüssel verdeckt ab (den KI:connect- oder OpenAI-Schlüssel kann er gleich online prüfen), schreibt erst danach die Konfiguration, zeigt beim ChatGPT-Abo den Anmeldebefehl für Codex, meldet den Server bei Claude Code an (und, wenn Codex installiert ist, auf Wunsch auch bei Codex) und führt `agent-sidekick doctor` aus.
+- Der Setup-Assistent prüft Claude Code, Node.js, OpenCode und Codex. Du wählst ein oder mehrere Profile: „KI:connect.nrw (Hochschul-Kontingent, kostenlos)“ (Vorschlag), „Claude-Zweitkonto“, „Gemini“, „OpenAI Codex (ChatGPT-Abo oder API-Key)“. Ein fehlendes OpenCode, Gemini CLI oder Codex installiert er nach Rückfrage mit `npm install -g`. Wählst du mehrere neue Profile, fragt er nach dem Standard-Backend (Vorschlag: `kiconnect`). Dann fragt er die Schlüssel verdeckt ab (den KI:connect- oder OpenAI-Schlüssel kann er gleich online prüfen), schreibt erst danach die Konfiguration, zeigt beim ChatGPT-Abo den Anmeldebefehl für Codex, meldet den Server bei Claude Code an (und, wenn Codex installiert ist, auf Wunsch auch bei Codex; ohne Claude Code nur bei Codex, ohne Rückfrage) und führt `agent-sidekick doctor` aus.
 - Eine vorhandene `config.toml` wird nie stillschweigend überschrieben: Du wählst Zusammenführen, Sichern und neu schreiben oder Abbrechen.
 - Eine bestimmte Version installierst du in PowerShell mit `$env:VERSION = 'v0.3.0'` vor dem ersten Befehl, unter Linux mit `curl -fsSL https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.sh | VERSION=v0.3.0 sh`.
 
@@ -63,6 +67,34 @@ Auf jedem Rechner gilt dasselbe: die [Voraussetzungen](#voraussetzungen) install
 - Die Anmeldung bei Claude Code und bei Codex erledigt das Setup auf jedem Rechner selbst.
 - Das Codex-Backend braucht auf jedem Rechner einmal den eigenen `codex login` (siehe [OpenAI Codex nutzen](#openai-codex-nutzen)).
 - Deine `config.toml` kannst du vom ersten Rechner kopieren, wenn du dieselben Backends willst. Unter Windows liegt sie in `%APPDATA%\agent-sidekick\config.toml`, unter Linux in `~/.config/agent-sidekick/config.toml`. Pfade darin, etwa zu Programmen, musst du gegebenenfalls anpassen. Danach `agent-sidekick setup --backend <name>` für jeden Schlüssel und `agent-sidekick doctor` zur Kontrolle.
+
+### Nur mit Codex (ohne Claude Code)
+
+Du hast die Codex-CLI, aber kein Claude Code? Dann meldet das Setup agent-sidekick nur in Codex an. So gehst du vor:
+
+1. Node.js installieren, unter Windows z. B. mit `winget install OpenJS.NodeJS.LTS` (sonst <https://nodejs.org/en/download>). Danach ein neues Terminal öffnen.
+2. Die Codex-CLI installieren, falls sie fehlt:
+
+   ```sh
+   npm install -g @openai/codex
+   ```
+
+3. Codex einmal mit deinem eigenen Konto anmelden (ChatGPT-Abo oder OpenAI-API-Schlüssel):
+
+   ```sh
+   codex login
+   ```
+
+4. agent-sidekick installieren, wie oben unter [Windows 11](#windows-11) oder [Linux](#linux-x86_64-aarch64) beschrieben, z. B. in PowerShell:
+
+   ```powershell
+   irm https://github.com/AAPPHH/agent-sidekick/releases/latest/download/install.ps1 | iex
+   ```
+
+5. Der Setup-Assistent startet von selbst. Er meldet „Claude Code nicht gefunden – agent-sidekick wird nur in Codex angemeldet“ und bietet das Profil „Claude-Zweitkonto“ nicht an (es braucht Claude Code). Wähle z. B. „KI:connect.nrw“ und/oder „OpenAI Codex“. Am Ende trägt er agent-sidekick in deine Codex-Konfiguration ein (`~/.codex/config.toml`, mit Sicherung).
+6. Eine neue Codex-Sitzung starten (`codex`); `/mcp` zeigt `agent-sidekick`.
+
+Nutzt du das Profil „OpenAI Codex“ als zweiten Agenten mit einem ChatGPT-Konto, trag ein Modell ein, das dein Konto nutzen darf (siehe den Modell-Hinweis unter [Codex als zweiter Agent](#codex-als-zweiter-agent-mit-deinem-chatgpt-abo)). Ohne Setup-Assistent (kein interaktives Terminal) meldet `agent-sidekick setup` den Server ebenfalls in Codex an, wenn Claude Code fehlt und Codex installiert ist. Installierst du Claude Code später, führe `agent-sidekick setup --register-only` aus. `agent-sidekick doctor` wertet ein fehlendes Claude Code dann nur als Hinweis, solange kein Backend Claude braucht.
 
 ## OpenAI Codex nutzen
 
@@ -96,7 +128,7 @@ Ohne weitere Angabe nimmt Codex sein Standardmodell. Mit ChatGPT-Anmeldung lehnt
 
 ### agent-sidekick in Codex verwenden
 
-Ist die Codex-CLI installiert, fragt das Setup „Auch in Codex anmelden?“. Du kannst es auch jederzeit selbst ausführen:
+Ist die Codex-CLI installiert, fragt das Setup „Auch in Codex anmelden?“ (ohne Claude Code meldet es ohne Rückfrage an). Du kannst es auch jederzeit selbst ausführen:
 
 ```sh
 agent-sidekick setup --codex
@@ -149,7 +181,7 @@ Die Ergebnisse der kostenlosen KI:connect-Modelle sind Entwürfe: Prüf die Änd
 
 ### Claude Code wurde nicht gefunden
 
-Das Setup braucht die Claude-Code-CLI. Installiere sie wie unter [Voraussetzungen](#voraussetzungen) beschrieben, öffne ein neues Terminal (im VS-Code-Terminal: VS Code komplett neu starten) und starte `agent-sidekick setup` erneut.
+Ist die Codex-CLI installiert, macht das Setup ohne Claude Code weiter und meldet agent-sidekick nur in Codex an (siehe [Nur mit Codex (ohne Claude Code)](#nur-mit-codex-ohne-claude-code)). Fehlen beide, bricht es ab, bevor es etwas schreibt: Installiere Claude Code oder Codex wie unter [Voraussetzungen](#voraussetzungen) beschrieben, öffne ein neues Terminal (im VS-Code-Terminal: VS Code komplett neu starten) und starte `agent-sidekick setup` erneut.
 
 ### OpenCode oder Node.js fehlt
 

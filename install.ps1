@@ -178,12 +178,12 @@ param()
     $Interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
     if ($env:AGENT_SIDEKICK_NO_SETUP -ne '1' -and $Interactive) {
         Write-Host ''
-        Write-Host "Running '$Bin setup' (stores the token and registers the MCP server with Claude Code) ..."
+        Write-Host "Running '$Bin setup' (stores the token and registers the MCP server with Claude Code or Codex) ..."
         & $Exe setup
         if ($LASTEXITCODE -ne 0) { Write-Host "Setup did not finish. Run it again later with: $Bin setup" }
     } else {
         Write-Host ''
         Write-Host "Next step: run '$Bin setup' in a terminal (stores the token and registers the MCP server"
-        Write-Host "with Claude Code), then reload VS Code. Problems? Run: $Bin doctor"
+        Write-Host "with Claude Code or Codex), then reload VS Code. Problems? Run: $Bin doctor"
     }
 }
