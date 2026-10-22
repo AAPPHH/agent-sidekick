@@ -214,6 +214,10 @@ Das Kontingent pro Minute oder pro Tag ist erschöpft. Warte die angegebene Zeit
 
 Lade VS Code neu oder starte es komplett neu. Hilft das nicht, führe `agent-sidekick doctor` aus; es nennt den nächsten Schritt. `agent-sidekick setup --register-only` meldet den Server erneut bei Claude Code an, und `claude mcp list` zeigt, ob er eingetragen ist.
 
+### Änderungen an der config.toml wirken nicht
+
+Seit Version 0.5.0 liest agent-sidekick die `config.toml` beim nächsten Aufruf eines Werkzeugs (`sidekick_run`, `sidekick_backends`, `sidekick_status`) neu ein; ein Neustart ist nicht nötig. Ist die geänderte Datei fehlerhaft, arbeitet agent-sidekick mit der letzten gültigen Fassung weiter und meldet den Fehler als `config_error` in `sidekick_backends`; `agent-sidekick doctor` zeigt Details. Ältere Versionen lesen die Datei nur beim Start: Wähle in Claude Code `/mcp`, dann agent-sidekick und **Reconnect**.
+
 ### Der KI:connect-Schlüssel ist abgelaufen
 
 Erzeuge im KI:connect-Webinterface unter **API Key Management** mit **Rotate** einen neuen Schlüssel und speichere ihn mit `agent-sidekick setup --backend kiconnect` (siehe [KI:connect-API-Schlüssel erzeugen](#kiconnect-api-schlüssel-erzeugen)).

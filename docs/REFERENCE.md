@@ -152,8 +152,14 @@ Runs that hit provider rate limits are detected and handled specially.
 
 ### Concurrency
 
-`max_concurrent` at the top level is a global limit over all backends (default 2). A backend can additionally have its own `max_concurrent`, e.g. 1 for a local GPU or for the Claude account.
+`max_concurrent` at the top level is a global limit over all backends (default 16, at most 1024). A backend can additionally have its own `max_concurrent`, e.g. 1 for a local GPU.
 A run waits for a slot of its backend first, then for a global slot; queued runs are visible in `sidekick_status`.
+
+Advice for many parallel runs (20 or more):
+
+- **Quota:** parallel runs on one backend share that account's or key's quota and rate limits; more parallel runs reach the limit sooner (the backend then cools down, see [Rate limits](#rate-limits-http-429)). Spread the work over backends or set a per-backend `max_concurrent`.
+- **Separate working directories:** runs in the same `cwd` edit the same files and the same git index. Give every parallel run its own directory, e.g. one git worktree per run (`git worktree add ../wt-1 -b task-1`).
+- Changing a limit in config.toml takes effect for the next run (see [Configuration](#configuration)); runs already started or queued keep their slot.
 
 ### Reachability
 
@@ -444,13 +450,15 @@ Without a `[backends]` section it also shows the global `default model` and the 
 Optional `config.toml` in the config directory:
 
 ```toml
-max_concurrent = 2        # parallel runs over all backends; more are queued
+max_concurrent = 16       # parallel runs over all backends (default 16); more are queued
 default_max_turns = 30
 default_timeout_s = 1800
 default_model = "sonnet"  # optional; only for the implicit backend (no [backends] section)
 claude_path = "/abs/path/to/claude"  # optional, used by claude-* backends
 pass_env = []             # inherited variables to keep for every backend, see above
 ```
+
+The server rereads `config.toml` before every tool call (`sidekick_run`, `sidekick_backends`, `sidekick_status`) when the file has changed, so edits take effect on the next call without an MCP reconnect. A call that is already running keeps the configuration it started with. If the changed file is invalid, the server keeps the last valid configuration, reports the error as `config_error` in `sidekick_backends` and as `config error` in `sidekick_status`, and adds a note to `sidekick_run` errors; the log gets a warning per change and an info line "config reloaded" with the backend names after every successful reload. If the file was already invalid when the server started, `sidekick_run` stays disabled until it is fixed. Rate-limit cooldowns and the running/queued counters survive a reload; a changed `max_concurrent` gets a new limit for new runs.
 
 `[backends.<name>]` keys (names: 1-32 characters `a-z`, `0-9`, `_`, `-`, starting with a letter or digit; keys not valid for the type or harness are a config error):
 
