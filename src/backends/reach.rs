@@ -549,6 +549,7 @@ mod tests {
             name,
             BackendKind::ClaudeOauth {
                 config_dir: PathBuf::from("cfg"),
+                permissions: Default::default(),
             },
         )
     }
@@ -561,6 +562,7 @@ mod tests {
                 api_key_env: api_key_env.map(str::to_owned),
                 auth: super::super::EndpointAuth::XApiKey,
                 config_dir: PathBuf::from("cfg"),
+                permissions: Default::default(),
             },
         )
     }

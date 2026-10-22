@@ -2,13 +2,20 @@
 # Groq (OpenAI-compatible API, free tier without a credit card) through the OpenCode agent CLI.
 # Key from https://console.groq.com/keys, stored with `agent-sidekick setup --backend groq`
 # (keyring user `backend-groq`). Free-tier limits per model (console.groq.com/docs/rate-limits,
-# checked 2026-10-22): 30 requests per minute, 1000 per day, 8000 tokens per minute, 200000
-# tokens per day. One agent step sends about 4000 to 6000 tokens, so longer runs hit HTTP 429.
+# checked 2026-10-22): 30 requests per minute, 1000 per day, about 8000 tokens per minute,
+# 200000 tokens per day. One OpenCode step sends about 7000 tokens, so an agent manages about
+# one step per minute: each step first hits HTTP 429 and OpenCode waits. Only for very small
+# tasks. Runs occasionally abort when the model produces an invalid tool call (Groq error
+# tool_use_failed). KI:connect is the better free backend.
+# No Qwen model: a single OpenCode request exceeds Groq's free-tier limit of 7000 input tokens
+# per minute for it. `interleaved` sends gpt-oss reasoning back in the `reasoning` field;
+# without it Groq rejects every step after the first (`reasoning_content` is unsupported).
 [backends.groq]
 harness = "opencode"
 provider = "openai-compatible"
 base_url = "https://api.groq.com/openai/v1"
-models = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]   # the first one is the default
-description = "OpenCode agent on Groq's free tier (very fast inference, open models). Free but tightly rate-limited (about 8000 tokens per minute and 200000 per day per model), so only small tasks with few steps; long runs hit HTTP 429. Same model family as kiconnect (gpt-oss-120b, Qwen 3.8 27B), useful when kiconnect is slow or busy. Reads, edits and runs commands in cwd without asking; check the diff."
+models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]   # the first one is the default
+model_options = { interleaved = { field = "reasoning" } }
+description = "OpenCode agent on Groq's free tier (open gpt-oss models). Very slow in practice: the free tier allows about 8000 tokens per minute, so the agent manages about one step per minute (each step first hits HTTP 429 and waits). Only for very small tasks; runs occasionally abort when the model produces an invalid tool call. KI:connect is the better free backend. Reads, edits and runs commands in cwd without asking; check the diff."
 cost = "free"
 max_concurrent = 1

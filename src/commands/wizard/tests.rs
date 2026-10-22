@@ -470,7 +470,7 @@ fn fresh_all_three_with_gemini_as_default() {
     );
     assert!(fake.probes.borrow().is_empty());
     // The Claude config dir of the second account was created (in the fake home).
-    let BackendKind::ClaudeOauth { config_dir } = &b.get("sidekick").unwrap().kind else {
+    let BackendKind::ClaudeOauth { config_dir, .. } = &b.get("sidekick").unwrap().kind else {
         panic!()
     };
     assert!(config_dir.is_dir(), "{}", config_dir.display());

@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
+use crate::backends::{ClaudePermissions, PermissionMode};
 use crate::redact::Secrets;
 use crate::token::Token;
 
@@ -109,6 +110,7 @@ impl RunContext {
             env,
             Secrets::new([self.token.expose()]),
             header,
+            &ClaudePermissions::default(),
         )
     }
 }
@@ -140,10 +142,11 @@ pub fn claude_launch(
     env: Vec<(OsString, OsString)>,
     secrets: Secrets,
     mut header: Vec<String>,
+    perms: &ClaudePermissions,
 ) -> Launch {
     let batch = crate::locate::is_batch_script(claude);
     let delivery = prompt_via_stdin(batch, &req.prompt);
-    let mut args = build_args(req);
+    let mut args = build_args(req, perms);
     let stdin = delivery.map(|_| {
         // Drop the trailing `-- <prompt>`; claude -p reads the prompt from stdin.
         args.truncate(args.len() - 2);
@@ -221,11 +224,12 @@ pub enum RunError {
 }
 
 /// Arguments after the executable:
-/// `-p --max-turns <n> [--model m] [--allowedTools a b ...] -- <prompt>`.
+/// `-p --max-turns <n> [--model m] [--permission-mode p] [--allowedTools a b ...]
+/// [--disallowedTools c d ...] -- <prompt>`.
 /// The prompt comes after `--` so a prompt starting with `-` is not parsed as a flag.
 /// When the prompt goes via stdin (see [`prompt_via_stdin`]), the trailing
 /// `-- <prompt>` is dropped by the caller.
-pub fn build_args(req: &RunRequest) -> Vec<OsString> {
+pub fn build_args(req: &RunRequest, perms: &ClaudePermissions) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "-p".into(),
         "--max-turns".into(),
@@ -235,15 +239,23 @@ pub fn build_args(req: &RunRequest) -> Vec<OsString> {
         args.push("--model".into());
         args.push(model.into());
     }
-    let tools: Vec<&String> = req
-        .allowed_tools
-        .iter()
+    if perms.mode != PermissionMode::Default {
+        args.push("--permission-mode".into());
+        args.push(perms.mode.as_str().into());
+    }
+    let tools: Vec<&String> = perms
+        .effective_allowed(req.allowed_tools.as_deref())
+        .into_iter()
         .flatten()
         .filter(|t| !t.trim().is_empty())
         .collect();
     if !tools.is_empty() {
         args.push("--allowedTools".into());
         args.extend(tools.into_iter().map(OsString::from));
+    }
+    if !perms.disallowed_tools.is_empty() {
+        args.push("--disallowedTools".into());
+        args.extend(perms.disallowed_tools.iter().map(OsString::from));
     }
     args.push("--".into());
     args.push(req.prompt.clone().into());
@@ -1011,12 +1023,18 @@ fn base_url_warning() -> String {
 }
 
 fn header(launch: &Launch, req: &RunRequest, started: &str) -> String {
-    let tools = req
-        .allowed_tools
-        .as_ref()
-        .map_or_else(|| "(default)".to_owned(), |t| t.join(" "));
     let extra: String = launch.header.iter().map(|l| format!("# {l}\n")).collect();
     let has = |prefix: &str| launch.header.iter().any(|l| l.starts_with(prefix));
+    let tools = if has("allowed_tools:") {
+        String::new()
+    } else {
+        format!(
+            "# allowed_tools: {}\n",
+            req.allowed_tools
+                .as_ref()
+                .map_or_else(|| "(default)".to_owned(), |t| t.join(" "))
+        )
+    };
     // An adapter that explains max_turns (ignored, mapped) replaces the generic line.
     let max_turns = if has("max_turns:") {
         String::new()
@@ -1042,7 +1060,7 @@ fn header(launch: &Launch, req: &RunRequest, started: &str) -> String {
          # cwd: {}\n\
          {max_turns}\
          {model}\
-         # allowed_tools: {tools}\n\
+         {tools}\
          # timeout: {}s\n\
          # prompt:\n{}\n\
          # ---- output (stdout+stderr) ----\n",
@@ -1320,19 +1338,23 @@ mod tests {
         }
     }
 
+    fn build_args_default(req: &RunRequest) -> Vec<OsString> {
+        build_args(req, &ClaudePermissions::default())
+    }
+
     fn strs(args: &[OsString]) -> Vec<&str> {
         args.iter().map(|a| a.to_str().unwrap()).collect()
     }
 
     #[test]
     fn args_minimal() {
-        let a = build_args(&req(None, None, "hello"));
+        let a = build_args_default(&req(None, None, "hello"));
         assert_eq!(strs(&a), ["-p", "--max-turns", "7", "--", "hello"]);
     }
 
     #[test]
     fn args_full() {
-        let a = build_args(&req(
+        let a = build_args_default(&req(
             Some("sonnet"),
             Some(vec!["Read", "", "Bash(git:*)"]),
             "x y",
@@ -1356,9 +1378,9 @@ mod tests {
 
     #[test]
     fn args_empty_tools_and_dash_prompt() {
-        let a = build_args(&req(None, Some(vec![]), "--help me"));
+        let a = build_args_default(&req(None, Some(vec![]), "--help me"));
         assert_eq!(strs(&a), ["-p", "--max-turns", "7", "--", "--help me"]);
-        let a = build_args(&req(None, Some(vec![" "]), "-x"));
+        let a = build_args_default(&req(None, Some(vec![" "]), "-x"));
         assert!(!strs(&a).contains(&"--allowedTools"));
         assert_eq!(strs(&a).last(), Some(&"-x"));
     }
@@ -1491,6 +1513,7 @@ mod tests {
             Vec::new(),
             Secrets::new(["secret-token-value"]),
             vec![base_url_warning()],
+            &ClaudePermissions::default(),
         );
         let h = header(&launch, &r, "now");
         assert!(

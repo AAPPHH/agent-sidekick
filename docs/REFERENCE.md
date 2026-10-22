@@ -39,14 +39,15 @@ As soon as `[backends]` exists, only the backends listed there are available.
 Three backends: the second Claude account (default), Claude Code against a local `qwen3-coder` in Ollama, and Aider with the same model. The commented version is [`examples/config.toml`](../examples/config.toml); it adds a fourth, optional backend `kiconnect` (see [Command backend with a stored key](#command-backend-with-a-stored-key)), which is reachable only after its key is stored.
 
 ```toml
-max_concurrent = 2          # global limit over all backends
+max_concurrent = 16         # global limit over all backends (default 16)
 
 [backends.sidekick]
 type = "claude-oauth"
 description = "Second Claude subscription account (Claude Code). Best quality for complex, multi-file changes and debugging; uses that account's quota."
 default = true
 cost = "quota"
-max_concurrent = 1
+permission_mode = "acceptEdits"
+allowed_tools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
 
 [backends.local]
 type = "claude-endpoint"
@@ -148,12 +149,18 @@ Runs that hit provider rate limits are detected and handled specially.
 - **Cooldown:** after a rate limit the backend is in cooldown for the wait time (60 s when unknown, at most 3600 s). During the cooldown `sidekick_backends` reports it as not reachable with "rate limited, retry in Ns", `sidekick_status` lists it ("cooldown: <name> retry in Ns"), and `sidekick_run` does not start it: with a `fallback` that is not cooling down itself the fallback runs directly (`fallback reason: primary <name> rate limited, retry in Ns`), otherwise the call fails with a tool error naming the remaining time. A fallback that is cooling down is skipped (`fallback '<name>' skipped: rate limited, retry in Ns`).
 - **Scope:** the cooldown is per backend name and kept in memory only (a server restart clears it); two backends on the same provider account cool down separately.
 - **Not rate-limit circumvention:** the cooldown makes agent-sidekick stop sending requests to a provider that asked it to wait; a fallback from one claude-oauth backend to another stays rejected (see Fallback).
-- **Typical case:** Groq's free tier allows about 8000 tokens per minute per model, while one agent step sends about 4000 to 6000 tokens.
+- **Typical case:** Groq's free tier allows about 8000 tokens per minute per model, while one OpenCode step sends about 7000 tokens, so nearly every step first gets HTTP 429 and OpenCode waits (about one step per minute).
 
 ### Concurrency
 
-`max_concurrent` at the top level is a global limit over all backends (default 2). A backend can additionally have its own `max_concurrent`, e.g. 1 for a local GPU or for the Claude account.
+`max_concurrent` at the top level is a global limit over all backends (default 16, at most 1024). A backend can additionally have its own `max_concurrent`, e.g. 1 for a local GPU.
 A run waits for a slot of its backend first, then for a global slot; queued runs are visible in `sidekick_status`.
+
+Advice for many parallel runs (20 or more):
+
+- **Quota:** parallel runs on one backend share that account's or key's quota and rate limits; more parallel runs reach the limit sooner (the backend then cools down, see [Rate limits](#rate-limits-http-429)). Spread the work over backends or set a per-backend `max_concurrent`.
+- **Separate working directories:** runs in the same `cwd` edit the same files and the same git index. Give every parallel run its own directory, e.g. one git worktree per run (`git worktree add ../wt-1 -b task-1`).
+- Changing a limit in config.toml takes effect for the next run (see [Configuration](#configuration)); runs already started or queued keep their slot.
 
 ### Reachability
 
@@ -275,6 +282,7 @@ Keys:
 | `harness_path` | Absolute path (or `~/...`) of the opencode executable. Default: the npm package's real executable (`<npm prefix>/node_modules/opencode-ai/bin/opencode.exe`, found next to an `opencode.cmd` in `PATH` or in `%APPDATA%\npm`; on Unix `<prefix>/lib/node_modules/...`), then `opencode` in `PATH` (on Windows only `opencode.exe`, never the `.cmd` shim), then `~/.opencode/bin/opencode`. A `.cmd`/`.bat` wrapper is accepted only here, with model names restricted to `A-Z a-z 0-9 - _ . / : @ +`. |
 | `read_only` | `true`: the edit, bash and webfetch tools are denied (OpenCode then does not offer them). Default `false`. |
 | `request_timeout_s` | Seconds OpenCode waits for the provider's response headers before it retries the request (OpenCode's `headerTimeout`, 1 to 3600; unset: OpenCode's default of 300). Raise it for slow local models that need long before the first token. A shorter value does not help against a queueing provider: on KI:connect the retries waited just as long. |
+| `model_options` | Table merged into every model entry of the generated opencode.json after `name` and `tool_call` (only openai-compatible and ollama; JSON-compatible values, no dates; `name` and `tool_call` are rejected). Example for gpt-oss on Groq: `model_options = { interleaved = { field = "reasoning" } }`. |
 | `cost` | Default `paid` (`free` for ollama). |
 
 `description`, `default`, `max_concurrent`, `env` and `pass_env` work as for every backend; `config_dir`, `auth`, `command`, `prompt_via_stdin` and `secret_env` are not allowed.
@@ -334,7 +342,7 @@ Keys:
 | `harness_path` | Absolute path (or `~/...`) of the codex executable. Default: the npm package's native `codex.exe` (next to a `codex.cmd` in `PATH` or in `%APPDATA%\npm`, x64 or arm64 package), then `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe` (standalone installer), then `codex.exe` in `PATH`; on Unix `codex` in `PATH`. The `.cmd` shim is never used; a `.cmd`/`.bat` here restricts model names and `cwd` to plain characters. |
 | `cost` | Default `quota` (chatgpt) or `paid` (api-key). |
 
-`description`, `default`, `max_concurrent`, `env` and `pass_env` work as for every backend (`env` must not set `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`); `config_dir`, `provider`, `request_timeout_s`, `command`, `prompt_via_stdin` and `secret_env` are not allowed.
+`description`, `default`, `max_concurrent`, `env` and `pass_env` work as for every backend (`env` must not set `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`); `config_dir`, `provider`, `request_timeout_s`, `model_options`, `command`, `prompt_via_stdin` and `secret_env` are not allowed.
 
 How a run works:
 
@@ -443,13 +451,15 @@ Without a `[backends]` section it also shows the global `default model` and the 
 Optional `config.toml` in the config directory:
 
 ```toml
-max_concurrent = 2        # parallel runs over all backends; more are queued
+max_concurrent = 16       # parallel runs over all backends (default 16); more are queued
 default_max_turns = 30
 default_timeout_s = 1800
 default_model = "sonnet"  # optional; only for the implicit backend (no [backends] section)
 claude_path = "/abs/path/to/claude"  # optional, used by claude-* backends
 pass_env = []             # inherited variables to keep for every backend, see above
 ```
+
+The server rereads `config.toml` before every tool call (`sidekick_run`, `sidekick_backends`, `sidekick_status`) when the file has changed, so edits take effect on the next call without an MCP reconnect. A call that is already running keeps the configuration it started with. If the changed file is invalid, the server keeps the last valid configuration, reports the error as `config_error` in `sidekick_backends` and as `config error` in `sidekick_status`, and adds a note to `sidekick_run` errors; the log gets a warning per change and an info line "config reloaded" with the backend names after every successful reload. If the file was already invalid when the server started, `sidekick_run` stays disabled until it is fixed. Rate-limit cooldowns and the running/queued counters survive a reload; a changed `max_concurrent` gets a new limit for new runs.
 
 `[backends.<name>]` keys (names: 1-32 characters `a-z`, `0-9`, `_`, `-`, starting with a letter or digit; keys not valid for the type or harness are a config error):
 
@@ -473,6 +483,7 @@ pass_env = []             # inherited variables to keep for every backend, see a
 | `harness_path` | opencode, codex | looked up | Absolute path (or `~/...`) of the harness executable. |
 | `read_only` | opencode, codex | `false` | opencode: deny the edit, bash and webfetch tools; codex: Codex's read-only sandbox. |
 | `request_timeout_s` | opencode | OpenCode's 300 | Header timeout before OpenCode retries a request (1 to 3600). |
+| `model_options` | opencode (openai-compatible, ollama) | none | Table merged into every model entry of the generated opencode.json. |
 | `wire_api` | codex (api-key with `base_url`) | `responses` | Only `responses` is accepted. |
 | `windows_sandbox` | codex | `mxc` | Windows sandbox of Codex: `mxc`, `elevated` or `unelevated`. |
 | `command` | command | (required) | Program and arguments with `{prompt}`, `{cwd}`, `{max_turns}`, `{model}` (placeholders only after `command[0]`). |

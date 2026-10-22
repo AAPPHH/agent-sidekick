@@ -775,3 +775,61 @@ Findings:
 - **The review by a different model (sonnet, read-only, 61 s) paid off:** it found two real medium defects (false rate-limit detections from tool output and from command tails) that the implementing model's own tests did not cover, and no false alarms.
 - **Duration and cost:** the 11 runs took about 23 minutes of delegated time in total. kiconnect's token use is high per edit (25k-210k input tokens, because OpenCode re-sends the file) but free.
 - **Rule of thumb from this test:** kiconnect for doc and template edits with all facts in the prompt; sidekick/opus for Rust with 40 turns and an explicit string-literal rule; a second model for the review; the main session checks every diff.
+
+## Groq with OpenCode (0.5.0)
+
+Measured against the real Groq API with OpenCode 1.19.3 (free tier):
+
+- **gpt-oss: `reasoning_content` 400.** With the plain model entry (`name`, `tool_call`) Groq answers every request from step 2 on with HTTP 400 "'messages.2' : property 'reasoning_content' is unsupported". `"interleaved": {"field": "reasoning"}` in the model entry fixes it (verified).
+- **qwen/qwen3.8-27b: `max_tokens`.** HTTP 400 "`max_tokens` must be less than or equal to `16384`"; `"limit": {"context": 131072, "output": 16384}` fixes that, but every OpenCode request is about 7200 tokens and Groq's free-tier ITPM limit for this model is 7000, so OpenCode retries "ContextOverflowError: Request too large for model ... on input tokens per minute (ITPM): Limit 7000, Requested 7210" until the run times out.
+- **Speed:** the free tier allows about 8000 tokens per minute, so nearly every step first hits HTTP 429 and OpenCode waits: about 45 s per step.
+- **tool_use_failed:** a gpt-oss-120b read task aborted at step 5 because the model produced an invalid tool call (Groq error `tool_use_failed`).
+
+Decisions:
+- New opencode backend option `model_options` (openai-compatible, ollama): a table merged into every generated model entry, so provider quirks are fixed in config instead of code. `name` and `tool_call` stay agent-sidekick's.
+- The Groq template offers only gpt-oss-120b and gpt-oss-20b with `model_options = { interleaved = { field = "reasoning" } }`; Qwen is dropped. Template, README and REFERENCE describe it honestly as very slow and only for very small tasks; kiconnect is the better free backend.
+- Rate-limit detection also treats "request too large" together with "tokens per minute" (Groq's TPM/ITPM message) as a rate limit without retry time.
+
+## Claude backend permissions (0.5.0)
+
+Problem: `claude -p` runs headless, so without the request's `allowed_tools` the delegated agent could only read; the calling session had to pass `allowed_tools` on every call.
+
+- **Three backend options for harness `claude` (both modes):** `permission_mode`, `allowed_tools`, `disallowed_tools`. Kept in `ClaudePermissions` inside `BackendKind::ClaudeOauth`/`ClaudeEndpoint`; on any other harness each key is a config error ("field ... is not allowed for harness ..."). The implicit backend (no `[backends]`) has none, so v0.1 configs behave as before.
+- **`permission_mode`:** the claude CLI 2.1.308 choices (`default`, `acceptEdits`, `auto`, `dontAsk`, `plan`, `bypassPermissions`) as a serde enum, so an unknown value fails when config.toml is parsed and the error lists the valid ones. `default` passes no flag (the CLI's own default stays authoritative).
+- **`allowed_tools` is a default, `disallowed_tools` is a floor:** the backend's `allowed_tools` is used only when the request names none; a request's own list replaces it (not merged, so a caller can narrow it). `disallowed_tools` is always passed, also next to the request's list, so a caller cannot lift a deny rule (claude gives deny rules precedence over allow rules).
+- **argv order:** `-p --max-turns n [--model m] [--permission-mode p] [--allowedTools ...] [--disallowedTools ...] -- <prompt>`; both tool flags are variadic, so the prompt stays behind `--` (or goes via stdin as before).
+- **Rule validation:** rules must not be blank, have surrounding whitespace, contain control characters or start with `-` (they land in argv and would be read as claude options, e.g. `--dangerously-skip-permissions`). The rule syntax itself is not checked; claude owns it.
+- **Visibility:** `backends test` shows all three values; the run log header gets `permission_mode`, `allowed_tools` (marked "request" or "backend default") and `disallowed_tools` lines, and the generic `allowed_tools` header line is suppressed for claude runs. `bypassPermissions` is allowed but `backends test` prints a warning line and `doctor` a WARN check per backend.
+- **Wizard template (`templates/sidekick.toml`):** `acceptEdits`, the common working tools and a deny list for irreversible or outward actions (`git push`, `sudo`, package publishing) and for reading SSH keys, agent-sidekick's config and the second account's credentials. Deny rules by prefix are a guard rail, not a sandbox: `Bash` stays allowed, so a determined agent could still reach the same effect through other commands (e.g. a script that pushes). Existing configs are not changed; only new wizard runs get these defaults.
+- **Not verified with a real run:** the flags were checked against the CLI's documented choices, not by a live `claude -p` run in this work.
+
+## Config hot reload and concurrency (0.5.0)
+
+Problem: `serve` read config.toml once at startup, so edits only applied after an MCP reconnect; users also want 20+ parallel runs.
+
+- **Check before every tool call:** `sidekick_run`, `sidekick_backends` and `sidekick_status` first compare config.toml with the last seen state (modification time, length and a hash of the content). The content is read on every call, so a change is detected even when the mtime resolution is coarse; a file that is only touched reloads too (harmless). No file watcher: no extra thread or dependency, and nothing happens while the server is idle.
+- **Snapshot:** config, resolved backends, config error and limits live in `RwLock<Arc<Snapshot>>`. A tool call takes the `Arc` at its start and keeps it (including fallback attempts), so a reload never changes a running or queued call.
+- **Semaphores by name:** a new snapshot reuses the global semaphore and each backend's semaphore when the limit is unchanged; a changed limit gets a new semaphore of the new size. Runs holding or waiting for a permit of the old one keep it; new runs use the new one, so for a moment old and new permits together can exceed the new limit. Removed backends lose their semaphore.
+- **Outside the snapshot:** the global and per-backend running/queued counters (by backend name; an entry of a removed backend is dropped once it is idle) and the rate-limit cooldown map, so `sidekick_status` stays correct and cooldowns survive reloads.
+- **Invalid config after a change:** the last valid snapshot stays in use with the new error as `config_error` (`sidekick_backends`, `sidekick_status`, and a note on `sidekick_run` errors); one warning is logged per change because the state is only compared again on the next change. A config that was invalid at startup has no valid snapshot to keep, so `sidekick_run` stays disabled as before until the file is fixed. An invalid `[backends]` (resolve error) counts as invalid too. Each successful reload logs "config reloaded" with the backend names.
+- **Unit tests** build the server without a reload source, so they never read the real config directory.
+- **Default global `max_concurrent` 16** (was 2); `MAX_CONCURRENT_LIMIT` stays 1024. The wizard's Claude template no longer sets a per-backend `max_concurrent = 1`; parallel runs share the account's quota and need separate working directories (e.g. git worktrees), which REFERENCE.md now advises. The template's deny list also covers `Read(~/AppData/Roaming/agent-sidekick/**)` (the Windows config directory).
+
+## 0.5.0: real tests and the second delegation practice test (2026-10-22)
+
+- **Version 0.5.0, not 0.4.1:** the release adds config options (`model_options`, `permission_mode`, `allowed_tools`, `disallowed_tools`) and hot reload, so it is a minor release.
+- **Real Groq test after the fix** (temporary config from the templates, key from the keyring, release build): gpt-oss-120b answered the calc.py read task correctly in 6 steps, 243 s (about 40 s per step: each step waits for the per-minute token budget), 39,057 tokens in / 337 out. Before the fix the same run failed at step 2 (`reasoning_content` unsupported); Qwen cannot work on Groq's free tier at all (one OpenCode request is larger than its 7000 input tokens per minute).
+- **Real permissions test:** the second account (haiku) fixed calc.py in a write task **without** `allowed_tools` in the request, in 10.5 s, using the template's `permission_mode = "acceptEdits"` and default `allowed_tools`; my own `python -m unittest` run: OK. Before, such a run could only read.
+- **Concurrency:** the default global limit is 16 and the second-account template has no per-backend limit (user decision: scale to many parallel runs). Parallel runs share the account's quota (rate limits are detected and, with `fallback`, avoided) and need separate working directories.
+
+Practice test 2 (all with `max_turns` 100):
+
+| # | Task | Backend / model | Duration | Result | Review changes |
+|---|---|---|---|---|---|
+| 1 | model_options, Groq template, ITPM detection, NOTES (Rust + docs) | sidekick / opus | 407 s | usable: 4 commits, green; also updated README/REFERENCE unasked (correct) | none |
+| 2 | Claude backend permissions + template (Rust) | sidekick / opus | 596 s | usable: 3 commits, green; good extra validation (tool rules must not start with `-`) | merge conflict with run 1 in the field array (resolved by me) |
+| 3 | Config hot reload, default 16, docs (Rust) | sidekick / opus | 1157 s | aborted: network error (Anthropic API unreachable, ENOTFOUND); only small changes left | continued in run 4 |
+| 4 | Continue hot reload | sidekick / opus | 471 s | usable: 6 commits, 548 tests green | one raw line break in a string literal |
+| 5 | REFERENCE example + CHANGELOG [0.5.0] | kiconnect / gpt-oss-120b | 33 s, 9 steps | usable as is | none |
+
+Findings: with 100 turns no run hit the turn limit (0.4.0: 2 of 4 with 20). The explicit string-literal rule in the prompt cut the raw-line-break defects from 3 of 4 Rust results to 1 of 4. kiconnect stays reliable for doc edits with all facts in the prompt.

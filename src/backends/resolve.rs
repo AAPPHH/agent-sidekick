@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use super::{
-    command_uses_model, Backend, BackendKind, BackendType, Backends, CodexAuth, Cost, EndpointAuth,
-    OpencodeProvider, RawAuth, RawBackend, IMPLICIT_BACKEND,
+    command_uses_model, Backend, BackendKind, BackendType, Backends, ClaudePermissions, CodexAuth,
+    Cost, EndpointAuth, OpencodeProvider, RawAuth, RawBackend, IMPLICIT_BACKEND,
 };
 use crate::config::Config;
 use crate::harness::HarnessKind;
@@ -174,7 +174,10 @@ fn implicit_backend(cfg: &Config, defaults: &ResolveDefaults) -> Result<Backend,
         env: BTreeMap::new(),
         pass_env: Vec::new(),
         implicit: true,
-        kind: BackendKind::ClaudeOauth { config_dir },
+        kind: BackendKind::ClaudeOauth {
+            config_dir,
+            permissions: ClaudePermissions::default(),
+        },
         foreign_secret_env: Vec::new(),
     })
 }
@@ -226,7 +229,10 @@ fn resolve_explicit(
         };
         let ep_norm = normalize_dir(config_dir);
         for oa in &list {
-            if let BackendKind::ClaudeOauth { config_dir: oa_dir } = &oa.kind {
+            if let BackendKind::ClaudeOauth {
+                config_dir: oa_dir, ..
+            } = &oa.kind
+            {
                 if normalize_dir(oa_dir) == ep_norm {
                     errors.push(format!(
                         "backends.{}: config_dir {} is also used by claude-oauth backend `{}`; \
@@ -334,7 +340,8 @@ fn resolve_one(
     }
 
     // Fields that are not allowed for this type.
-    let set_fields: [(&str, bool, &[BackendType]); 13] = [
+    let claude: &[BackendType] = &[BackendType::ClaudeOauth, BackendType::ClaudeEndpoint];
+    let set_fields: [(&str, bool, &[BackendType]); 17] = [
         (
             "config_dir",
             raw.config_dir.is_some(),
@@ -375,6 +382,11 @@ fn resolve_one(
             &[BackendType::OpenCode],
         ),
         (
+            "model_options",
+            raw.model_options.is_some(),
+            &[BackendType::OpenCode],
+        ),
+        (
             "auth",
             raw.auth.is_some(),
             &[BackendType::ClaudeEndpoint, BackendType::Codex],
@@ -396,6 +408,9 @@ fn resolve_one(
             raw.secret_env.is_some(),
             &[BackendType::Command],
         ),
+        ("permission_mode", raw.permission_mode.is_some(), claude),
+        ("allowed_tools", raw.allowed_tools.is_some(), claude),
+        ("disallowed_tools", raw.disallowed_tools.is_some(), claude),
     ];
     for (field, is_set, allowed) in set_fields {
         if is_set && !allowed.contains(&kind) {
@@ -408,7 +423,11 @@ fn resolve_one(
     let backend_kind = match kind {
         BackendType::ClaudeOauth => {
             let dir = config_dir_for(name, raw, defaults, true, &mut errs);
-            dir.map(|config_dir| BackendKind::ClaudeOauth { config_dir })
+            let permissions = claude_permissions(raw, &mut errs);
+            dir.map(|config_dir| BackendKind::ClaudeOauth {
+                config_dir,
+                permissions,
+            })
         }
         BackendType::ClaudeEndpoint => {
             let base_url = match raw.base_url.as_deref() {
@@ -438,6 +457,7 @@ fn resolve_one(
                 }
             };
             let dir = config_dir_for(name, raw, defaults, false, &mut errs);
+            let permissions = claude_permissions(raw, &mut errs);
             match (base_url, dir, auth) {
                 (Some(base_url), Some(config_dir), Some(auth)) => {
                     Some(BackendKind::ClaudeEndpoint {
@@ -445,6 +465,7 @@ fn resolve_one(
                         api_key_env: raw.api_key_env.clone(),
                         auth,
                         config_dir,
+                        permissions,
                     })
                 }
                 _ => None,
@@ -757,6 +778,38 @@ fn codex_kind(
     })
 }
 
+fn claude_permissions(raw: &RawBackend, errs: &mut Vec<String>) -> ClaudePermissions {
+    for (field, list) in [
+        ("allowed_tools", &raw.allowed_tools),
+        ("disallowed_tools", &raw.disallowed_tools),
+    ] {
+        for (i, t) in list.iter().flatten().enumerate() {
+            if let Some(p) = tool_rule_problem(t) {
+                errs.push(format!("`{field}[{i}]` ({t:?}) {p}"));
+            }
+        }
+    }
+    ClaudePermissions {
+        mode: raw.permission_mode.unwrap_or_default(),
+        allowed_tools: raw.allowed_tools.clone(),
+        disallowed_tools: raw.disallowed_tools.clone().unwrap_or_default(),
+    }
+}
+
+fn tool_rule_problem(rule: &str) -> Option<&'static str> {
+    if rule.trim().is_empty() {
+        Some("must not be blank")
+    } else if rule.chars().any(char::is_control) {
+        Some("must not contain control characters")
+    } else if rule.trim() != rule {
+        Some("must not have leading or trailing whitespace")
+    } else if rule.starts_with('-') {
+        Some("must not start with `-` (it would be read as a claude option)")
+    } else {
+        None
+    }
+}
+
 /// `api_key_env` (claude-endpoint, opencode): a valid name and never one of the agent's own
 /// secrets.
 fn check_api_key_env(raw: &RawBackend, errs: &mut Vec<String>) {
@@ -845,6 +898,23 @@ fn opencode_kind(
             "`request_timeout_s` must be between 1 and 3600 (got {t})"
         ));
     }
+    let model_options = raw.model_options.clone().unwrap_or_default();
+    if raw.model_options.is_some() && provider == OpencodeProvider::Openrouter {
+        errs.push(
+            "`model_options` is not allowed for provider `openrouter` (only for              openai-compatible and ollama)"
+                .to_owned(),
+        );
+    }
+    for key in ["name", "tool_call"] {
+        if model_options.contains_key(key) {
+            errs.push(format!(
+                "`model_options` must not set `{key}` (agent-sidekick sets it for every model)"
+            ));
+        }
+    }
+    for (k, v) in &model_options {
+        check_json_value(&format!("model_options.{k}"), v, errs);
+    }
     if errs.len() != before {
         return None;
     }
@@ -855,9 +925,37 @@ fn opencode_kind(
         harness_path,
         read_only: raw.read_only.unwrap_or(false),
         request_timeout_s,
+        model_options,
         base_dir,
     })
 }
+
+fn check_json_value(path: &str, v: &serde_json::Value, errs: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Null => errs.push(format!(
+            "`{path}`: not a JSON-compatible value (nan and inf are not allowed)"
+        )),
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                check_json_value(&format!("{path}[{i}]"), item, errs);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.contains_key(TOML_DATETIME_FIELD) {
+                errs.push(format!(
+                    "`{path}`: not a JSON-compatible value (TOML dates and times are not allowed)"
+                ));
+                return;
+            }
+            for (k, item) in map {
+                check_json_value(&format!("{path}.{k}"), item, errs);
+            }
+        }
+        _ => {}
+    }
+}
+
+const TOML_DATETIME_FIELD: &str = "$__toml_private_datetime";
 
 /// Placeholders of a command template (never allowed in `command[0]`).
 const PLACEHOLDERS: [&str; 4] = ["{prompt}", "{cwd}", "{max_turns}", "{model}"];
@@ -1244,7 +1342,8 @@ pass_env = ["OPENAI_API_BASE"]
         assert_eq!(
             s.kind,
             BackendKind::ClaudeOauth {
-                config_dir: abs("home").join(".claude-sidekick")
+                config_dir: abs("home").join(".claude-sidekick"),
+                permissions: Default::default(),
             }
         );
     }
@@ -1283,7 +1382,8 @@ pass_env = ["OPENAI_API_BASE"]
         assert_eq!(
             s.kind,
             BackendKind::ClaudeOauth {
-                config_dir: abs("home").join(".claude-sidekick")
+                config_dir: abs("home").join(".claude-sidekick"),
+                permissions: Default::default(),
             }
         );
 
@@ -1299,6 +1399,7 @@ pass_env = ["OPENAI_API_BASE"]
                 api_key_env: Some("OLLAMA_API_KEY".into()),
                 auth: EndpointAuth::XApiKey,
                 config_dir: abs("home").join(".claude-sidekick-local"),
+                permissions: Default::default(),
             }
         );
 
@@ -1360,13 +1461,15 @@ prompt_via_stdin = true
         assert_eq!(
             b.get("sidekick").unwrap().kind,
             BackendKind::ClaudeOauth {
-                config_dir: abs("home").join(".claude-sidekick")
+                config_dir: abs("home").join(".claude-sidekick"),
+                permissions: Default::default(),
             }
         );
         assert_eq!(
             b.get("other").unwrap().kind,
             BackendKind::ClaudeOauth {
-                config_dir: abs("home").join(".claude-sidekick-other")
+                config_dir: abs("home").join(".claude-sidekick-other"),
+                permissions: Default::default(),
             }
         );
         assert_eq!(
@@ -1376,6 +1479,7 @@ prompt_via_stdin = true
                 api_key_env: None,
                 auth: EndpointAuth::XApiKey,
                 config_dir: abs("home").join(".claude-sidekick-ep"),
+                permissions: Default::default(),
             }
         );
         assert_eq!(
@@ -2121,7 +2225,8 @@ prompt_via_stdin = true
         assert_eq!(
             b.default_backend().kind,
             BackendKind::ClaudeOauth {
-                config_dir: abs("home").join("sub/dir")
+                config_dir: abs("home").join("sub/dir"),
+                permissions: Default::default(),
             }
         );
         let b = resolve_str(&one(
@@ -2131,7 +2236,8 @@ prompt_via_stdin = true
         assert_eq!(
             b.default_backend().kind,
             BackendKind::ClaudeOauth {
-                config_dir: abs("home")
+                config_dir: abs("home"),
+                permissions: Default::default(),
             }
         );
         let text = one(&format!(
@@ -2141,7 +2247,8 @@ prompt_via_stdin = true
         assert_eq!(
             resolve_str(&text).unwrap().default_backend().kind,
             BackendKind::ClaudeOauth {
-                config_dir: abs("abs").join("dir")
+                config_dir: abs("abs").join("dir"),
+                permissions: Default::default(),
             }
         );
     }
@@ -2265,5 +2372,123 @@ description = "fine"
         );
         assert_eq!(normalize_dir(&d.join("")), normalize_dir(&d));
         assert_ne!(normalize_dir(&d.join("y")), normalize_dir(&d));
+    }
+
+    #[test]
+    fn claude_permission_fields_resolve() {
+        let b = resolve_str(
+            "[backends.s]\nharness = \"claude\"\ndescription = \"d\"\ndefault = true\n\
+             permission_mode = \"acceptEdits\"\nallowed_tools = [\"Read\", \"Bash(git:*)\"]\n\
+             disallowed_tools = [\"Bash(git push:*)\"]\n\
+             [backends.e]\nharness = \"claude\"\ndescription = \"d\"\n\
+             base_url = \"http://localhost:11434\"\npermission_mode = \"plan\"\n",
+        )
+        .unwrap();
+        let s = b.get("s").unwrap().claude_permissions().unwrap();
+        assert_eq!(s.mode, crate::backends::PermissionMode::AcceptEdits);
+        assert_eq!(
+            s.allowed_tools.as_deref(),
+            Some(&["Read".to_owned(), "Bash(git:*)".to_owned()][..])
+        );
+        assert_eq!(s.disallowed_tools, ["Bash(git push:*)"]);
+        let e = b.get("e").unwrap().claude_permissions().unwrap();
+        assert_eq!(e.mode, crate::backends::PermissionMode::Plan);
+        assert_eq!(e.allowed_tools, None);
+        assert!(e.disallowed_tools.is_empty());
+        let implicit = resolve_str("").unwrap();
+        assert_eq!(
+            implicit.default_backend().claude_permissions(),
+            Some(&ClaudePermissions::default())
+        );
+    }
+
+    #[test]
+    fn claude_permission_fields_are_errors_on_other_harnesses() {
+        let others = [
+            (
+                "harness = \"command\"\ncommand = [\"aider\", \"{prompt}\"]",
+                "harness `command`",
+            ),
+            (
+                "harness = \"opencode\"\nprovider = \"ollama\"\n\
+                 base_url = \"http://localhost:11434\"\nmodels = [\"m\"]",
+                "harness `opencode`",
+            ),
+            ("harness = \"codex\"", "harness `codex`"),
+        ];
+        for (kind, label) in others {
+            for field in [
+                "permission_mode = \"acceptEdits\"",
+                "allowed_tools = [\"Read\"]",
+                "disallowed_tools = [\"Bash\"]",
+            ] {
+                let e = err_of(&format!(
+                    "[backends.x]\n{kind}\ndescription = \"d\"\ndefault = true\n{field}\n"
+                ));
+                let key = field.split(' ').next().unwrap();
+                assert!(
+                    e.contains(&format!(
+                        "backends.x: field `{key}` is not allowed for {label}"
+                    )),
+                    "{e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_permission_values_are_validated() {
+        let base = "[backends.s]\nharness = \"claude\"\ndescription = \"d\"\ndefault = true\n";
+        let e = toml::from_str::<Config>(&format!("{base}permission_mode = \"yolo\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("unknown variant `yolo`"), "{e}");
+        assert!(
+            e.contains("acceptEdits") && e.contains("bypassPermissions"),
+            "{e}"
+        );
+        let e = err_of(&format!(
+            "{base}allowed_tools = [\"Read\", \" \", \"--dangerously-skip-permissions\"]\n\
+             disallowed_tools = [\" Bash\", \"a\\nb\"]\n"
+        ));
+        assert!(
+            e.contains("`allowed_tools[1]` (\" \") must not be blank"),
+            "{e}"
+        );
+        assert!(
+            e.contains(
+                "`allowed_tools[2]` (\"--dangerously-skip-permissions\") must not start with `-`"
+            ),
+            "{e}"
+        );
+        assert!(
+            e.contains(
+                "`disallowed_tools[0]` (\" Bash\") must not have leading or trailing whitespace"
+            ),
+            "{e}"
+        );
+        assert!(
+            e.contains("`disallowed_tools[1]` (\"a\\nb\") must not contain control characters"),
+            "{e}"
+        );
+        for mode in [
+            "default",
+            "acceptEdits",
+            "auto",
+            "dontAsk",
+            "plan",
+            "bypassPermissions",
+        ] {
+            let b = resolve_str(&format!("{base}permission_mode = \"{mode}\"\n")).unwrap();
+            assert_eq!(
+                b.get("s")
+                    .unwrap()
+                    .claude_permissions()
+                    .unwrap()
+                    .mode
+                    .as_str(),
+                mode
+            );
+        }
     }
 }

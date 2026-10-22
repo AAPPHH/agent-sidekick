@@ -320,7 +320,7 @@ fn per_backend_max_concurrent_queues_runs() {
         "sleep 6\necho SLOW-DONE",
         "ping -n 7 127.0.0.1 >nul\necho SLOW-DONE",
     );
-    // Global max_concurrent stays 2: only the backend's own limit can queue the second run.
+    // Global max_concurrent stays at its default (16): only the backend's own limit can queue the second run.
     let config = command_backend("slow", &slow, true, "max_concurrent = 1\n");
     let mut server = start(&config, &dir);
     let args = |server: &mut Server| {
@@ -747,4 +747,71 @@ fn fallback_uses_its_default_when_model_not_offered() {
     );
     assert!(!text.contains("not offered"), "{text}");
     assert_model_arg(&text, "qwen-qwen3-8-27b");
+}
+
+fn backends_of(server: &mut Server) -> Value {
+    let res = server.call_tool("sidekick_backends", json!({}));
+    serde_json::from_str(&text_of(&res)).unwrap()
+}
+
+fn names_of(report: &Value) -> Vec<String> {
+    report["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn config_changes_apply_on_the_next_tool_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = dir.path().join("scripts");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let good = good_script(&scripts);
+    let first = command_backend("bad", &bad_script(&scripts), true, "");
+    let mut server = start(&first, &dir);
+    let report = backends_of(&mut server);
+    assert_eq!(names_of(&report), ["bad"], "{report}");
+    assert_eq!(report["config_error"], Value::Null, "{report}");
+
+    let config_file = dir.path().join("config.toml");
+    let second = format!("{first}{}", command_backend("good", &good, false, ""));
+    std::fs::write(&config_file, &second).unwrap();
+    let report = backends_of(&mut server);
+    assert_eq!(names_of(&report), ["bad", "good"], "{report}");
+    assert_eq!(report["config_error"], Value::Null, "{report}");
+    let (is_error, text) = run(
+        &mut server,
+        &work,
+        json!({"prompt": "hello", "backend": "good"}),
+    );
+    assert!(!is_error, "{text}");
+    assert!(text.contains("GOOD-RAN"), "{text}");
+
+    std::fs::write(&config_file, format!("{second}this is not toml\n")).unwrap();
+    let report = backends_of(&mut server);
+    assert_eq!(names_of(&report), ["bad", "good"], "{report}");
+    let err = report["config_error"].as_str().unwrap_or_default();
+    assert!(err.contains("config.toml"), "{report}");
+    let (is_error, text) = run(
+        &mut server,
+        &work,
+        json!({"prompt": "hello", "backend": "nope"}),
+    );
+    assert!(is_error, "{text}");
+    assert!(text.contains("last valid config is still in use"), "{text}");
+    let res = server.call_tool("sidekick_status", json!({}));
+    let status = text_of(&res);
+    assert!(
+        status.contains("the last valid config.toml stays in use"),
+        "{status}"
+    );
+
+    std::fs::write(&config_file, &second).unwrap();
+    let report = backends_of(&mut server);
+    assert_eq!(names_of(&report), ["bad", "good"], "{report}");
+    assert_eq!(report["config_error"], Value::Null, "{report}");
 }

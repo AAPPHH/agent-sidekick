@@ -377,7 +377,7 @@ pub fn describe(backend: &Backend) -> Vec<String> {
         );
     }
     match &backend.kind {
-        BackendKind::ClaudeOauth { config_dir } => {
+        BackendKind::ClaudeOauth { config_dir, .. } => {
             lines.push(config_dir_line(config_dir));
         }
         BackendKind::ClaudeEndpoint {
@@ -385,6 +385,7 @@ pub fn describe(backend: &Backend) -> Vec<String> {
             api_key_env,
             auth,
             config_dir,
+            ..
         } => {
             lines.push(config_dir_line(config_dir));
             lines.push(format!("base_url:    {base_url}"));
@@ -408,6 +409,7 @@ pub fn describe(backend: &Backend) -> Vec<String> {
             harness_path,
             read_only,
             request_timeout_s,
+            model_options,
             base_dir,
         } => {
             lines.push(format!("provider:    {provider}"));
@@ -423,6 +425,12 @@ pub fn describe(backend: &Backend) -> Vec<String> {
                 Some(t) => format!("request_timeout_s: {t}"),
                 None => "request_timeout_s: (OpenCode default, 300)".to_owned(),
             });
+            if !model_options.is_empty() {
+                lines.push(format!(
+                    "model_options: {}",
+                    serde_json::Value::Object(model_options.clone())
+                ));
+            }
             lines.push(match (provider.needs_key(), api_key_env) {
                 (false, _) => "api key:     none needed".to_owned(),
                 (true, Some(var)) => format!("api key:     from environment variable {var}"),
@@ -498,6 +506,29 @@ pub fn describe(backend: &Backend) -> Vec<String> {
             }
         }
     }
+    if let Some(p) = backend.claude_permissions() {
+        lines.push(format!("permission_mode: {}", p.mode));
+        lines.push(match &p.allowed_tools {
+            Some(t) if !t.is_empty() => format!(
+                "allowed_tools: {} (when the request gives none)",
+                t.join(" ")
+            ),
+            _ => "allowed_tools: (none; without the request's allowed_tools only read-only \
+                  tools run)"
+                .to_owned(),
+        });
+        lines.push(if p.disallowed_tools.is_empty() {
+            "disallowed_tools: (none)".to_owned()
+        } else {
+            format!(
+                "disallowed_tools: {} (always)",
+                p.disallowed_tools.join(" ")
+            )
+        });
+        if p.mode == backends::PermissionMode::BypassPermissions {
+            lines.push(format!("warning:     {}", backends::BYPASS_WARNING));
+        }
+    }
     if !backend.env.is_empty() {
         let keys: Vec<&str> = backend.env.keys().map(String::as_str).collect();
         lines.push(format!(
@@ -532,7 +563,7 @@ pub fn quote_template(command: &[String]) -> String {
 /// Config dir of a claude-* backend.
 pub(crate) fn claude_config_dir(backend: &Backend) -> Option<&PathBuf> {
     match &backend.kind {
-        BackendKind::ClaudeOauth { config_dir }
+        BackendKind::ClaudeOauth { config_dir, .. }
         | BackendKind::ClaudeEndpoint { config_dir, .. } => Some(config_dir),
         BackendKind::Command { .. } | BackendKind::OpenCode { .. } | BackendKind::Codex { .. } => {
             None
@@ -575,6 +606,7 @@ pub(crate) mod tests {
             name,
             BackendKind::ClaudeOauth {
                 config_dir: abs(&format!(".claude-{name}")),
+                permissions: Default::default(),
             },
             is_default,
         )
@@ -588,6 +620,7 @@ pub(crate) mod tests {
                 api_key_env: api_key_env.map(Into::into),
                 auth: EndpointAuth::XApiKey,
                 config_dir: abs(&format!(".claude-sidekick-{name}")),
+                permissions: Default::default(),
             },
             is_default,
         )
@@ -637,6 +670,7 @@ pub(crate) mod tests {
                 harness_path: None,
                 read_only: false,
                 request_timeout_s: None,
+                model_options: serde_json::Map::new(),
                 base_dir: abs("cfg").join("opencode").join(name),
             },
             is_default,
@@ -668,7 +702,24 @@ pub(crate) mod tests {
         );
         assert!(text.contains("OS keyring entry backend-kic"), "{text}");
         assert!(text.contains("state dir:   "), "{text}");
+        assert!(!text.contains("model_options"), "{text}");
         assert_eq!(claude_config_dir(&b), None);
+
+        let mut b = b;
+        if let BackendKind::OpenCode { model_options, .. } = &mut b.kind {
+            model_options.insert(
+                "interleaved".into(),
+                serde_json::json!({"field": "reasoning"}),
+            );
+        }
+        let text = describe(&b).join(
+            "
+",
+        );
+        assert!(
+            text.contains("model_options: {\"interleaved\":{\"field\":\"reasoning\"}}"),
+            "{text}"
+        );
     }
 
     /// sidekick (oauth, default), work (oauth), local (endpoint, keyring), envkey (endpoint,
@@ -775,6 +826,42 @@ pub(crate) mod tests {
             text.contains(r#"command:     ["aider", "--message", "{prompt}"]"#),
             "{text}"
         );
+    }
+
+    #[test]
+    fn describe_shows_claude_permissions() {
+        let text = describe(&oauth("s", true)).join("\n");
+        assert!(text.contains("permission_mode: default"), "{text}");
+        assert!(text.contains("allowed_tools: (none;"), "{text}");
+        assert!(text.contains("disallowed_tools: (none)"), "{text}");
+        assert!(!text.contains("warning:"), "{text}");
+
+        let mut b = endpoint("local", None, false);
+        if let BackendKind::ClaudeEndpoint { permissions, .. } = &mut b.kind {
+            permissions.mode = backends::PermissionMode::BypassPermissions;
+            permissions.allowed_tools = Some(vec!["Bash".into(), "Edit".into()]);
+            permissions.disallowed_tools = vec!["Bash(git push:*)".into()];
+        }
+        let text = describe(&b).join("\n");
+        assert!(
+            text.contains("permission_mode: bypassPermissions"),
+            "{text}"
+        );
+        assert!(
+            text.contains("allowed_tools: Bash Edit (when the request gives none)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("disallowed_tools: Bash(git push:*) (always)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("warning:     {}", backends::BYPASS_WARNING)),
+            "{text}"
+        );
+
+        let text = describe(&command("aider", true)).join("\n");
+        assert!(!text.contains("permission_mode"), "{text}");
     }
 
     #[test]

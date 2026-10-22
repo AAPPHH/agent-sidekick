@@ -113,6 +113,78 @@ impl WindowsSandbox {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    #[default]
+    Default,
+    AcceptEdits,
+    Auto,
+    DontAsk,
+    Plan,
+    BypassPermissions,
+}
+
+impl PermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PermissionMode::Default => "default",
+            PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::Auto => "auto",
+            PermissionMode::DontAsk => "dontAsk",
+            PermissionMode::Plan => "plan",
+            PermissionMode::BypassPermissions => "bypassPermissions",
+        }
+    }
+}
+
+impl fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub const BYPASS_WARNING: &str = "permission_mode = \"bypassPermissions\": the agent runs every \
+     tool without asking (only disallowed_tools still apply); prefer \"acceptEdits\" with \
+     allowed_tools";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudePermissions {
+    pub mode: PermissionMode,
+    pub allowed_tools: Option<Vec<String>>,
+    pub disallowed_tools: Vec<String>,
+}
+
+impl ClaudePermissions {
+    pub fn effective_allowed<'a>(
+        &'a self,
+        requested: Option<&'a [String]>,
+    ) -> Option<&'a [String]> {
+        requested
+            .filter(|t| !t.is_empty())
+            .or(self.allowed_tools.as_deref())
+            .filter(|t| !t.is_empty())
+    }
+
+    pub fn header_lines(&self, requested: Option<&[String]>) -> Vec<String> {
+        let allowed = match (requested.filter(|t| !t.is_empty()), &self.allowed_tools) {
+            (Some(t), _) => format!("{} (request)", t.join(" ")),
+            (None, Some(t)) if !t.is_empty() => format!("{} (backend default)", t.join(" ")),
+            _ => "(none: read-only tools)".to_owned(),
+        };
+        let disallowed = if self.disallowed_tools.is_empty() {
+            "(none)".to_owned()
+        } else {
+            self.disallowed_tools.join(" ")
+        };
+        vec![
+            format!("permission_mode: {}", self.mode),
+            format!("allowed_tools: {allowed}"),
+            format!("disallowed_tools: {disallowed}"),
+        ]
+    }
+}
+
 /// The `auth` value as written in config.toml: claude-endpoint uses `x-api-key`/`bearer`,
 /// codex `chatgpt`/`api-key`; [`resolve`] checks which values a backend may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -277,11 +349,15 @@ pub struct RawBackend {
     /// opencode: seconds to wait for the provider's response headers before OpenCode retries
     /// the request (OpenCode's `headerTimeout`; unset: OpenCode's default of 300 s).
     pub request_timeout_s: Option<u64>,
+    pub model_options: Option<serde_json::Map<String, serde_json::Value>>,
     /// codex (api-key with `base_url`): the provider's wire API. Only `responses` exists
     /// (Codex 0.163 dropped chat completions); any other value is a config error.
     pub wire_api: Option<String>,
     /// codex: Windows sandbox implementation (`mxc`, `elevated`, `unelevated`; default mxc).
     pub windows_sandbox: Option<WindowsSandbox>,
+    pub permission_mode: Option<PermissionMode>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub disallowed_tools: Option<Vec<String>>,
 }
 
 /// A validated backend.
@@ -317,12 +393,14 @@ pub struct Backend {
 pub enum BackendKind {
     ClaudeOauth {
         config_dir: PathBuf,
+        permissions: ClaudePermissions,
     },
     ClaudeEndpoint {
         base_url: String,
         api_key_env: Option<String>,
         auth: EndpointAuth,
         config_dir: PathBuf,
+        permissions: ClaudePermissions,
     },
     Command {
         command: Vec<String>,
@@ -343,6 +421,7 @@ pub enum BackendKind {
         /// Header timeout in seconds (OpenCode provider option `headerTimeout`, retried on
         /// expiry); `None`: OpenCode's default.
         request_timeout_s: Option<u64>,
+        model_options: serde_json::Map<String, serde_json::Value>,
         /// Per-backend isolation directory `<config-dir>/opencode/<name>`.
         base_dir: PathBuf,
     },
@@ -371,6 +450,14 @@ impl Backend {
             BackendKind::Command { .. } => BackendType::Command,
             BackendKind::OpenCode { .. } => BackendType::OpenCode,
             BackendKind::Codex { .. } => BackendType::Codex,
+        }
+    }
+
+    pub fn claude_permissions(&self) -> Option<&ClaudePermissions> {
+        match &self.kind {
+            BackendKind::ClaudeOauth { permissions, .. }
+            | BackendKind::ClaudeEndpoint { permissions, .. } => Some(permissions),
+            _ => None,
         }
     }
 

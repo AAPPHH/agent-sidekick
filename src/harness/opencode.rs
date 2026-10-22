@@ -240,6 +240,7 @@ pub fn render_config(backend: &Backend) -> Result<Value, String> {
         base_url,
         read_only,
         request_timeout_s,
+        model_options,
         ..
     } = &backend.kind
     else {
@@ -266,7 +267,11 @@ pub fn render_config(backend: &Backend) -> Result<Value, String> {
             };
             let mut model_map = Map::new();
             for m in &models {
-                model_map.insert((*m).to_owned(), json!({"name": m, "tool_call": true}));
+                let mut entry = Map::new();
+                entry.insert("name".to_owned(), json!(m));
+                entry.insert("tool_call".to_owned(), json!(true));
+                entry.extend(model_options.clone());
+                model_map.insert((*m).to_owned(), Value::Object(entry));
             }
             json!({
                 "npm": "@ai-sdk/openai-compatible",

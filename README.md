@@ -151,13 +151,13 @@ Die Nutzung über die API zählt auf dasselbe Kontingent wie das Webinterface, u
 
 ## Groq-API-Schlüssel erzeugen
 
-Groq ist ein zweites kostenloses Backend mit denselben offenen Modellen wie KI:connect (gpt-oss-120b, Qwen 3.8 27B), sehr schnell, aber eng begrenzt.
+Groq ist ein zweites kostenloses Backend mit den offenen Modellen gpt-oss-120b und gpt-oss-20b. Die kostenlose Stufe ist so eng begrenzt, dass der Agent nur etwa einen Schritt pro Minute schafft; KI:connect ist das bessere kostenlose Backend.
 
 1. Öffne https://console.groq.com/keys und melde dich an (kostenlos, ohne Kreditkarte; Anmeldung z. B. mit Google oder GitHub).
 2. Klicke auf "Create API Key", gib einen Namen ein und kopiere den Schlüssel; er wird nur einmal angezeigt.
 3. Wähle im Setup das Profil "Groq (kostenlos, mit Limits)" oder speichere den Schlüssel später mit `agent-sidekick setup --backend groq`.
 
-**Grenzen:** Pro Modell gelten in der kostenlosen Stufe 30 Anfragen pro Minute, 1000 pro Tag, 8000 Tokens pro Minute und 200.000 Tokens pro Tag (Stand Oktober 2026, aktuelle Werte unter https://console.groq.com/settings/limits). Ein Agentenschritt braucht etwa 4000 bis 6000 Tokens, längere Aufgaben stoßen daher an das Limit (HTTP 429). Nutze Groq für kleine Aufgaben oder wenn KI:connect langsam ist.
+**Grenzen:** Pro Modell gelten in der kostenlosen Stufe 30 Anfragen pro Minute, 1000 pro Tag, 8000 Tokens pro Minute und 200.000 Tokens pro Tag (Stand Oktober 2026, aktuelle Werte unter https://console.groq.com/settings/limits). Ein OpenCode-Schritt schickt etwa 7000 Tokens, daher stößt fast jeder Schritt erst an das Limit (HTTP 429) und OpenCode wartet. Gelegentlich bricht ein Lauf ab, wenn das Modell einen ungültigen Tool-Aufruf erzeugt (Groq-Fehler `tool_use_failed`). Nutze Groq nur für sehr kleine Aufgaben.
 
 ## Token für das Claude-Zweitkonto erzeugen
 
@@ -213,6 +213,10 @@ Das Kontingent pro Minute oder pro Tag ist erschöpft. Warte die angegebene Zeit
 ### /mcp zeigt agent-sidekick nicht an
 
 Lade VS Code neu oder starte es komplett neu. Hilft das nicht, führe `agent-sidekick doctor` aus; es nennt den nächsten Schritt. `agent-sidekick setup --register-only` meldet den Server erneut bei Claude Code an, und `claude mcp list` zeigt, ob er eingetragen ist.
+
+### Änderungen an der config.toml wirken nicht
+
+Seit Version 0.5.0 liest agent-sidekick die `config.toml` beim nächsten Aufruf eines Werkzeugs (`sidekick_run`, `sidekick_backends`, `sidekick_status`) neu ein; ein Neustart ist nicht nötig. Ist die geänderte Datei fehlerhaft, arbeitet agent-sidekick mit der letzten gültigen Fassung weiter und meldet den Fehler als `config_error` in `sidekick_backends`; `agent-sidekick doctor` zeigt Details. Ältere Versionen lesen die Datei nur beim Start: Wähle in Claude Code `/mcp`, dann agent-sidekick und **Reconnect**.
 
 ### Der KI:connect-Schlüssel ist abgelaufen
 

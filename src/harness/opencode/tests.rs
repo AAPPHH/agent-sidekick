@@ -167,12 +167,14 @@ fn kiconnect_example_resolves() {
         harness_path,
         read_only,
         request_timeout_s,
+        model_options,
         base_dir,
     } = &b.kind
     else {
         panic!("{b:?}")
     };
     assert_eq!(*request_timeout_s, None);
+    assert!(model_options.is_empty());
     assert_eq!(*provider, OpencodeProvider::OpenaiCompatible);
     assert_eq!(
         base_url.as_deref(),
@@ -396,6 +398,86 @@ fn rendered_config_ollama_and_openrouter() {
     assert_eq!(p["models"]["qwen/qwen3-coder"], json!({}));
     assert!(p["options"].get("headerTimeout").is_none(), "{p}");
     assert_eq!(c["permission"], permissions(true));
+}
+
+#[test]
+fn model_options_are_merged_into_every_model() {
+    let bs = resolve_str(&one("provider = \"openai-compatible\"
+base_url = \"https://api.groq.com/openai/v1\"
+         models = [\"a\", \"b\"]
+         model_options = { interleaved = { field = \"reasoning\" }, limit = { output = 16384 } }
+"))
+    .unwrap();
+    let c = render_config(bs.get("x").unwrap()).unwrap();
+    for m in ["a", "b"] {
+        assert_eq!(
+            c["provider"]["sidekick"]["models"][m],
+            json!({
+                "name": m,
+                "tool_call": true,
+                "interleaved": {"field": "reasoning"},
+                "limit": {"output": 16384}
+            })
+        );
+    }
+    let bs = resolve_str(&one("provider = \"ollama\"
+base_url = \"http://localhost:11434\"
+models = [\"m\"]
+         [backends.x.model_options]
+reasoning = true
+temperature = 0.5
+"))
+    .unwrap();
+    let c = render_config(bs.get("x").unwrap()).unwrap();
+    assert_eq!(
+        c["provider"]["sidekick"]["models"]["m"],
+        json!({"name": "m", "tool_call": true, "reasoning": true, "temperature": 0.5})
+    );
+}
+
+#[test]
+fn model_options_config_errors() {
+    const COMPAT: &str = "provider = \"openai-compatible\"
+base_url = \"https://x\"
+models = [\"m\"]
+";
+    let err = |body: &str| resolve_str(&one(body)).unwrap_err();
+    let has = |e: String, what: &str| assert!(e.contains(what), "{e}");
+    has(
+        err("provider = \"openrouter\"
+models = [\"m\"]
+model_options = { a = 1 }"),
+        "`model_options` is not allowed for provider `openrouter`",
+    );
+    for key in ["name", "tool_call"] {
+        has(
+            err(&format!("{COMPAT}model_options = {{ {key} = true }}")),
+            &format!("`model_options` must not set `{key}`"),
+        );
+    }
+    has(
+        err(&format!(
+            "{COMPAT}model_options = {{ a = {{ b = [1, nan] }} }}"
+        )),
+        "`model_options.a.b[1]`: not a JSON-compatible value",
+    );
+    has(
+        err(&format!("{COMPAT}model_options = {{ when = 2026-10-22 }}")),
+        "`model_options.when`: not a JSON-compatible value (TOML dates",
+    );
+    has(err(&format!("{COMPAT}model_options = 5")), "parse error");
+    has(
+        resolve_str(
+            "[backends.x]
+harness = \"command\"
+description = \"d\"
+             command = [\"x\", \"{prompt}\"]
+model_options = { a = 1 }
+",
+        )
+        .unwrap_err(),
+        "field `model_options` is not allowed for harness `command`",
+    );
 }
 
 #[test]
