@@ -814,3 +814,22 @@ Problem: `serve` read config.toml once at startup, so edits only applied after a
 - **Invalid config after a change:** the last valid snapshot stays in use with the new error as `config_error` (`sidekick_backends`, `sidekick_status`, and a note on `sidekick_run` errors); one warning is logged per change because the state is only compared again on the next change. A config that was invalid at startup has no valid snapshot to keep, so `sidekick_run` stays disabled as before until the file is fixed. An invalid `[backends]` (resolve error) counts as invalid too. Each successful reload logs "config reloaded" with the backend names.
 - **Unit tests** build the server without a reload source, so they never read the real config directory.
 - **Default global `max_concurrent` 16** (was 2); `MAX_CONCURRENT_LIMIT` stays 1024. The wizard's Claude template no longer sets a per-backend `max_concurrent = 1`; parallel runs share the account's quota and need separate working directories (e.g. git worktrees), which REFERENCE.md now advises. The template's deny list also covers `Read(~/AppData/Roaming/agent-sidekick/**)` (the Windows config directory).
+
+## 0.5.0: real tests and the second delegation practice test (2026-10-22)
+
+- **Version 0.5.0, not 0.4.1:** the release adds config options (`model_options`, `permission_mode`, `allowed_tools`, `disallowed_tools`) and hot reload, so it is a minor release.
+- **Real Groq test after the fix** (temporary config from the templates, key from the keyring, release build): gpt-oss-120b answered the calc.py read task correctly in 6 steps, 243 s (about 40 s per step: each step waits for the per-minute token budget), 39,057 tokens in / 337 out. Before the fix the same run failed at step 2 (`reasoning_content` unsupported); Qwen cannot work on Groq's free tier at all (one OpenCode request is larger than its 7000 input tokens per minute).
+- **Real permissions test:** the second account (haiku) fixed calc.py in a write task **without** `allowed_tools` in the request, in 10.5 s, using the template's `permission_mode = "acceptEdits"` and default `allowed_tools`; my own `python -m unittest` run: OK. Before, such a run could only read.
+- **Concurrency:** the default global limit is 16 and the second-account template has no per-backend limit (user decision: scale to many parallel runs). Parallel runs share the account's quota (rate limits are detected and, with `fallback`, avoided) and need separate working directories.
+
+Practice test 2 (all with `max_turns` 100):
+
+| # | Task | Backend / model | Duration | Result | Review changes |
+|---|---|---|---|---|---|
+| 1 | model_options, Groq template, ITPM detection, NOTES (Rust + docs) | sidekick / opus | 407 s | usable: 4 commits, green; also updated README/REFERENCE unasked (correct) | none |
+| 2 | Claude backend permissions + template (Rust) | sidekick / opus | 596 s | usable: 3 commits, green; good extra validation (tool rules must not start with `-`) | merge conflict with run 1 in the field array (resolved by me) |
+| 3 | Config hot reload, default 16, docs (Rust) | sidekick / opus | 1157 s | aborted: network error (Anthropic API unreachable, ENOTFOUND); only small changes left | continued in run 4 |
+| 4 | Continue hot reload | sidekick / opus | 471 s | usable: 6 commits, 548 tests green | one raw line break in a string literal |
+| 5 | REFERENCE example + CHANGELOG [0.5.0] | kiconnect / gpt-oss-120b | 33 s, 9 steps | usable as is | none |
+
+Findings: with 100 turns no run hit the turn limit (0.4.0: 2 of 4 with 20). The explicit string-literal rule in the prompt cut the raw-line-break defects from 3 of 4 Rust results to 1 of 4. kiconnect stays reliable for doc edits with all facts in the prompt.
