@@ -50,6 +50,7 @@ fn fake_opencode(dir: &Path) -> PathBuf {
         "#!/bin/sh\n\
          out=\"$FAKE_OC_OUT\"\n\
          mkdir -p \"$out\"\n\
+         echo run >> \"$out/runs.txt\"\n\
          printf '%s\\n' \"$@\" > \"$out/argv.txt\"\n\
          env | cut -d= -f1 | sort > \"$out/env-names.txt\"\n\
          cat > \"$out/stdin.txt\"\n\
@@ -84,6 +85,7 @@ fn fake_opencode(dir: &Path) -> PathBuf {
          setlocal\n\
          set \"out=%FAKE_OC_OUT%\"\n\
          if not exist \"%out%\" mkdir \"%out%\"\n\
+         >>\"%out%\\runs.txt\" echo run\n\
          >\"%out%\\argv.txt\" echo %*\n\
          for /f \"tokens=1 delims==\" %%k in ('set') do >>\"%out%\\env-names.txt\" echo %%k\n\
          findstr \"^\" > \"%out%\\stdin.txt\"\n\
@@ -535,6 +537,7 @@ fn rate_limit_falls_back_to_command() {
         "{text}"
     );
 
+    let mut server = f.start(&config, &[]);
     let (is_error, text) = f.run(&mut server, json!({"prompt": "hi", "fallback": "good"}));
     assert!(!is_error, "{text}");
     assert!(
@@ -543,6 +546,84 @@ fn rate_limit_falls_back_to_command() {
     );
     assert!(text.contains("\nfallback reason: rate limited\n"), "{text}");
     assert!(text.contains("GOOD-RAN"), "{text}");
+}
+
+#[test]
+fn rate_limited_backend_cools_down() {
+    let f = Fixture::new();
+    let (_good, invocation) = good_script(f.dir.path());
+    let canned = ev(
+        json!({"type":"error","sessionID":"s1","error":{"name":"APIError","data":{"message":"Rate limit reached. Please try again in 30s","statusCode":429}}}),
+    ) + "\n";
+    let missing = f.dir.path().join("missing-bad-command");
+    let config = format!(
+        "{}\n[backends.good]\nharness = \"command\"\ndescription = \"good\"\n{invocation}\n\
+         [backends.bad]\nharness = \"command\"\ndescription = \"bad\"\ncommand = ['{}', '{{prompt}}']\n",
+        f.oc_backend(true, &canned, 0),
+        missing.to_string_lossy().replace('\\', "/")
+    );
+    let mut server = f.start(&config, &[]);
+    let runs = || {
+        std::fs::read_to_string(f.rec.join("runs.txt"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let (is_error, text) = f.run(&mut server, json!({"prompt": "hi", "fallback": "good"}));
+    assert!(!is_error, "{text}");
+    assert!(text.contains("\nfallback reason: rate limited\n"), "{text}");
+    assert_eq!(runs(), 1);
+
+    let (is_error, text) = f.run(&mut server, json!({"prompt": "hi", "fallback": "good"}));
+    assert!(!is_error, "{text}");
+    assert!(text.starts_with("backend: good (command)\n"), "{text}");
+    assert!(
+        text.contains("\nfallback reason: primary oc rate limited, retry in "),
+        "{text}"
+    );
+    assert!(text.contains("GOOD-RAN"), "{text}");
+    assert_eq!(runs(), 1, "opencode ran again");
+
+    let (is_error, text) = f.run(&mut server, json!({"prompt": "hi"}));
+    assert!(is_error, "{text}");
+    assert!(
+        text.contains("backend oc is rate limited, retry in "),
+        "{text}"
+    );
+    assert_eq!(runs(), 1, "opencode ran again");
+
+    let (is_error, text) = f.run(
+        &mut server,
+        json!({"prompt": "hi", "backend": "bad", "fallback": "oc"}),
+    );
+    assert!(is_error, "{text}");
+    assert!(
+        text.contains("\nfallback 'oc' skipped: rate limited, retry in "),
+        "{text}"
+    );
+    assert_eq!(runs(), 1, "opencode ran again");
+
+    let res = server.call_tool("sidekick_backends", json!({}), RUN_WITHIN);
+    let report: Value = serde_json::from_str(&text_of(&res)).unwrap();
+    let oc = report["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "oc")
+        .unwrap()
+        .clone();
+    assert_eq!(oc["reachable"], false, "{oc}");
+    assert!(
+        oc["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("rate limited, retry in "),
+        "{oc}"
+    );
+
+    let status = text_of(&server.call_tool("sidekick_status", json!({}), RUN_WITHIN));
+    assert!(status.contains("\ncooldown: oc retry in "), "{status}");
 }
 
 #[test]

@@ -867,7 +867,7 @@ pub fn normalize_json_lines(raw: &str) -> Normalized {
             let mut seen = warnings.clone();
             seen.extend(failed.iter().cloned());
             seen.extend(plain.iter().cloned());
-            detect_rate_limit(&seen.join("\n")).or_else(|| detect_rate_limit(raw))
+            detect_rate_limit(&seen.join("\n"))
         })
         .flatten();
     if let Some(rl) = &rate_limit {

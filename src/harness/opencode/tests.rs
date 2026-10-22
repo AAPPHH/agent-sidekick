@@ -1058,13 +1058,25 @@ fn rate_limit_without_answer_is_a_failure() {
     );
 
     let with_answer = format!(
-        "{raw}
-{}",
+        "{raw}\n{}",
         ev(json!({"type":"text","sessionID":"s","part":{"type":"text","text":"done"}}))
     );
     let n = normalize_json_lines(&with_answer);
     assert_eq!(n.failure, None);
     assert_eq!(n.rate_limit, None);
+}
+
+#[test]
+fn rate_limit_text_in_tool_output_is_not_a_rate_limit() {
+    let raw = [
+        ev(json!({"type":"tool_use","sessionID":"s","part":{"tool":"bash","state":{"status":"completed","output":"grep: rate_limit_error 429 Too Many Requests"}}})),
+        ev(json!({"type":"error","sessionID":"s","error":{"name":"APIError","data":{"message":"Internal server error","statusCode":500}}})),
+    ]
+    .join("\n");
+    let n = normalize_json_lines(&raw);
+    assert!(n.failure.is_some());
+    assert_eq!(n.rate_limit, None);
+    assert!(!n.text.contains("rate_limited"), "{}", n.text);
 }
 
 #[test]
