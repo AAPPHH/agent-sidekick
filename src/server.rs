@@ -520,12 +520,27 @@ impl Counters {
     }
 }
 
-/// Per-backend concurrency state.
-#[derive(Debug, Default)]
-struct BackendSlot {
-    /// `max_concurrent` of the backend, if configured.
-    semaphore: Option<Arc<Semaphore>>,
-    counters: Counters,
+#[derive(Debug, Clone)]
+struct Limit {
+    permits: usize,
+    semaphore: Arc<Semaphore>,
+}
+
+impl Limit {
+    fn new(permits: usize) -> Self {
+        let permits = permits.max(1);
+        Self {
+            permits,
+            semaphore: Arc::new(Semaphore::new(permits)),
+        }
+    }
+
+    fn reuse_or_new(old: Option<&Limit>, permits: usize) -> Self {
+        match old {
+            Some(l) if l.permits == permits.max(1) => l.clone(),
+            _ => Self::new(permits),
+        }
+    }
 }
 
 /// One entry of the `sidekick_backends` result. Never contains secrets or env values.
@@ -791,7 +806,7 @@ fn active_cooldowns(map: &mut CooldownMap, now: Instant) -> Vec<(String, u64)> {
 }
 
 #[derive(Debug)]
-struct State {
+struct Snapshot {
     config: Config,
     /// `Config::load` error, reported by `sidekick_status` and `sidekick_backends`.
     config_error: Option<String>,
@@ -799,11 +814,109 @@ struct State {
     /// `sidekick_run` refuses to run instead of falling back to the implicit backend).
     backends: Result<Backends, String>,
     /// Global concurrency limit (`max_concurrent` in config.toml).
-    semaphore: Arc<Semaphore>,
+    global: Limit,
+    /// Per-backend semaphores (`max_concurrent` of the backend).
+    per_backend: HashMap<String, Limit>,
+}
+
+impl Snapshot {
+    fn build(
+        config: Config,
+        config_error: Option<String>,
+        backends: Result<Backends, String>,
+        previous: Option<&Snapshot>,
+    ) -> Self {
+        let global = Limit::reuse_or_new(previous.map(|p| &p.global), config.max_concurrent);
+        let per_backend = backends
+            .iter()
+            .flat_map(Backends::iter)
+            .filter_map(|b| {
+                let n = b.max_concurrent?;
+                let old = previous.and_then(|p| p.per_backend.get(&b.name));
+                Some((b.name.clone(), Limit::reuse_or_new(old, n)))
+            })
+            .collect();
+        Self {
+            config,
+            config_error,
+            backends,
+            global,
+            per_backend,
+        }
+    }
+
+    fn with_error(&self, err: String) -> Self {
+        Self {
+            config: self.config.clone(),
+            config_error: Some(err),
+            backends: self.backends.clone(),
+            global: self.global.clone(),
+            per_backend: self.per_backend.clone(),
+        }
+    }
+
+    fn backend_names(&self) -> String {
+        match &self.backends {
+            Ok(b) => b
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Err(_) => String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileState {
+    Missing,
+    Present {
+        modified: Option<std::time::SystemTime>,
+        len: u64,
+        hash: u64,
+    },
+    Unreadable(String),
+}
+
+fn read_config_file(path: &Path) -> (FileState, Result<Config, String>) {
+    use std::hash::{Hash, Hasher};
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (FileState::Missing, Ok(Config::default()))
+        }
+        Err(e) => {
+            let msg = redact_all(&format!("reading {}: {e}", path.display()));
+            return (FileState::Unreadable(msg.clone()), Err(msg));
+        }
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let state = FileState::Present {
+        modified: std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+        len: bytes.len() as u64,
+        hash: hasher.finish(),
+    };
+    let config = match std::str::from_utf8(&bytes) {
+        Ok(text) => Config::parse(text, path).map_err(|e| redact_all(&format!("{e:#}"))),
+        Err(e) => Err(format!("parsing {}: not UTF-8: {e}", path.display())),
+    };
+    (state, config)
+}
+
+#[derive(Debug)]
+struct Reload {
+    path: PathBuf,
+    file: std::sync::Mutex<FileState>,
+}
+
+#[derive(Debug)]
+struct State {
+    snapshot: std::sync::RwLock<Arc<Snapshot>>,
+    reload: Option<Reload>,
     /// Global running/queued counters.
     counters: Counters,
-    /// Per-backend semaphores (`max_concurrent` of the backend) and counters.
-    per_backend: HashMap<String, BackendSlot>,
+    per_backend: std::sync::Mutex<HashMap<String, Arc<Counters>>>,
     /// Cancelled when the server shuts down (client disconnect or signal); every run's
     /// cancellation token is a child of it, so in-flight process trees get killed.
     shutdown: CancellationToken,
@@ -827,6 +940,26 @@ fn text_result(text: String, is_error: bool) -> CallToolResult {
 
 fn tool_error(msg: impl AsRef<str>) -> Result<CallToolResult, McpError> {
     Ok(text_result(redact_all(msg.as_ref()), true))
+}
+
+fn stale_config_note(snap: &Snapshot) -> Option<String> {
+    match (&snap.config_error, &snap.backends) {
+        (Some(e), Ok(_)) => Some(format!(
+            "note: config.toml is invalid since its last change ({e}); the last valid config              is still in use"
+        )),
+        _ => None,
+    }
+}
+
+fn tool_error_with(snap: &Snapshot, msg: impl AsRef<str>) -> Result<CallToolResult, McpError> {
+    match stale_config_note(snap) {
+        Some(note) => tool_error(format!(
+            "{}
+{note}",
+            msg.as_ref()
+        )),
+        None => tool_error(msg),
+    }
 }
 
 /// Redact every secret of the run's attempts (and every `sk-ant-…` token).
@@ -855,30 +988,39 @@ impl SidekickServer {
         config_error: Option<String>,
         backends: Result<Backends, String>,
     ) -> Self {
-        let permits = config.max_concurrent.max(1);
-        let per_backend = backends
-            .iter()
-            .flat_map(Backends::iter)
-            .map(|b| {
-                let slot = BackendSlot {
-                    semaphore: b.max_concurrent.map(|n| Arc::new(Semaphore::new(n.max(1)))),
-                    counters: Counters::default(),
-                };
-                (b.name.clone(), slot)
-            })
-            .collect();
+        Self::with_snapshot(Snapshot::build(config, config_error, backends, None), None)
+    }
+
+    fn with_snapshot(snapshot: Snapshot, reload: Option<Reload>) -> Self {
         Self {
             state: Arc::new(State {
-                config,
-                config_error,
-                backends,
-                semaphore: Arc::new(Semaphore::new(permits)),
+                snapshot: std::sync::RwLock::new(Arc::new(snapshot)),
+                reload,
                 counters: Counters::default(),
-                per_backend,
+                per_backend: std::sync::Mutex::default(),
                 shutdown: CancellationToken::new(),
                 cooldowns: std::sync::Mutex::default(),
             }),
         }
+    }
+
+    fn reloading(path: PathBuf) -> Self {
+        let (file, loaded) = read_config_file(&path);
+        if let Err(msg) = &loaded {
+            tracing::warn!("config error, sidekick_run is disabled: {msg}");
+        }
+        let snapshot = match loaded {
+            Ok(config) => {
+                let backends = backends::resolve(&config);
+                Snapshot::build(config, None, backends, None)
+            }
+            Err(msg) => Snapshot::build(Config::default(), Some(msg.clone()), Err(msg), None),
+        };
+        let reload = Reload {
+            path,
+            file: std::sync::Mutex::new(file),
+        };
+        Self::with_snapshot(snapshot, Some(reload))
     }
 
     /// Delegate a prompt to a separate, headless agent that runs with its own credentials
@@ -900,9 +1042,10 @@ impl SidekickServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let state = &self.state;
+        let snap = state.refresh();
 
         // No silent fallback to the implicit backend when config.toml is broken.
-        let backends = match &state.backends {
+        let backends = match &snap.backends {
             Ok(b) => b,
             Err(e) => return tool_error(config_invalid_message(e)),
         };
@@ -911,16 +1054,19 @@ impl SidekickServer {
         let base_dir = match std::env::current_dir() {
             Ok(d) => d,
             Err(e) => {
-                return tool_error(format!(
+                return tool_error_with(
+                    &snap,
+                    format!(
                     "Cannot determine the server's current directory: {e}. Pass an absolute 'cwd'."
-                ))
+                ),
+                )
             }
         };
         let home = crate::paths::home_dir().ok();
         let (backend_param, fallback_param) = (params.backend.clone(), params.fallback.clone());
-        let req = match resolve_request(params, &state.config, &base_dir, home.as_deref()) {
+        let req = match resolve_request(params, &snap.config, &base_dir, home.as_deref()) {
             Ok(r) => r,
-            Err(msg) => return tool_error(msg),
+            Err(msg) => return tool_error_with(&snap, msg),
         };
         let (primary, fallback) = match select_backends(
             backends,
@@ -928,22 +1074,25 @@ impl SidekickServer {
             fallback_param.as_deref(),
         ) {
             Ok(sel) => sel,
-            Err(msg) => return tool_error(msg),
+            Err(msg) => return tool_error_with(&snap, msg),
         };
         // A model the primary does not offer is an invalid parameter: no run, no fallback.
         if let Err(msg) = primary.effective_model(req.model.as_deref()) {
-            return tool_error(msg);
+            return tool_error_with(&snap, msg);
         }
         let direct = match state.cooldown(&primary.name) {
             None => None,
             Some(secs) => match fallback.filter(|fb| state.cooldown(&fb.name).is_none()) {
                 Some(fb) => Some((secs, fb)),
                 None => {
-                    return tool_error(format!(
-                        "backend {} is rate limited, retry in {secs}s; choose another backend \
+                    return tool_error_with(
+                        &snap,
+                        format!(
+                            "backend {} is rate limited, retry in {secs}s; choose another backend \
                          (see sidekick_backends) or set fallback",
-                        primary.name
-                    ))
+                            primary.name
+                        ),
+                    )
                 }
             },
         };
@@ -973,7 +1122,7 @@ impl SidekickServer {
             let mut lines = vec![reason.clone()];
             lines.extend(model_note);
             match self
-                .attempt(fb, &fb_req, &cancel, &ctx.ct, &phase, &mut secrets)
+                .attempt(&snap, fb, &fb_req, &cancel, &ctx.ct, &phase, &mut secrets)
                 .await
             {
                 Attempt::Ran(o) => (
@@ -995,7 +1144,7 @@ impl SidekickServer {
             }
         } else {
             let first = self
-                .attempt(primary, &req, &cancel, &ctx.ct, &phase, &mut secrets)
+                .attempt(&snap, primary, &req, &cancel, &ctx.ct, &phase, &mut secrets)
                 .await;
             match (first, fallback) {
                 (first, Some(fb))
@@ -1032,7 +1181,7 @@ impl SidekickServer {
                     with_phase(&phase, |p| *p = RunPhase::fallback(&fb.name));
                     let (fb_req, model_note) = fallback_request(fb, &req);
                     let second = self
-                        .attempt(fb, &fb_req, &cancel, &ctx.ct, &phase, &mut secrets)
+                        .attempt(&snap, fb, &fb_req, &cancel, &ctx.ct, &phase, &mut secrets)
                         .await;
                     match (second, &first) {
                         (Attempt::Ran(o), _) => (
@@ -1085,6 +1234,13 @@ impl SidekickServer {
             }
         };
         drop(ticker);
+        let text = match stale_config_note(&snap) {
+            Some(note) if is_error => format!(
+                "{text}
+{note}"
+            ),
+            _ => text,
+        };
         Ok(text_result(redact_with(&secrets, &text), is_error))
     }
 
@@ -1096,7 +1252,8 @@ impl SidekickServer {
     /// `backend`, sidekick_run uses the default one. Never shows secrets.
     #[tool]
     async fn sidekick_backends(&self) -> Result<CallToolResult, McpError> {
-        let report = self.backends_report().await;
+        let snap = self.state.refresh();
+        let report = self.backends_report(&snap).await;
         let text = serde_json::to_string_pretty(&report)
             .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
         Ok(text_result(redact_all(&text), false))
@@ -1108,9 +1265,10 @@ impl SidekickServer {
     /// backend's secret comes from (never the value itself).
     #[tool]
     async fn sidekick_status(&self) -> Result<CallToolResult, McpError> {
-        let claude_cfg = self.state.config.claude_path.clone();
+        let snap = self.state.refresh();
+        let claude_cfg = snap.config.claude_path.clone();
         let located = blocking(move || locate::find_claude(claude_cfg.as_deref())).await;
-        let ids: Vec<SecretId> = match &self.state.backends {
+        let ids: Vec<SecretId> = match &snap.backends {
             Ok(b) => b
                 .iter()
                 .filter(|b| {
@@ -1137,7 +1295,7 @@ impl SidekickServer {
                 .collect::<Vec<_>>()
         })
         .await;
-        let text = self.status_text(located, tokens);
+        let text = self.status_text(&snap, located, tokens);
         Ok(text_result(redact_all(&text), false))
     }
 }
@@ -1149,8 +1307,10 @@ impl SidekickServer {
     /// One attempt to run `backend`: credentials, program, endpoint probe, launch, permits
     /// (per backend first, then global; both cancellable), run. Secrets of the attempt are
     /// added to `secrets` for redaction of the result.
+    #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
+        snap: &Snapshot,
         backend: &Backend,
         req: &RunRequest,
         cancel: &CancellationToken,
@@ -1161,7 +1321,7 @@ impl SidekickServer {
         let st = &self.state;
         let ty = backend.backend_type();
         let b = backend.clone();
-        let claude_path = st.config.claude_path.clone();
+        let claude_path = snap.config.claude_path.clone();
         let prepared = blocking(move || -> Result<(Credential, PathBuf), String> {
             let (cred, _source) = backends::load_credential(&b)?;
             let program =
@@ -1197,7 +1357,7 @@ impl SidekickServer {
             &cred,
             &program,
             std::env::vars_os(),
-            &st.config.pass_env,
+            &snap.config.pass_env,
         ) {
             Ok(l) => l,
             Err(e) => return Attempt::NotStarted(e),
@@ -1211,12 +1371,10 @@ impl SidekickServer {
             }
         };
 
-        let slot = st.per_backend.get(&backend.name);
+        let counters = st.backend_counters(&backend.name);
         let (backend_permit, global_permit) = {
-            let _queued = CountGuard::all(
-                std::iter::once(&st.counters.queued).chain(slot.map(|s| &s.counters.queued)),
-            );
-            let backend_permit = match slot.and_then(|s| s.semaphore.clone()) {
+            let _queued = CountGuard::all([&st.counters.queued, &counters.queued]);
+            let backend_permit = match snap.per_backend.get(&backend.name) {
                 None => None,
                 Some(sem) => tokio::select! {
                     biased;
@@ -1224,7 +1382,7 @@ impl SidekickServer {
                         tracing::info!("sidekick_run cancelled while queued");
                         return Attempt::Stopped(CANCELLED_QUEUED_MSG.into());
                     }
-                    p = sem.acquire_owned() => match p {
+                    p = sem.semaphore.clone().acquire_owned() => match p {
                         Ok(p) => Some(p),
                         Err(_) => return Attempt::Stopped("Server is shutting down.".into()),
                     },
@@ -1236,7 +1394,7 @@ impl SidekickServer {
                     tracing::info!("sidekick_run cancelled while queued");
                     return Attempt::Stopped(CANCELLED_QUEUED_MSG.into());
                 }
-                p = st.semaphore.clone().acquire_owned() => match p {
+                p = snap.global.semaphore.clone().acquire_owned() => match p {
                     Ok(p) => p,
                     Err(_) => return Attempt::Stopped("Server is shutting down.".into()),
                 },
@@ -1249,9 +1407,7 @@ impl SidekickServer {
             tracing::info!("sidekick_run cancelled before start");
             return Attempt::Stopped(CANCELLED_QUEUED_MSG.into());
         }
-        let _running = CountGuard::all(
-            std::iter::once(&st.counters.running).chain(slot.map(|s| &s.counters.running)),
-        );
+        let _running = CountGuard::all([&st.counters.running, &counters.running]);
         with_phase(phase, |p| p.started = Some(Instant::now()));
         tracing::info!(
             backend = %backend.name,
@@ -1327,9 +1483,9 @@ impl SidekickServer {
 
     /// `sidekick_backends` content: every backend with a reachability check; the checks run
     /// concurrently and are bounded by [`BACKENDS_CHECK_BUDGET`] in total.
-    async fn backends_report(&self) -> BackendsReport {
+    async fn backends_report(&self, snap: &Snapshot) -> BackendsReport {
         let st = &self.state;
-        let backends = match &st.backends {
+        let backends = match &snap.backends {
             Ok(b) => b,
             Err(e) => {
                 return BackendsReport {
@@ -1346,7 +1502,7 @@ impl SidekickServer {
                     return Err(secs);
                 }
                 let b = b.clone();
-                let claude_path = st.config.claude_path.clone();
+                let claude_path = snap.config.claude_path.clone();
                 Ok(tokio::task::spawn_blocking(move || {
                     backends::check_backend(&b, claude_path.as_deref())
                 }))
@@ -1372,7 +1528,7 @@ impl SidekickServer {
                     ),
                 ),
             };
-            let counters = st.per_backend.get(&b.name).map(|s| &s.counters);
+            let (running, queued) = st.counts(&b.name);
             list.push(BackendInfo {
                 name: b.name.clone(),
                 kind: b.backend_type().as_str(),
@@ -1384,19 +1540,19 @@ impl SidekickServer {
                 reachable,
                 detail: redact_all(&detail),
                 max_concurrent: b.max_concurrent,
-                running: counters.map_or(0, Counters::running),
-                queued: counters.map_or(0, Counters::queued),
+                running,
+                queued,
             });
         }
         BackendsReport {
-            config_error: st.config_error.clone(),
+            config_error: snap.config_error.clone(),
             backends: list,
         }
     }
 
-    fn status_text(&self, located: LocateResult, tokens: TokenResults) -> String {
+    fn status_text(&self, snap: &Snapshot, located: LocateResult, tokens: TokenResults) -> String {
         let st = &self.state;
-        let cfg = &st.config;
+        let cfg = &snap.config;
         let path_or_err = |r: anyhow::Result<PathBuf>| match r {
             Ok(p) => p.display().to_string(),
             Err(e) => format!("unavailable ({e:#})"),
@@ -1447,8 +1603,14 @@ impl SidekickServer {
             "config file: {}",
             path_or_err(crate::paths::config_file())
         );
-        match (&st.config_error, &st.backends) {
-            (Some(e), _) | (None, Err(e)) => {
+        match (&snap.config_error, &snap.backends) {
+            (Some(e), Ok(_)) => {
+                let _ = writeln!(
+                    s,
+                    "config error: {e} (the last valid config.toml stays in use until it is fixed)"
+                );
+            }
+            (Some(e), Err(_)) | (None, Err(e)) => {
                 let _ = writeln!(
                     s,
                     "config error: {e} (sidekick_run is disabled until config.toml is fixed)"
@@ -1457,18 +1619,18 @@ impl SidekickServer {
             (None, Ok(_)) => s.push_str("config error: none\n"),
         }
         s.push_str("backends:\n");
-        match &st.backends {
+        match &snap.backends {
             Ok(backends) => {
                 for b in backends.iter() {
-                    let counters = st.per_backend.get(&b.name).map(|s| &s.counters);
+                    let (running, queued) = st.counts(&b.name);
                     let _ = write!(
                         s,
                         "  {} ({}{}): running {}, queued {}, max_concurrent {}",
                         b.name,
                         b.backend_type(),
                         if b.is_default { ", default" } else { "" },
-                        counters.map_or(0, Counters::running),
-                        counters.map_or(0, Counters::queued),
+                        running,
+                        queued,
                         b.max_concurrent
                             .map_or_else(|| "-".to_owned(), |n| n.to_string())
                     );
@@ -1566,23 +1728,24 @@ impl ServerHandler for SidekickServer {
 pub async fn serve() -> anyhow::Result<()> {
     // Linux: become a child subreaper so the runner can find setsid'ed descendants.
     runner::init_process_supervision();
-    let (config, config_error) = match Config::load() {
-        Ok(c) => (c, None),
+    let server = match crate::paths::config_file() {
+        Ok(path) => SidekickServer::reloading(path),
         Err(e) => {
             let msg = redact_all(&format!("{e:#}"));
             tracing::warn!("config error, sidekick_run is disabled: {msg}");
-            (Config::default(), Some(msg))
+            SidekickServer::new(Config::default(), Some(msg))
         }
     };
+    let snap = server.state.snapshot();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        max_concurrent = config.max_concurrent,
-        default_max_turns = config.default_max_turns,
-        default_timeout_s = config.default_timeout_s,
+        max_concurrent = snap.config.max_concurrent,
+        default_max_turns = snap.config.default_max_turns,
+        default_timeout_s = snap.config.default_timeout_s,
         "agent-sidekick MCP server starting on stdio"
     );
+    drop(snap);
 
-    let server = SidekickServer::new(config, config_error);
     let state = server.state.clone();
     let service = server
         .serve(rmcp::transport::stdio())
@@ -1619,6 +1782,88 @@ impl State {
 
     fn cooldown(&self, name: &str) -> Option<u64> {
         cooldown_remaining(&mut self.cooldowns(), name, Instant::now())
+    }
+
+    fn snapshot(&self) -> Arc<Snapshot> {
+        self.snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn refresh(&self) -> Arc<Snapshot> {
+        let Some(reload) = &self.reload else {
+            return self.snapshot();
+        };
+        let mut file = reload
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (now, loaded) = read_config_file(&reload.path);
+        if now == *file {
+            return self.snapshot();
+        }
+        *file = now;
+        let previous = self.snapshot();
+        let resolved = loaded.and_then(|config| {
+            let backends = backends::resolve(&config)?;
+            Ok((config, backends))
+        });
+        let next = match resolved {
+            Ok((config, backends)) => {
+                let next = Snapshot::build(config, None, Ok(backends), Some(&previous));
+                tracing::info!(backends = %next.backend_names(), "config reloaded");
+                next
+            }
+            Err(msg) if previous.backends.is_ok() => {
+                tracing::warn!("config error after a change, keeping the last valid config: {msg}");
+                previous.with_error(msg)
+            }
+            Err(msg) => {
+                tracing::warn!("config error, sidekick_run is disabled: {msg}");
+                Snapshot::build(
+                    Config::default(),
+                    Some(msg.clone()),
+                    Err(msg),
+                    Some(&previous),
+                )
+            }
+        };
+        let next = Arc::new(next);
+        self.prune_counters(&next);
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
+        next
+    }
+
+    fn prune_counters(&self, snapshot: &Snapshot) {
+        let configured: Vec<&str> = match &snapshot.backends {
+            Ok(b) => b.iter().map(|b| b.name.as_str()).collect(),
+            Err(_) => Vec::new(),
+        };
+        self.counter_map()
+            .retain(|name, c| configured.contains(&name.as_str()) || c.running() + c.queued() > 0);
+    }
+
+    fn counter_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Counters>>> {
+        self.per_backend
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn backend_counters(&self, name: &str) -> Arc<Counters> {
+        self.counter_map()
+            .entry(name.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    fn counts(&self, name: &str) -> (usize, usize) {
+        self.counter_map()
+            .get(name)
+            .map_or((0, 0), |c| (c.running(), c.queued()))
     }
 
     /// Cancel every queued and running run and wait (bounded) until they have returned, so
@@ -2424,16 +2669,14 @@ mod tests {
     fn per_backend_semaphores_and_counters() {
         let server = SidekickServer::with_backends(Config::default(), None, Ok(sample_backends()));
         let st = &server.state;
-        assert_eq!(st.per_backend.len(), 4);
-        let aider = &st.per_backend["aider"];
-        assert_eq!(
-            aider.semaphore.as_ref().map(|s| s.available_permits()),
-            Some(1)
-        );
-        assert!(st.per_backend["sidekick"].semaphore.is_none());
+        let snap = st.snapshot();
+        assert_eq!(snap.per_backend.len(), 1);
+        assert_eq!(snap.per_backend["aider"].semaphore.available_permits(), 1);
+        assert!(!snap.per_backend.contains_key("sidekick"));
 
-        let _q = CountGuard::all([&st.counters.queued, &aider.counters.queued]);
-        let text = server.status_text(Err("stub".into()), Ok(Vec::new()));
+        let aider = st.backend_counters("aider");
+        let _q = CountGuard::all([&st.counters.queued, &aider.queued]);
+        let text = server.status_text(&server.state.snapshot(), Err("stub".into()), Ok(Vec::new()));
         assert!(text.contains("queued: 1\n"), "{text}");
         assert!(
             text.contains("  aider (command): running 0, queued 1, max_concurrent 1\n"),
@@ -2468,7 +2711,7 @@ mod tests {
                 .collect(),
         );
         let server = SidekickServer::with_backends(cfg, None, Ok(list));
-        let text = server.status_text(Err("stub".into()), Ok(Vec::new()));
+        let text = server.status_text(&server.state.snapshot(), Err("stub".into()), Ok(Vec::new()));
         // The top-level default_model is not in effect with [backends]: not shown.
         assert!(!text.contains("default model:"), "{text}");
         assert!(!text.contains("opus"), "{text}");
@@ -2501,7 +2744,7 @@ mod tests {
         b.implicit = true;
         b.model = cfg.default_model.clone();
         let server = SidekickServer::with_backends(cfg, None, Ok(Backends::new(vec![b])));
-        let text = server.status_text(Err("stub".into()), Ok(Vec::new()));
+        let text = server.status_text(&server.state.snapshot(), Err("stub".into()), Ok(Vec::new()));
         assert!(text.contains("default model: sonnet\n"), "{text}");
         assert!(text.contains("agent claude config dir: "), "{text}");
         assert!(
@@ -2518,6 +2761,7 @@ mod tests {
         let server = SidekickServer::with_backends(Config::default(), None, Ok(sample_backends()));
         let secret = "sk-ant-oat01-SECRETSECRET";
         let text = server.status_text(
+            &server.state.snapshot(),
             Err("stub".into()),
             Ok(vec![
                 (
@@ -2556,8 +2800,11 @@ mod tests {
     #[test]
     fn invalid_config_disables_backends() {
         let server = SidekickServer::new(Config::default(), Some("bad config".into()));
-        assert_eq!(server.state.backends, Err("bad config".to_owned()));
-        let text = server.status_text(Err("stub".into()), Ok(Vec::new()));
+        assert_eq!(
+            server.state.snapshot().backends,
+            Err("bad config".to_owned())
+        );
+        let text = server.status_text(&server.state.snapshot(), Err("stub".into()), Ok(Vec::new()));
         assert!(
             text.contains("config error: bad config (sidekick_run is disabled"),
             "{text}"
@@ -2578,7 +2825,7 @@ mod tests {
             None,
             Err("backends: two defaults".into()),
         );
-        let report = server.backends_report().await;
+        let report = server.backends_report(&server.state.snapshot()).await;
         assert_eq!(
             report.config_error.as_deref(),
             Some("backends: two defaults")
@@ -2599,7 +2846,7 @@ mod tests {
         };
         let server =
             SidekickServer::with_backends(Config::default(), None, Ok(Backends::new(vec![b])));
-        let report = server.backends_report().await;
+        let report = server.backends_report(&server.state.snapshot()).await;
         assert_eq!(report.config_error, None);
         let json = serde_json::to_value(&report).unwrap();
         let entry = &json["backends"][0];
@@ -2610,5 +2857,129 @@ mod tests {
         assert_eq!(entry["reachable"], false);
         assert_eq!(entry["max_concurrent"], serde_json::Value::Null);
         assert_eq!(entry["running"], 0);
+    }
+
+    fn limited(name: &str, n: Option<usize>, is_default: bool) -> Backend {
+        let mut b = command(name);
+        b.is_default = is_default;
+        b.max_concurrent = n;
+        b
+    }
+
+    #[test]
+    fn limits_are_kept_or_replaced_by_name_on_reload() {
+        let cfg = |n| Config {
+            max_concurrent: n,
+            ..Config::default()
+        };
+        let list = |n| {
+            Ok(Backends::new(vec![
+                limited("a", Some(n), true),
+                limited("b", Some(2), false),
+            ]))
+        };
+        let first = Snapshot::build(cfg(16), None, list(1), None);
+        let held = first.per_backend["a"]
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+
+        let same = Snapshot::build(cfg(16), None, list(1), Some(&first));
+        assert!(Arc::ptr_eq(&same.global.semaphore, &first.global.semaphore));
+        assert!(Arc::ptr_eq(
+            &same.per_backend["a"].semaphore,
+            &first.per_backend["a"].semaphore
+        ));
+
+        let changed = Snapshot::build(cfg(4), None, list(3), Some(&same));
+        assert!(!Arc::ptr_eq(
+            &changed.global.semaphore,
+            &first.global.semaphore
+        ));
+        assert_eq!(changed.global.semaphore.available_permits(), 4);
+        assert_eq!(changed.per_backend["a"].semaphore.available_permits(), 3);
+        assert_eq!(first.per_backend["a"].semaphore.available_permits(), 0);
+        assert!(Arc::ptr_eq(
+            &changed.per_backend["b"].semaphore,
+            &first.per_backend["b"].semaphore
+        ));
+        drop(held);
+        assert_eq!(first.per_backend["a"].semaphore.available_permits(), 1);
+        assert_eq!(changed.per_backend["a"].semaphore.available_permits(), 3);
+
+        let removed = Snapshot::build(
+            cfg(4),
+            None,
+            Ok(Backends::new(vec![limited("a", None, true)])),
+            Some(&changed),
+        );
+        assert!(removed.per_backend.is_empty());
+    }
+
+    fn command_config(names: &[&str], extra: &str) -> String {
+        let mut s = extra.to_owned();
+        for (i, name) in names.iter().enumerate() {
+            s.push_str(&format!(
+                "[backends.{name}]\ntype = \"command\"\ndescription = \"{name}\"\n\
+                 default = {}\ncommand = [\"agent\", \"{{prompt}}\"]\nmax_concurrent = 2\n",
+                i == 0
+            ));
+        }
+        s
+    }
+
+    #[test]
+    fn refresh_reloads_changes_and_keeps_last_valid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, command_config(&["a"], "max_concurrent = 3\n")).unwrap();
+        let server = SidekickServer::reloading(path.clone());
+        let st = &server.state;
+        let first = st.refresh();
+        assert!(Arc::ptr_eq(&first, &st.refresh()));
+        assert_eq!(first.backend_names(), "a");
+        assert_eq!(first.global.permits, 3);
+        let counters = st.backend_counters("a");
+        let _running = CountGuard::all([&counters.running]);
+        set_cooldown(&mut st.cooldowns(), "a", Some(300), Instant::now());
+
+        std::fs::write(&path, command_config(&["a", "b"], "max_concurrent = 5\n")).unwrap();
+        let second = st.refresh();
+        assert_eq!(second.backend_names(), "a, b");
+        assert_eq!(second.global.permits, 5);
+        assert_eq!(first.global.permits, 3);
+        assert!(Arc::ptr_eq(
+            &second.per_backend["a"].semaphore,
+            &first.per_backend["a"].semaphore
+        ));
+        assert_eq!(st.counts("a"), (1, 0));
+        assert!(st.cooldown("a").is_some());
+
+        std::fs::write(&path, "max_concurrent = \"many\"\n").unwrap();
+        let broken = st.refresh();
+        assert_eq!(broken.backend_names(), "a, b");
+        assert_eq!(broken.config.max_concurrent, 5);
+        let err = broken.config_error.clone().unwrap();
+        assert!(err.contains("parsing"), "{err}");
+        assert!(stale_config_note(&broken).unwrap().contains(&err));
+        let text = server.status_text(&broken, Err("stub".into()), Ok(Vec::new()));
+        assert!(
+            text.contains("the last valid config.toml stays in use"),
+            "{text}"
+        );
+
+        std::fs::write(&path, command_config(&["b"], "")).unwrap();
+        let fixed = st.refresh();
+        assert_eq!(fixed.config_error, None);
+        assert_eq!(fixed.backend_names(), "b");
+        assert_eq!(fixed.global.permits, 16);
+        assert_eq!(st.counts("a"), (1, 0), "running counters survive removal");
+        drop(_running);
+
+        std::fs::remove_file(&path).unwrap();
+        let missing = st.refresh();
+        assert_eq!(missing.config, Config::default());
+        assert!(st.counts("a") == (0, 0));
     }
 }
