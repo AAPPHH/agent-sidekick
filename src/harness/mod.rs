@@ -203,9 +203,7 @@ pub fn detect_rate_limit(text: &str) -> Option<RateLimit> {
     let matched = (has_429 && marker)
         || lower.contains("rate_limit_error")
         || lower.contains("rate limit reached");
-    matched.then(|| RateLimit {
-        retry_after_s: retry_after(&lower),
-    })
+    rate_limit_of(&lower, matched)
 }
 
 pub fn detect_rate_limit_strict(text: &str) -> Option<RateLimit> {
@@ -221,9 +219,20 @@ pub fn detect_rate_limit_strict(text: &str) -> Option<RateLimit> {
     });
     let matched =
         after_429 || lower.contains("rate_limit_error") || lower.contains("rate limit reached");
-    matched.then(|| RateLimit {
-        retry_after_s: retry_after(&lower),
-    })
+    rate_limit_of(&lower, matched)
+}
+
+fn rate_limit_of(lower: &str, matched: bool) -> Option<RateLimit> {
+    if matched {
+        return Some(RateLimit {
+            retry_after_s: retry_after(lower),
+        });
+    }
+    (lower.contains("request too large") && lower.contains("tokens per minute")).then_some(
+        RateLimit {
+            retry_after_s: None,
+        },
+    )
 }
 
 fn retry_after(lower: &str) -> Option<u64> {
@@ -549,6 +558,21 @@ mod tests {
         );
         assert_eq!(detect_rate_limit("14290 rate limit tokens"), None);
         assert_eq!(detect_rate_limit(""), None);
+    }
+
+    #[test]
+    fn groq_request_too_large_is_a_rate_limit_without_retry_time() {
+        let groq = "ContextOverflowError: Request too large for model `qwen/qwen3.8-27b` in                     organization `org_x` service tier `on_demand` on input tokens per minute                     (ITPM): Limit 7000, Requested 7210, please reduce your message size";
+        assert_eq!(retry(groq), Some(None));
+        assert_eq!(
+            detect_rate_limit_strict(groq).map(|r| r.retry_after_s),
+            Some(None)
+        );
+        let tpm = "Request too large for model `openai/gpt-oss-20b` on tokens per minute (TPM):                    Limit 8000, Requested 9100";
+        assert_eq!(retry(tpm), Some(None));
+        let other = "413 Request Too Large: body exceeds 10 MB";
+        assert_eq!(retry(other), None);
+        assert_eq!(detect_rate_limit_strict(other), None);
     }
 
     #[test]
