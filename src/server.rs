@@ -762,6 +762,10 @@ fn remaining_s(until: Instant, now: Instant) -> Option<u64> {
     (secs > 0).then_some(secs)
 }
 
+fn fallback_skipped_line(name: &str, secs: u64) -> String {
+    format!("fallback '{name}' skipped: rate limited, retry in {secs}s")
+}
+
 fn set_cooldown(map: &mut CooldownMap, name: &str, retry_after_s: Option<u64>, now: Instant) {
     let until = cooldown_until(retry_after_s, now);
     let entry = map.entry(name.to_owned()).or_insert(until);
@@ -994,6 +998,25 @@ impl SidekickServer {
                 .attempt(primary, &req, &cancel, &ctx.ct, &phase, &mut secrets)
                 .await;
             match (first, fallback) {
+                (first, Some(fb))
+                    if fallback_eligible(&first) && state.cooldown(&fb.name).is_some() =>
+                {
+                    let secs = state.cooldown(&fb.name).unwrap_or(1);
+                    let line = fallback_skipped_line(&fb.name, secs);
+                    match &first {
+                        Attempt::Ran(o) => {
+                            (format_run_result(primary, o, &req, None, &[line]), true)
+                        }
+                        Attempt::NotStarted(r) | Attempt::Stopped(r) => (
+                            format!(
+                                "backend '{}' ({}) failed: {r}\n{line}",
+                                primary.name,
+                                primary.backend_type()
+                            ),
+                            true,
+                        ),
+                    }
+                }
                 (first, Some(fb)) if fallback_eligible(&first) => {
                     let why = match &first {
                         Attempt::Ran(o) => exit_reason(o),
@@ -1265,7 +1288,7 @@ impl SidekickServer {
                         outcome.rate_limit = n.rate_limit;
                     }
                 } else if !stopped && outcome.exit_code != Some(0) {
-                    outcome.rate_limit = crate::harness::detect_rate_limit(&outcome.tail);
+                    outcome.rate_limit = crate::harness::detect_rate_limit_strict(&outcome.tail);
                 }
                 if let Some(rl) = &outcome.rate_limit {
                     set_cooldown(
@@ -1680,6 +1703,14 @@ async fn termination_signal() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_skipped_line_names_backend_and_wait() {
+        assert_eq!(
+            fallback_skipped_line("oc", 42),
+            "fallback 'oc' skipped: rate limited, retry in 42s"
+        );
+    }
 
     #[test]
     fn cooldown_uses_retry_after_default_and_cap() {

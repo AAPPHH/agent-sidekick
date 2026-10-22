@@ -1011,7 +1011,7 @@ pub fn normalize_json_lines(raw: &str) -> Normalized {
     }
     let rate_limit = answer
         .is_empty()
-        .then(|| detect_rate_limit(&errors.join("\n")).or_else(|| detect_rate_limit(raw)))
+        .then(|| detect_rate_limit(&errors.join("\n")))
         .flatten();
     if let Some(rl) = &rate_limit {
         push(&rl.line());

@@ -208,6 +208,24 @@ pub fn detect_rate_limit(text: &str) -> Option<RateLimit> {
     })
 }
 
+pub fn detect_rate_limit_strict(text: &str) -> Option<RateLimit> {
+    let lower = text.to_ascii_lowercase();
+    let key = "too many requests";
+    let after_429 = lower.match_indices(key).any(|(i, _)| {
+        let before = lower[..i].trim_end_matches([' ', ':', '-']);
+        before.ends_with("429")
+            && !before[..before.len() - 3]
+                .bytes()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_digit())
+    });
+    let matched =
+        after_429 || lower.contains("rate_limit_error") || lower.contains("rate limit reached");
+    matched.then(|| RateLimit {
+        retry_after_s: retry_after(&lower),
+    })
+}
+
 fn retry_after(lower: &str) -> Option<u64> {
     for key in ["retry-after", "retry after"] {
         for (i, _) in lower.match_indices(key) {
@@ -225,6 +243,23 @@ fn retry_after(lower: &str) -> Option<u64> {
 }
 
 fn parse_duration_s(s: &str) -> Option<u64> {
+    const UNITS: [(&str, f64); 15] = [
+        ("hours", 3600.0),
+        ("hour", 3600.0),
+        ("hrs", 3600.0),
+        ("h", 3600.0),
+        ("minutes", 60.0),
+        ("minute", 60.0),
+        ("mins", 60.0),
+        ("min", 60.0),
+        ("ms", 0.001),
+        ("m", 60.0),
+        ("seconds", 1.0),
+        ("second", 1.0),
+        ("secs", 1.0),
+        ("sec", 1.0),
+        ("s", 1.0),
+    ];
     let mut rest = s;
     let mut total = 0.0f64;
     let mut any = false;
@@ -235,21 +270,19 @@ fn parse_duration_s(s: &str) -> Option<u64> {
         let Ok(n) = rest[..len].trim_end_matches('.').parse::<f64>() else {
             break;
         };
-        let after = &rest[len..];
-        let (factor, unit) = if after.starts_with("ms") {
-            (0.001, 2)
-        } else if after.starts_with('h') {
-            (3600.0, 1)
-        } else if after.starts_with('m') {
-            (60.0, 1)
-        } else if after.starts_with('s') {
-            (1.0, 1)
-        } else {
+        let after = rest[len..].strip_prefix(' ').unwrap_or(&rest[len..]);
+        let Some((unit, factor)) = UNITS.iter().find(|(u, _)| {
+            after.starts_with(u)
+                && after[u.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphabetic())
+        }) else {
             break;
         };
         total += n * factor;
         any = true;
-        rest = &after[unit..];
+        rest = &after[unit.len()..];
     }
     any.then(|| (total.ceil() as u64).max(1))
 }
@@ -516,5 +549,44 @@ mod tests {
         );
         assert_eq!(detect_rate_limit("14290 rate limit tokens"), None);
         assert_eq!(detect_rate_limit(""), None);
+    }
+
+    #[test]
+    fn strict_detection_needs_unambiguous_markers() {
+        let strict = |t: &str| detect_rate_limit_strict(t).map(|r| r.retry_after_s);
+        assert_eq!(strict("Error: 429 Too Many Requests"), Some(None));
+        assert_eq!(strict("HTTP 429: too many requests"), Some(None));
+        assert_eq!(
+            strict(r#"API Error: {"type":"error","error":{"type":"rate_limit_error"}}"#),
+            Some(None)
+        );
+        assert_eq!(
+            strict("Rate limit reached, try again in 2 seconds"),
+            Some(Some(2))
+        );
+        assert_eq!(strict("test_rate_limit_429 failed"), None);
+        assert_eq!(strict("429 rate limit exceeded"), None);
+        assert_eq!(strict("too many requests"), None);
+        assert_eq!(strict("1429 too many requests"), None);
+        assert_eq!(strict("429 tests passed, too many requests mocked"), None);
+        assert_eq!(strict(""), None);
+    }
+
+    #[test]
+    fn parses_duration_formats() {
+        assert_eq!(parse_duration_s("5 minutes"), Some(300));
+        assert_eq!(parse_duration_s("2 seconds."), Some(2));
+        assert_eq!(parse_duration_s("1 hour"), Some(3600));
+        assert_eq!(parse_duration_s("3 min"), Some(180));
+        assert_eq!(parse_duration_s("10 sec"), Some(10));
+        assert_eq!(parse_duration_s("1m2.3s"), Some(63));
+        assert_eq!(parse_duration_s("7.66s"), Some(8));
+        assert_eq!(parse_duration_s("450ms."), Some(1));
+        assert_eq!(parse_duration_s("5 more tries"), None);
+        assert_eq!(parse_duration_s("a while"), None);
+        assert_eq!(
+            retry("Rate limit reached. Please try again in 5 minutes."),
+            Some(Some(300))
+        );
     }
 }
