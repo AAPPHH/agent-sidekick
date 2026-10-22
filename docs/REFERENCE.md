@@ -275,6 +275,7 @@ Keys:
 | `harness_path` | Absolute path (or `~/...`) of the opencode executable. Default: the npm package's real executable (`<npm prefix>/node_modules/opencode-ai/bin/opencode.exe`, found next to an `opencode.cmd` in `PATH` or in `%APPDATA%\npm`; on Unix `<prefix>/lib/node_modules/...`), then `opencode` in `PATH` (on Windows only `opencode.exe`, never the `.cmd` shim), then `~/.opencode/bin/opencode`. A `.cmd`/`.bat` wrapper is accepted only here, with model names restricted to `A-Z a-z 0-9 - _ . / : @ +`. |
 | `read_only` | `true`: the edit, bash and webfetch tools are denied (OpenCode then does not offer them). Default `false`. |
 | `request_timeout_s` | Seconds OpenCode waits for the provider's response headers before it retries the request (OpenCode's `headerTimeout`, 1 to 3600; unset: OpenCode's default of 300). Raise it for slow local models that need long before the first token. A shorter value does not help against a queueing provider: on KI:connect the retries waited just as long. |
+| `model_options` | Table merged into every model entry of the generated opencode.json after `name` and `tool_call` (only openai-compatible and ollama; JSON-compatible values, no dates; `name` and `tool_call` are rejected). Example for gpt-oss on Groq: `model_options = { interleaved = { field = "reasoning" } }`. |
 | `cost` | Default `paid` (`free` for ollama). |
 
 `description`, `default`, `max_concurrent`, `env` and `pass_env` work as for every backend; `config_dir`, `auth`, `command`, `prompt_via_stdin` and `secret_env` are not allowed.
@@ -334,7 +335,7 @@ Keys:
 | `harness_path` | Absolute path (or `~/...`) of the codex executable. Default: the npm package's native `codex.exe` (next to a `codex.cmd` in `PATH` or in `%APPDATA%\npm`, x64 or arm64 package), then `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe` (standalone installer), then `codex.exe` in `PATH`; on Unix `codex` in `PATH`. The `.cmd` shim is never used; a `.cmd`/`.bat` here restricts model names and `cwd` to plain characters. |
 | `cost` | Default `quota` (chatgpt) or `paid` (api-key). |
 
-`description`, `default`, `max_concurrent`, `env` and `pass_env` work as for every backend (`env` must not set `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`); `config_dir`, `provider`, `request_timeout_s`, `command`, `prompt_via_stdin` and `secret_env` are not allowed.
+`description`, `default`, `max_concurrent`, `env` and `pass_env` work as for every backend (`env` must not set `CODEX_HOME`, `CODEX_SQLITE_HOME`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`); `config_dir`, `provider`, `request_timeout_s`, `model_options`, `command`, `prompt_via_stdin` and `secret_env` are not allowed.
 
 How a run works:
 
@@ -473,6 +474,7 @@ pass_env = []             # inherited variables to keep for every backend, see a
 | `harness_path` | opencode, codex | looked up | Absolute path (or `~/...`) of the harness executable. |
 | `read_only` | opencode, codex | `false` | opencode: deny the edit, bash and webfetch tools; codex: Codex's read-only sandbox. |
 | `request_timeout_s` | opencode | OpenCode's 300 | Header timeout before OpenCode retries a request (1 to 3600). |
+| `model_options` | opencode (openai-compatible, ollama) | none | Table merged into every model entry of the generated opencode.json. |
 | `wire_api` | codex (api-key with `base_url`) | `responses` | Only `responses` is accepted. |
 | `windows_sandbox` | codex | `mxc` | Windows sandbox of Codex: `mxc`, `elevated` or `unelevated`. |
 | `command` | command | (required) | Program and arguments with `{prompt}`, `{cwd}`, `{max_turns}`, `{model}` (placeholders only after `command[0]`). |

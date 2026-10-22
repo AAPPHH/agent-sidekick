@@ -334,7 +334,7 @@ fn resolve_one(
     }
 
     // Fields that are not allowed for this type.
-    let set_fields: [(&str, bool, &[BackendType]); 13] = [
+    let set_fields: [(&str, bool, &[BackendType]); 14] = [
         (
             "config_dir",
             raw.config_dir.is_some(),
@@ -372,6 +372,11 @@ fn resolve_one(
         (
             "request_timeout_s",
             raw.request_timeout_s.is_some(),
+            &[BackendType::OpenCode],
+        ),
+        (
+            "model_options",
+            raw.model_options.is_some(),
             &[BackendType::OpenCode],
         ),
         (
@@ -845,6 +850,23 @@ fn opencode_kind(
             "`request_timeout_s` must be between 1 and 3600 (got {t})"
         ));
     }
+    let model_options = raw.model_options.clone().unwrap_or_default();
+    if raw.model_options.is_some() && provider == OpencodeProvider::Openrouter {
+        errs.push(
+            "`model_options` is not allowed for provider `openrouter` (only for              openai-compatible and ollama)"
+                .to_owned(),
+        );
+    }
+    for key in ["name", "tool_call"] {
+        if model_options.contains_key(key) {
+            errs.push(format!(
+                "`model_options` must not set `{key}` (agent-sidekick sets it for every model)"
+            ));
+        }
+    }
+    for (k, v) in &model_options {
+        check_json_value(&format!("model_options.{k}"), v, errs);
+    }
     if errs.len() != before {
         return None;
     }
@@ -855,9 +877,37 @@ fn opencode_kind(
         harness_path,
         read_only: raw.read_only.unwrap_or(false),
         request_timeout_s,
+        model_options,
         base_dir,
     })
 }
+
+fn check_json_value(path: &str, v: &serde_json::Value, errs: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Null => errs.push(format!(
+            "`{path}`: not a JSON-compatible value (nan and inf are not allowed)"
+        )),
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                check_json_value(&format!("{path}[{i}]"), item, errs);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.contains_key(TOML_DATETIME_FIELD) {
+                errs.push(format!(
+                    "`{path}`: not a JSON-compatible value (TOML dates and times are not allowed)"
+                ));
+                return;
+            }
+            for (k, item) in map {
+                check_json_value(&format!("{path}.{k}"), item, errs);
+            }
+        }
+        _ => {}
+    }
+}
+
+const TOML_DATETIME_FIELD: &str = "$__toml_private_datetime";
 
 /// Placeholders of a command template (never allowed in `command[0]`).
 const PLACEHOLDERS: [&str; 4] = ["{prompt}", "{cwd}", "{max_turns}", "{model}"];

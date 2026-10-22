@@ -408,6 +408,7 @@ pub fn describe(backend: &Backend) -> Vec<String> {
             harness_path,
             read_only,
             request_timeout_s,
+            model_options,
             base_dir,
         } => {
             lines.push(format!("provider:    {provider}"));
@@ -423,6 +424,12 @@ pub fn describe(backend: &Backend) -> Vec<String> {
                 Some(t) => format!("request_timeout_s: {t}"),
                 None => "request_timeout_s: (OpenCode default, 300)".to_owned(),
             });
+            if !model_options.is_empty() {
+                lines.push(format!(
+                    "model_options: {}",
+                    serde_json::Value::Object(model_options.clone())
+                ));
+            }
             lines.push(match (provider.needs_key(), api_key_env) {
                 (false, _) => "api key:     none needed".to_owned(),
                 (true, Some(var)) => format!("api key:     from environment variable {var}"),
@@ -637,6 +644,7 @@ pub(crate) mod tests {
                 harness_path: None,
                 read_only: false,
                 request_timeout_s: None,
+                model_options: serde_json::Map::new(),
                 base_dir: abs("cfg").join("opencode").join(name),
             },
             is_default,
@@ -668,7 +676,24 @@ pub(crate) mod tests {
         );
         assert!(text.contains("OS keyring entry backend-kic"), "{text}");
         assert!(text.contains("state dir:   "), "{text}");
+        assert!(!text.contains("model_options"), "{text}");
         assert_eq!(claude_config_dir(&b), None);
+
+        let mut b = b;
+        if let BackendKind::OpenCode { model_options, .. } = &mut b.kind {
+            model_options.insert(
+                "interleaved".into(),
+                serde_json::json!({"field": "reasoning"}),
+            );
+        }
+        let text = describe(&b).join(
+            "
+",
+        );
+        assert!(
+            text.contains("model_options: {\"interleaved\":{\"field\":\"reasoning\"}}"),
+            "{text}"
+        );
     }
 
     /// sidekick (oauth, default), work (oauth), local (endpoint, keyring), envkey (endpoint,
