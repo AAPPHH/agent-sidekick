@@ -945,7 +945,8 @@ fn tool_error(msg: impl AsRef<str>) -> Result<CallToolResult, McpError> {
 fn stale_config_note(snap: &Snapshot) -> Option<String> {
     match (&snap.config_error, &snap.backends) {
         (Some(e), Ok(_)) => Some(format!(
-            "note: config.toml is invalid since its last change ({e}); the last valid config              is still in use"
+            "note: config.toml is invalid since its last change ({e}); the last valid config \
+             is still in use"
         )),
         _ => None,
     }
