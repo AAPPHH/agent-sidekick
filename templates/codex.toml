@@ -5,8 +5,11 @@
 #   `agent-sidekick setup --backend codex` shows the `codex login` command for this backend.
 # auth = "api-key": an OpenAI API key (billed per token), stored with
 #   `agent-sidekick setup --backend codex` (keyring user `backend-codex`).
-# Without `model`, Codex uses its default model; to offer a choice add e.g.
-#   models = ["gpt-6.1-sol", "gpt-6-luna"]   # the first one is the default
+# Without `model`, Codex uses its default model. With a ChatGPT login that default can be
+# rejected ("model is not supported when using Codex with a ChatGPT account"): list the models
+# your account may use with `codex debug models` (in a terminal with this backend's CODEX_HOME
+# set, after the login) and add them, e.g.
+#   models = ["gpt-6-luna", "gpt-5.6-terra"]   # the first one is the default
 # max_concurrent = 1: parallel runs of one ChatGPT login could race on refreshing it.
 [backends.codex]
 harness = "codex"

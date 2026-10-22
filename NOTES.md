@@ -720,3 +720,12 @@ User request: agent-sidekick must run under Codex (Codex as MCP host) and drive 
 See the commit messages of `feat/codex`; final state in the report of this task.
 
 Note to "Harness adapters (0.3.0)", step 3: the stub described there is replaced by this section.
+
+### First real runs with Codex as MCP host (2026-10-22)
+
+With the user's own Codex 0.163.0 and ChatGPT login (`codex exec --sandbox read-only|workspace-write --ephemeral`, scratch cwd):
+- **Model:** the user's configured `gpt-6-astra` and Codex's default `gpt-6.1-sol` were rejected with HTTP 400 "The '<model>' model is not supported when using Codex with a ChatGPT account". `codex debug models` listed gpt-6-luna, gpt-5.6-terra, gpt-5.6-luna (plus hidden gpt-reserve, codex-auto-review); `-m gpt-6-luna` worked. Consequence: a `codex` backend with `auth = "chatgpt"` should list the account's models; the template, README and REFERENCE now say how to find them.
+- **`sidekick_backends` from Codex:** works (approved without asking); 45k tokens in (29k cached), 870 out.
+- **`sidekick_run` from Codex** (approval overridden for the test with `-c mcp_servers.agent-sidekick.tools.sidekick_run.approval_mode="approve"`) to `kiconnect`: the chain works, 19 s in total including the delegated 7.5 s run, in both sandbox modes. The first delegated run's OpenCode `glob` calls failed with "ripgrep execution failed"; three more runs (one with a Codex-like minimal environment started directly, two through Codex) did not reproduce it. Watch for it; if it recurs, capture OpenCode's log (`<config-dir>/opencode/<backend>/data/opencode/log`).
+- The `codex` backend itself (own CODEX_HOME) still needs the user's `codex login`; no run there yet.
+
