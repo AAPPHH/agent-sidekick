@@ -148,7 +148,7 @@ Runs that hit provider rate limits are detected and handled specially.
 - **Cooldown:** after a rate limit the backend is in cooldown for the wait time (60 s when unknown, at most 3600 s). During the cooldown `sidekick_backends` reports it as not reachable with "rate limited, retry in Ns", `sidekick_status` lists it ("cooldown: <name> retry in Ns"), and `sidekick_run` does not start it: with a `fallback` that is not cooling down itself the fallback runs directly (`fallback reason: primary <name> rate limited, retry in Ns`), otherwise the call fails with a tool error naming the remaining time. A fallback that is cooling down is skipped (`fallback '<name>' skipped: rate limited, retry in Ns`).
 - **Scope:** the cooldown is per backend name and kept in memory only (a server restart clears it); two backends on the same provider account cool down separately.
 - **Not rate-limit circumvention:** the cooldown makes agent-sidekick stop sending requests to a provider that asked it to wait; a fallback from one claude-oauth backend to another stays rejected (see Fallback).
-- **Typical case:** Groq's free tier, with about 8000 tokens per minute per model, and an agent step sends about 4000 to 6000 tokens.
+- **Typical case:** Groq's free tier allows about 8000 tokens per minute per model, while one agent step sends about 4000 to 6000 tokens.
 
 ### Concurrency
 
