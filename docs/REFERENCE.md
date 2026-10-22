@@ -581,7 +581,7 @@ You are responsible for complying with Anthropic's terms for each account you us
 
 Run `agent-sidekick doctor` first; it checks the installation and every backend and prints next steps.
 
-- **`claude` not found**: install the Claude Code CLI (`agent-sidekick harness install claude` prints the official commands; the VS Code extension alone is not enough, its bundled binary is not searched), open a new terminal, or set `AGENT_SIDEKICK_CLAUDE` / `claude_path` to its absolute path, then re-run `agent-sidekick setup --register-only`.
+- **`claude` not found**: install the Claude Code CLI (`agent-sidekick harness install claude` prints the official commands; the VS Code extension alone is not enough, its bundled binary is not searched), open a new terminal, or set `AGENT_SIDEKICK_CLAUDE` / `claude_path` to its absolute path, then re-run `agent-sidekick setup --register-only`; on a machine that only has the Codex CLI, `claude` is not needed (see [Codex-only machines](#codex-only-machines)).
 - **Token missing**: run `agent-sidekick setup --backend <name>` for that backend, or `agent-sidekick setup --no-wizard` for every claude-oauth backend without a token, and reload VS Code (see the README); `setup --register-only` registers without asking for tokens.
 - **Endpoint not reachable**: start the local server (`ollama serve`, LM Studio's server), then `agent-sidekick backends test <name>`.
 - **Endpoint run fails with "Not logged in"**: check that the key is stored (`backends test`) and that `config_dir` is the backend's own directory.
