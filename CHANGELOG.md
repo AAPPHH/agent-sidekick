@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-22
+
+### Added
+
+- Claude backends: `permission_mode` (default, acceptEdits, auto, dontAsk, plan, bypassPermissions; `doctor` warns about bypassPermissions), `allowed_tools` (used when a `sidekick_run` request names none) and `disallowed_tools` (always applied, also against a request's own list). The wizard's second-account template sets acceptEdits, broad tools and a deny list for git push, sudo, publishing and reading the key folders.
+- `model_options` for opencode backends (openai-compatible, ollama): a table merged into every model entry of the generated opencode.json.
+- The server reloads config.toml before a tool call when the file changed; a running run keeps its config, a broken config keeps the last valid one and is reported as `config_error`.
+
+### Changed
+
+- Default global `max_concurrent` 16 (was 2); the second-account template has no per-backend limit.
+- Groq template: only openai/gpt-oss-120b and openai/gpt-oss-20b, with `model_options = { interleaved = { field = "reasoning" } }`, and an honest description (about one agent step per minute on the free tier).
+- Rate-limit detection also matches Groq's "Request too large ... tokens per minute".
+
+### Fixed
+
+- Groq runs failed from the second step on ("reasoning_content is unsupported") and with Qwen ("max_tokens must be less than or equal to 16384").
+
 ## [0.4.0] - 2026-10-22
 
 ### Added
