@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-22
+
+### Fixed
+
+- A machine with the OpenAI Codex CLI but without Claude Code can now install and set up agent-sidekick and use it from Codex. Before, the setup wizard and the non-interactive `setup` aborted with "Claude Code wurde nicht gefunden" / "Claude Code is required for registration", and `doctor` failed on the missing `claude`.
+
+### Changed
+
+- Setup wizard: Claude Code is no longer required when the Codex CLI is installed. The prerequisites show both; without `claude` the wizard says "Claude Code nicht gefunden – agent-sidekick wird nur in Codex angemeldet", does not offer the profile "Claude-Zweitkonto", skips the Claude Code registration and registers in Codex without asking (an implicit `sidekick` backend of an existing config is not carried over then). Without either CLI it aborts before writing anything and names both install commands (Claude Code installer, `npm install -g @openai/codex`).
+- Non-interactive `setup` and `setup --register-only`: when `claude` is not found (and no `--claude` was given) but the Codex CLI is installed, the server is registered in Codex instead (as `setup --codex` does); otherwise the error now also names `setup --codex`. `setup --codex` already worked without Claude Code (now covered by a test).
+- `doctor`: a missing `claude` is a failure only when a `claude-*` backend is configured (including the implicit `sidekick`) or the Codex CLI is not installed; otherwise it is an `[OK]` note, the Claude Code registration check is skipped, and a missing Codex registration is a failure (Codex is then the only host).
+- The install scripts say the setup registers the server "with Claude Code or Codex".
+- README: "Voraussetzungen" asks for the Claude Code CLI or the Codex CLI, new section "Nur mit Codex (ohne Claude Code)"; docs/REFERENCE.md: section "Codex-only machines" and the setup/doctor rows.
+
 ## [0.3.0] - 2026-10-21
 
 ### Added
