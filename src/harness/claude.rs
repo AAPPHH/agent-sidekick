@@ -501,6 +501,7 @@ mod tests {
                 "Bash(twine upload:*)",
                 "Read(~/.ssh/**)",
                 "Read(~/.config/agent-sidekick/**)",
+                "Read(~/AppData/Roaming/agent-sidekick/**)",
                 "Read(~/.claude-sidekick/.credentials.json)"
             ]
         );
