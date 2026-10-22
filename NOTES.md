@@ -775,3 +775,17 @@ Findings:
 - **The review by a different model (sonnet, read-only, 61 s) paid off:** it found two real medium defects (false rate-limit detections from tool output and from command tails) that the implementing model's own tests did not cover, and no false alarms.
 - **Duration and cost:** the 11 runs took about 23 minutes of delegated time in total. kiconnect's token use is high per edit (25k-210k input tokens, because OpenCode re-sends the file) but free.
 - **Rule of thumb from this test:** kiconnect for doc and template edits with all facts in the prompt; sidekick/opus for Rust with 40 turns and an explicit string-literal rule; a second model for the review; the main session checks every diff.
+
+## Groq with OpenCode (0.5.0)
+
+Measured against the real Groq API with OpenCode 1.19.3 (free tier):
+
+- **gpt-oss: `reasoning_content` 400.** With the plain model entry (`name`, `tool_call`) Groq answers every request from step 2 on with HTTP 400 "'messages.2' : property 'reasoning_content' is unsupported". `"interleaved": {"field": "reasoning"}` in the model entry fixes it (verified).
+- **qwen/qwen3.8-27b: `max_tokens`.** HTTP 400 "`max_tokens` must be less than or equal to `16384`"; `"limit": {"context": 131072, "output": 16384}` fixes that, but every OpenCode request is about 7200 tokens and Groq's free-tier ITPM limit for this model is 7000, so OpenCode retries "ContextOverflowError: Request too large for model ... on input tokens per minute (ITPM): Limit 7000, Requested 7210" until the run times out.
+- **Speed:** the free tier allows about 8000 tokens per minute, so nearly every step first hits HTTP 429 and OpenCode waits: about 45 s per step.
+- **tool_use_failed:** a gpt-oss-120b read task aborted at step 5 because the model produced an invalid tool call (Groq error `tool_use_failed`).
+
+Decisions:
+- New opencode backend option `model_options` (openai-compatible, ollama): a table merged into every generated model entry, so provider quirks are fixed in config instead of code. `name` and `tool_call` stay agent-sidekick's.
+- The Groq template offers only gpt-oss-120b and gpt-oss-20b with `model_options = { interleaved = { field = "reasoning" } }`; Qwen is dropped. Template, README and REFERENCE describe it honestly as very slow and only for very small tasks; kiconnect is the better free backend.
+- Rate-limit detection also treats "request too large" together with "tokens per minute" (Groq's TPM/ITPM message) as a rate limit without retry time.
