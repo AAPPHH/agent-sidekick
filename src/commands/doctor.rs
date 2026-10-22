@@ -362,6 +362,7 @@ fn check_backends(cfg_valid: bool, cfg: &Config, claude_found: bool) -> Vec<Chec
     };
     let mut checks = vec![backends_check(&Ok(backends.clone()))];
     checks.extend(harness_checks(&backends));
+    checks.extend(permission_checks(&backends));
     let list: Vec<&Backend> = backends.iter().collect();
     let claude_path = cfg.claude_path.as_deref();
     checks.extend(parallel_map(&list, 8, |b| {
@@ -372,6 +373,27 @@ fn check_backends(cfg_valid: bool, cfg: &Config, claude_found: bool) -> Vec<Chec
         backend_check(b, claude_found, &credential, &reach, dir_exists)
     }));
     checks
+}
+
+fn permission_checks(backends: &Backends) -> Vec<Check> {
+    backends
+        .iter()
+        .filter(|b| {
+            b.claude_permissions()
+                .is_some_and(|p| p.mode == backends::PermissionMode::BypassPermissions)
+        })
+        .map(|b| {
+            Check::warn(
+                format!("backend `{}` permissions", b.name),
+                backends::BYPASS_WARNING,
+                format!(
+                    "set permission_mode = \"acceptEdits\" in [backends.{}] unless you \
+                     really want this",
+                    b.name
+                ),
+            )
+        })
+        .collect()
 }
 
 /// One check per harness executable the configured backends use, beyond claude (checked
@@ -1347,6 +1369,22 @@ mod tests {
         assert!(claude_needed(Some(&implicit), true), "implicit sidekick");
         assert!(claude_needed(Some(&with_claude), true));
         assert!(claude_needed(None, true), "config not loadable");
+    }
+
+    #[test]
+    fn bypass_permissions_is_a_warning() {
+        let b = resolved(
+            "[backends.a]\nharness = \"claude\"\ndescription = \"d\"\ndefault = true\n\
+             permission_mode = \"bypassPermissions\"\n\
+             [backends.b]\nharness = \"claude\"\ndescription = \"d\"\n\
+             permission_mode = \"acceptEdits\"\n",
+        );
+        let checks = permission_checks(&b);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, Status::Warn);
+        assert_eq!(checks[0].name, "backend `a` permissions");
+        assert!(checks[0].detail.contains("bypassPermissions"), "{checks:?}");
+        assert!(permission_checks(&resolved("")).is_empty());
     }
 
     #[test]

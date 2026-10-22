@@ -133,6 +133,7 @@ impl Harness for ClaudeHarness {
         ) {
             return Err(wrong_harness(self, backend));
         }
+        let permissions = backend.claude_permissions().cloned().unwrap_or_default();
         let env = child_env(backend, base, global_pass_env, credential);
         match &backend.kind {
             BackendKind::ClaudeEndpoint { base_url, .. } => {
@@ -147,6 +148,7 @@ impl Harness for ClaudeHarness {
                 }
             }
         }
+        header.extend(permissions.header_lines(req.allowed_tools.as_deref()));
         let req2 = RunRequest {
             model,
             ..req.clone()
@@ -156,7 +158,12 @@ impl Harness for ClaudeHarness {
             None => Secrets::none(),
         };
         Ok(crate::runner::claude_launch(
-            program, &req2, env, secrets, header,
+            program,
+            &req2,
+            env,
+            secrets,
+            header,
+            &permissions,
         ))
     }
 
@@ -247,5 +254,259 @@ fn missing_oauth_message(name: &str) -> String {
             "No token stored for backend '{name}'. Run 'agent-sidekick setup --backend {name}' \
              in a terminal."
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use crate::backends::{
+        build_launch, resolve_with, BackendKind, Backends, Credential, PermissionMode,
+        ResolveDefaults,
+    };
+    use crate::commands::wizard::templates::SIDEKICK;
+    use crate::config::Config;
+    use crate::runner::{Launch, RunRequest};
+    use crate::token::Token;
+
+    fn abs(rel: &str) -> PathBuf {
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        Path::new(root).join(rel)
+    }
+
+    fn resolved(text: &str) -> Backends {
+        let cfg: Config = toml::from_str(text).unwrap();
+        resolve_with(
+            &cfg,
+            &ResolveDefaults {
+                home: Some(abs("home")),
+                legacy_agent_config_dir: Some(abs("home").join(".claude-sidekick")),
+                config_dir: Some(abs("config").join("agent-sidekick")),
+            },
+        )
+        .unwrap()
+    }
+
+    fn config(extra: &str) -> String {
+        format!(
+            "[backends.s]\nharness = \"claude\"\ndescription = \"d\"\ndefault = true\n{extra}\n\
+             [backends.e]\nharness = \"claude\"\ndescription = \"d\"\n\
+             base_url = \"http://localhost:11434\"\n{extra}\n"
+        )
+    }
+
+    fn launch(backends: &Backends, name: &str, tools: Option<&[&str]>) -> Launch {
+        let b = backends.get(name).unwrap();
+        let credential = if matches!(b.kind, BackendKind::ClaudeOauth { .. }) {
+            Credential::OauthToken(Token::new("sk-ant-oat01-test"))
+        } else {
+            Credential::ApiKey(Token::new("endpoint-key"))
+        };
+        let req = RunRequest {
+            prompt: "do it".to_owned(),
+            cwd: abs("work"),
+            max_turns: 5,
+            model: None,
+            allowed_tools: tools.map(|t| t.iter().map(|s| (*s).to_owned()).collect()),
+            timeout: Duration::from_secs(60),
+        };
+        build_launch(
+            b,
+            &req,
+            &credential,
+            &abs("bin").join("claude"),
+            Vec::<(OsString, OsString)>::new(),
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn args(l: &Launch) -> Vec<&str> {
+        l.args.iter().map(|a| a.to_str().unwrap()).collect()
+    }
+
+    fn has(l: &Launch, line: &str) -> bool {
+        l.header.iter().any(|h| h == line)
+    }
+
+    #[test]
+    fn default_mode_passes_no_permission_flags() {
+        for extra in ["", "permission_mode = \"default\""] {
+            let b = resolved(&config(extra));
+            for name in ["s", "e"] {
+                let l = launch(&b, name, None);
+                assert_eq!(args(&l), ["-p", "--max-turns", "5", "--", "do it"]);
+                assert!(has(&l, "permission_mode: default"), "{:?}", l.header);
+                assert!(has(&l, "allowed_tools: (none: read-only tools)"));
+                assert!(has(&l, "disallowed_tools: (none)"));
+            }
+        }
+    }
+
+    #[test]
+    fn permission_mode_is_passed() {
+        let b = resolved(&config("permission_mode = \"acceptEdits\""));
+        for name in ["s", "e"] {
+            assert_eq!(
+                args(&launch(&b, name, Some(&["Read"]))),
+                [
+                    "-p",
+                    "--max-turns",
+                    "5",
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--allowedTools",
+                    "Read",
+                    "--",
+                    "do it"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn backend_allowed_tools_apply_without_request_tools() {
+        let b = resolved(&config("allowed_tools = [\"Bash\", \"Edit\"]"));
+        for name in ["s", "e"] {
+            let l = launch(&b, name, None);
+            assert_eq!(
+                args(&l),
+                [
+                    "-p",
+                    "--max-turns",
+                    "5",
+                    "--allowedTools",
+                    "Bash",
+                    "Edit",
+                    "--",
+                    "do it"
+                ]
+            );
+            assert!(has(&l, "allowed_tools: Bash Edit (backend default)"));
+        }
+    }
+
+    #[test]
+    fn request_allowed_tools_replace_the_backend_default() {
+        let b = resolved(&config("allowed_tools = [\"Bash\", \"Edit\"]"));
+        for name in ["s", "e"] {
+            let l = launch(&b, name, Some(&["Read", "Grep"]));
+            assert_eq!(
+                args(&l),
+                [
+                    "-p",
+                    "--max-turns",
+                    "5",
+                    "--allowedTools",
+                    "Read",
+                    "Grep",
+                    "--",
+                    "do it"
+                ]
+            );
+            assert!(has(&l, "allowed_tools: Read Grep (request)"));
+        }
+    }
+
+    #[test]
+    fn disallowed_tools_are_always_passed() {
+        let b = resolved(&config(
+            "permission_mode = \"dontAsk\"\nallowed_tools = [\"Bash\"]\n\
+             disallowed_tools = [\"Bash(git push:*)\", \"Read(~/.ssh/**)\"]",
+        ));
+        for name in ["s", "e"] {
+            for tools in [None, Some(&["Bash(git:*)"][..])] {
+                let l = launch(&b, name, tools);
+                let allowed = if tools.is_some() {
+                    "Bash(git:*)"
+                } else {
+                    "Bash"
+                };
+                assert_eq!(
+                    args(&l),
+                    [
+                        "-p",
+                        "--max-turns",
+                        "5",
+                        "--permission-mode",
+                        "dontAsk",
+                        "--allowedTools",
+                        allowed,
+                        "--disallowedTools",
+                        "Bash(git push:*)",
+                        "Read(~/.ssh/**)",
+                        "--",
+                        "do it"
+                    ]
+                );
+                assert!(has(
+                    &l,
+                    "disallowed_tools: Bash(git push:*) Read(~/.ssh/**)"
+                ));
+            }
+        }
+        let b = resolved(&config("disallowed_tools = [\"WebFetch\"]"));
+        assert_eq!(
+            args(&launch(&b, "s", None)),
+            [
+                "-p",
+                "--max-turns",
+                "5",
+                "--disallowedTools",
+                "WebFetch",
+                "--",
+                "do it"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_wizard_template_resolves_and_launches() {
+        let text = SIDEKICK.replace(
+            "[backends.sidekick]\n",
+            "[backends.sidekick]\ndefault = true\n",
+        );
+        let b = resolved(&text);
+        let p = b.get("sidekick").unwrap().claude_permissions().unwrap();
+        assert_eq!(p.mode, PermissionMode::AcceptEdits);
+        let l = launch(&b, "sidekick", None);
+        let a = args(&l);
+        let at = |flag: &str| a.iter().position(|x| *x == flag).unwrap();
+        assert_eq!(a[at("--permission-mode") + 1], "acceptEdits");
+        assert_eq!(
+            a[at("--allowedTools") + 1..at("--disallowedTools")],
+            [
+                "Bash",
+                "Read",
+                "Edit",
+                "Write",
+                "Glob",
+                "Grep",
+                "NotebookEdit",
+                "WebFetch",
+                "WebSearch",
+                "TodoWrite"
+            ]
+        );
+        assert_eq!(
+            a[at("--disallowedTools") + 1..at("--")],
+            [
+                "Bash(git push:*)",
+                "Bash(sudo:*)",
+                "Bash(npm publish:*)",
+                "Bash(cargo publish:*)",
+                "Bash(twine upload:*)",
+                "Read(~/.ssh/**)",
+                "Read(~/.config/agent-sidekick/**)",
+                "Read(~/.claude-sidekick/.credentials.json)"
+            ]
+        );
+        assert_eq!(a[a.len() - 2..], ["--", "do it"]);
+        for line in SIDEKICK.lines().filter(|l| l.starts_with('#')) {
+            assert!(line.len() < 100, "{line}");
+        }
     }
 }
