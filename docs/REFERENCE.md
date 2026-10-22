@@ -39,14 +39,15 @@ As soon as `[backends]` exists, only the backends listed there are available.
 Three backends: the second Claude account (default), Claude Code against a local `qwen3-coder` in Ollama, and Aider with the same model. The commented version is [`examples/config.toml`](../examples/config.toml); it adds a fourth, optional backend `kiconnect` (see [Command backend with a stored key](#command-backend-with-a-stored-key)), which is reachable only after its key is stored.
 
 ```toml
-max_concurrent = 2          # global limit over all backends
+max_concurrent = 16         # global limit over all backends (default 16)
 
 [backends.sidekick]
 type = "claude-oauth"
 description = "Second Claude subscription account (Claude Code). Best quality for complex, multi-file changes and debugging; uses that account's quota."
 default = true
 cost = "quota"
-max_concurrent = 1
+permission_mode = "acceptEdits"
+allowed_tools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
 
 [backends.local]
 type = "claude-endpoint"
