@@ -178,6 +178,12 @@ fn error_lines() -> String {
     ) + "\n"
 }
 
+fn rate_limit_lines() -> String {
+    ev(
+        json!({"type":"error","sessionID":"s1","error":{"name":"APIError","data":{"message":"Rate limit reached for model `m1` on tokens per minute (TPM): Limit 8000, Used 7000, Requested 4000. Please try again in 7.66s.","statusCode":429}}}),
+    ) + "\n"
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     config_dir: PathBuf,
@@ -508,6 +514,34 @@ fn no_answer_counts_as_failure_and_falls_back_to_command() {
         ),
         "{text}"
     );
+    assert!(text.contains("GOOD-RAN"), "{text}");
+}
+
+#[test]
+fn rate_limit_falls_back_to_command() {
+    let f = Fixture::new();
+    let (_good, invocation) = good_script(f.dir.path());
+    let config = format!(
+        "{}\n[backends.good]\nharness = \"command\"\ndescription = \"good\"\n{invocation}",
+        f.oc_backend(true, &rate_limit_lines(), 0)
+    );
+    let mut server = f.start(&config, &[]);
+
+    let (is_error, text) = f.run(&mut server, json!({"prompt": "hi"}));
+    assert!(is_error, "{text}");
+    assert!(text.contains("exit_code: 0"), "{text}");
+    assert!(
+        text.contains("rate_limited: yes (retry after 8s)"),
+        "{text}"
+    );
+
+    let (is_error, text) = f.run(&mut server, json!({"prompt": "hi", "fallback": "good"}));
+    assert!(!is_error, "{text}");
+    assert!(
+        text.starts_with("backend: good (command) — fallback after 'oc' failed: "),
+        "{text}"
+    );
+    assert!(text.contains("\nfallback reason: rate limited\n"), "{text}");
     assert!(text.contains("GOOD-RAN"), "{text}");
 }
 

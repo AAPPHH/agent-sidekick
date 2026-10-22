@@ -181,6 +181,7 @@ pub struct RunOutcome {
     /// Set when the run exited 0 but still counts as failed (e.g. a harness that produced no
     /// answer); see [`crate::harness::Normalized::failure`].
     pub failure: Option<String>,
+    pub rate_limit: Option<crate::harness::RateLimit>,
     pub duration: Duration,
     /// Byte offset in the log file where the agent's output starts (after the header); see
     /// [`read_logged_output`].
@@ -1141,6 +1142,7 @@ pub async fn run_launch(
             tail: CANCELLED_BEFORE_START_MSG.to_owned(),
             output: CANCELLED_BEFORE_START_MSG.to_owned(),
             failure: None,
+            rate_limit: None,
             duration: Duration::ZERO,
             output_offset,
         });
@@ -1296,6 +1298,7 @@ pub async fn run_launch(
         tail,
         output,
         failure: None,
+        rate_limit: None,
         duration,
         output_offset,
     })
