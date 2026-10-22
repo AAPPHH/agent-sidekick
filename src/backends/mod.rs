@@ -277,6 +277,7 @@ pub struct RawBackend {
     /// opencode: seconds to wait for the provider's response headers before OpenCode retries
     /// the request (OpenCode's `headerTimeout`; unset: OpenCode's default of 300 s).
     pub request_timeout_s: Option<u64>,
+    pub model_options: Option<serde_json::Map<String, serde_json::Value>>,
     /// codex (api-key with `base_url`): the provider's wire API. Only `responses` exists
     /// (Codex 0.163 dropped chat completions); any other value is a config error.
     pub wire_api: Option<String>,
@@ -343,6 +344,7 @@ pub enum BackendKind {
         /// Header timeout in seconds (OpenCode provider option `headerTimeout`, retried on
         /// expiry); `None`: OpenCode's default.
         request_timeout_s: Option<u64>,
+        model_options: serde_json::Map<String, serde_json::Value>,
         /// Per-backend isolation directory `<config-dir>/opencode/<name>`.
         base_dir: PathBuf,
     },
