@@ -174,6 +174,84 @@ pub struct Normalized {
     /// Why a run that exited 0 still counts as failed (e.g. no answer at all); `None`: the
     /// exit code decides.
     pub failure: Option<String>,
+    pub rate_limit: Option<RateLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimit {
+    pub retry_after_s: Option<u64>,
+}
+
+impl RateLimit {
+    pub fn line(&self) -> String {
+        match self.retry_after_s {
+            Some(n) => format!("rate_limited: yes (retry after {n}s)"),
+            None => "rate_limited: yes".to_owned(),
+        }
+    }
+}
+
+pub fn detect_rate_limit(text: &str) -> Option<RateLimit> {
+    let lower = text.to_ascii_lowercase();
+    let has_429 = lower.match_indices("429").any(|(i, _)| {
+        let b = lower.as_bytes();
+        (i == 0 || !b[i - 1].is_ascii_digit()) && b.get(i + 3).is_none_or(|c| !c.is_ascii_digit())
+    });
+    let marker = ["rate limit", "rate_limit", "too many requests"]
+        .iter()
+        .any(|m| lower.contains(m));
+    let matched = (has_429 && marker)
+        || lower.contains("rate_limit_error")
+        || lower.contains("rate limit reached");
+    matched.then(|| RateLimit {
+        retry_after_s: retry_after(&lower),
+    })
+}
+
+fn retry_after(lower: &str) -> Option<u64> {
+    for key in ["retry-after", "retry after"] {
+        for (i, _) in lower.match_indices(key) {
+            let rest = lower[i + key.len()..].trim_start_matches([':', ' ', '"', '=', '\\']);
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if let Ok(n) = digits.parse::<u64>() {
+                return Some(n.max(1));
+            }
+        }
+    }
+    let key = "try again in ";
+    lower
+        .match_indices(key)
+        .find_map(|(i, _)| parse_duration_s(&lower[i + key.len()..]))
+}
+
+fn parse_duration_s(s: &str) -> Option<u64> {
+    let mut rest = s;
+    let mut total = 0.0f64;
+    let mut any = false;
+    loop {
+        let len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let Ok(n) = rest[..len].trim_end_matches('.').parse::<f64>() else {
+            break;
+        };
+        let after = &rest[len..];
+        let (factor, unit) = if after.starts_with("ms") {
+            (0.001, 2)
+        } else if after.starts_with('h') {
+            (3600.0, 1)
+        } else if after.starts_with('m') {
+            (60.0, 1)
+        } else if after.starts_with('s') {
+            (1.0, 1)
+        } else {
+            break;
+        };
+        total += n * factor;
+        any = true;
+        rest = &after[unit..];
+    }
+    any.then(|| (total.ceil() as u64).max(1))
 }
 
 /// One harness adapter. Implementations are stateless unit structs; get one with
@@ -384,5 +462,59 @@ mod tests {
         }
         // opencode and codex translate their JSON lines.
         assert!(HarnessKind::Codex.adapter().normalize_output(raw).is_some());
+    }
+
+    fn retry(text: &str) -> Option<Option<u64>> {
+        detect_rate_limit(text).map(|r| r.retry_after_s)
+    }
+
+    #[test]
+    fn detects_rate_limits() {
+        let groq = "Rate limit reached for model `openai/gpt-oss-120b` in organization `org_x` \
+                    service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7000, \
+                    Requested 4000. Please try again in 22.5s.";
+        assert_eq!(retry(groq), Some(Some(23)));
+        assert_eq!(retry("Error: 429 Too Many Requests"), Some(None));
+        assert_eq!(
+            retry(r#"API Error: {"type":"error","error":{"type":"rate_limit_error"}}"#),
+            Some(None)
+        );
+        assert_eq!(
+            retry("HTTP 429 Too Many Requests\nretry-after: 30"),
+            Some(Some(30))
+        );
+        assert_eq!(
+            retry("429 rate limit exceeded, please try again in 1m2.3s"),
+            Some(Some(63))
+        );
+        assert_eq!(
+            retry("status 429: rate_limit_exceeded. Try again in 450ms."),
+            Some(Some(1))
+        );
+        assert_eq!(
+            retry("429 too many requests, retry after 5 seconds"),
+            Some(Some(5))
+        );
+        assert_eq!(
+            detect_rate_limit("429 too many requests").unwrap().line(),
+            "rate_limited: yes"
+        );
+        assert_eq!(
+            detect_rate_limit("rate limit reached, try again in 7.66s")
+                .unwrap()
+                .line(),
+            "rate_limited: yes (retry after 8s)"
+        );
+    }
+
+    #[test]
+    fn no_rate_limit_without_markers() {
+        assert_eq!(detect_rate_limit("429 lines changed"), None);
+        assert_eq!(
+            detect_rate_limit("we should add a rate limit to the API"),
+            None
+        );
+        assert_eq!(detect_rate_limit("14290 rate limit tokens"), None);
+        assert_eq!(detect_rate_limit(""), None);
     }
 }

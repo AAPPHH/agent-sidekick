@@ -235,6 +235,12 @@ pub fn format_outcome(outcome: &RunOutcome, timeout: Duration) -> String {
     if let Some(f) = &outcome.failure {
         let _ = writeln!(s, "failed: {f}");
     }
+    if let Some(rl) = &outcome.rate_limit {
+        let line = rl.line();
+        if !outcome.tail.lines().any(|l| l == line) {
+            let _ = writeln!(s, "{line}");
+        }
+    }
     let _ = writeln!(s, "log: {}", outcome.log_path.display());
     let _ = writeln!(s, "duration_s: {:.1}", outcome.duration.as_secs_f64());
     let _ = writeln!(s, "--- output (last {TAIL_CHARS} chars) ---");
@@ -481,6 +487,9 @@ fn format_run_result(
                     "primary: exit_code {code}, log {} — it ran and may have left changes in cwd",
                     o.log_path.display()
                 );
+                if o.rate_limit.is_some() {
+                    let _ = writeln!(s, "fallback reason: rate limited");
+                }
             }
         }
     }
@@ -1154,13 +1163,19 @@ impl SidekickServer {
                 // would undercount steps and tokens); the buffer is the fallback.
                 let full = runner::read_logged_output(&outcome.log_path, outcome.output_offset);
                 let raw = full.as_deref().unwrap_or(&outcome.output);
+                let stopped = outcome.timed_out || outcome.cancelled;
                 if let Some(n) = backend.harness().normalize_output(raw) {
                     // Redacted again: decoding JSON escapes could have revealed a secret.
                     outcome.tail =
                         redact_with(secrets, &runner::truncate_tail(&n.text, runner::TAIL_CHARS));
-                    if outcome.exit_code == Some(0) && !outcome.timed_out && !outcome.cancelled {
+                    if outcome.exit_code == Some(0) && !stopped {
                         outcome.failure = n.failure;
                     }
+                    if !stopped {
+                        outcome.rate_limit = n.rate_limit;
+                    }
+                } else if !stopped && outcome.exit_code != Some(0) {
+                    outcome.rate_limit = crate::harness::detect_rate_limit(&outcome.tail);
                 }
                 outcome.output.clear();
                 tracing::info!(
@@ -1691,6 +1706,7 @@ mod tests {
             tail: "done".into(),
             output: "done".into(),
             failure: None,
+            rate_limit: None,
             duration: Duration::from_millis(12_340),
             output_offset: 0,
         }

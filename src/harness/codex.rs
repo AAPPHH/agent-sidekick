@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::{
-    batch_safe, create_private_dir, write_if_changed, wrong_harness, CheckDeps, Harness,
-    HarnessKind, LaunchInput, Normalized, SecretLoader, VERSION_ENV_KEEP, VERSION_TIMEOUT,
+    batch_safe, create_private_dir, detect_rate_limit, write_if_changed, wrong_harness, CheckDeps,
+    Harness, HarnessKind, LaunchInput, Normalized, SecretLoader, VERSION_ENV_KEEP, VERSION_TIMEOUT,
 };
 use crate::backends::launch::{child_env, eq_name, set_var, PROVIDER_KEY_ENV};
 use crate::backends::reach::{ProbeResponse, PROBE_TIMEOUT};
@@ -862,6 +862,17 @@ pub fn normalize_json_lines(raw: &str) -> Normalized {
     if let Some(f) = &failed {
         push(&format!("[error] turn failed: {f}"));
     }
+    let rate_limit = (answer.is_none() || failed.is_some())
+        .then(|| {
+            let mut seen = warnings.clone();
+            seen.extend(failed.iter().cloned());
+            seen.extend(plain.iter().cloned());
+            detect_rate_limit(&seen.join("\n")).or_else(|| detect_rate_limit(raw))
+        })
+        .flatten();
+    if let Some(rl) = &rate_limit {
+        push(&rl.line());
+    }
     if let Some(u) = &usage {
         push(&format!(
             "[usage] tokens in {} (cached {}) / out {} (reasoning {})",
@@ -874,7 +885,11 @@ pub fn normalize_json_lines(raw: &str) -> Normalized {
         (None, None) if saw_event => Some("no answer: codex produced no final message".to_owned()),
         (None, None) => Some("no answer: no codex JSON output".to_owned()),
     };
-    Normalized { text: out, failure }
+    Normalized {
+        text: out,
+        failure,
+        rate_limit,
+    }
 }
 
 #[cfg(test)]
