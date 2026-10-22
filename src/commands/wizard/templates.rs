@@ -249,11 +249,22 @@ mod tests {
 
         let q = b.get("groq").unwrap();
         let BackendKind::OpenCode {
-            provider, base_url, ..
+            provider,
+            base_url,
+            model_options,
+            ..
         } = &q.kind
         else {
             panic!("{q:?}")
         };
+        assert_eq!(
+            q.models.as_deref().unwrap(),
+            ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+        );
+        assert_eq!(
+            serde_json::Value::Object(model_options.clone()),
+            serde_json::json!({"interleaved": {"field": "reasoning"}})
+        );
         assert_eq!(*provider, OpencodeProvider::OpenaiCompatible);
         assert_eq!(base_url.as_deref(), Some("https://api.groq.com/openai/v1"));
         assert_eq!(q.secret_id(), Some(SecretId::Backend("groq".into())));
