@@ -535,6 +535,7 @@ fn rate_limit_falls_back_to_command() {
         "{text}"
     );
 
+    let mut server = f.start(&config, &[]);
     let (is_error, text) = f.run(&mut server, json!({"prompt": "hi", "fallback": "good"}));
     assert!(!is_error, "{text}");
     assert!(
@@ -543,6 +544,92 @@ fn rate_limit_falls_back_to_command() {
     );
     assert!(text.contains("\nfallback reason: rate limited\n"), "{text}");
     assert!(text.contains("GOOD-RAN"), "{text}");
+}
+
+#[test]
+fn rate_limited_backend_cools_down() {
+    let f = Fixture::new();
+    let (_good, invocation) = good_script(f.dir.path());
+    let canned = ev(
+        json!({"type":"error","sessionID":"s1","error":{"name":"APIError","data":{"message":"Rate limit reached. Please try again in 30s","statusCode":429}}}),
+    ) + "
+";
+    let config = format!(
+        "{}
+[backends.good]
+harness = \"command\"
+description = \"good\"
+{invocation}",
+        f.oc_backend(true, &canned, 0)
+    );
+    let mut server = f.start(&config, &[]);
+
+    let (is_error, text) = f.run(&mut server, json!({"prompt": "hi", "fallback": "good"}));
+    assert!(!is_error, "{text}");
+    assert!(
+        text.contains(
+            "
+fallback reason: rate limited
+"
+        ),
+        "{text}"
+    );
+    assert!(f.rec.join("argv.txt").exists());
+    std::fs::remove_dir_all(&f.rec).unwrap();
+
+    let (is_error, text) = f.run(&mut server, json!({"prompt": "hi", "fallback": "good"}));
+    assert!(!is_error, "{text}");
+    assert!(
+        text.starts_with(
+            "backend: good (command)
+"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "
+fallback reason: primary oc rate limited, retry in "
+        ),
+        "{text}"
+    );
+    assert!(text.contains("GOOD-RAN"), "{text}");
+    assert!(!f.rec.join("argv.txt").exists(), "opencode ran again");
+
+    let (is_error, text) = f.run(&mut server, json!({"prompt": "hi"}));
+    assert!(is_error, "{text}");
+    assert!(
+        text.contains("backend oc is rate limited, retry in "),
+        "{text}"
+    );
+    assert!(!f.rec.join("argv.txt").exists(), "opencode ran again");
+
+    let res = server.call_tool("sidekick_backends", json!({}), RUN_WITHIN);
+    let report: Value = serde_json::from_str(&text_of(&res)).unwrap();
+    let oc = report["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "oc")
+        .unwrap()
+        .clone();
+    assert_eq!(oc["reachable"], false, "{oc}");
+    assert!(
+        oc["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("rate limited, retry in "),
+        "{oc}"
+    );
+
+    let status = text_of(&server.call_tool("sidekick_status", json!({}), RUN_WITHIN));
+    assert!(
+        status.contains(
+            "
+cooldown: oc retry in "
+        ),
+        "{status}"
+    );
 }
 
 #[test]
