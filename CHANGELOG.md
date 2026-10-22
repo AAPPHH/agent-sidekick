@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-22
+
+### Added
+
+- Groq as a second free backend: templates/groq.toml (harness opencode, provider openai-compatible, base_url https://api.groq.com/openai/v1, models openai/gpt-oss-120b, qwen/qwen3.8-27b, openai/gpt-oss-20b), a setup wizard profile "Groq (kostenlos, mit Limits)" with hidden key prompt (keyring user `backend-groq`), online key check against `/models` and the hint https://console.groq.com/keys on 401/403; README section "Groq-API-Schlüssel erzeugen".
+- Rate limits (HTTP 429): opencode and codex runs are checked in their error events, claude and command runs in the output tail (only unambiguous API markers); the result gets `rate_limited: yes (retry after Ns)`, the wait time comes from "retry-after" or "try again in ..." (22.5s, 1m2.3s, 450ms, 5 minutes).
+- A rate-limited run counts as failed, so `fallback` takes over (`fallback reason: rate limited`).
+- Per-backend cooldown after a rate limit (the wait time, 60 s when unknown, at most 3600 s, in memory): `sidekick_backends` reports the backend as not reachable ("rate limited, retry in Ns"), `sidekick_status` lists it, `sidekick_run` goes straight to a fallback that is not cooling down or fails with the remaining time, and a cooling fallback is skipped.
+- docs/REFERENCE.md section "Rate limits (HTTP 429)"; README FAQ "Groq oder KI:connect meldet 429 (Rate-Limit)".
+
+### Changed
+
+- `CLAUDE.md` now only imports the shared configuration from the `config_md` repository (`@../config_md/projects/agent-sidekick.md`).
+
 ## [0.3.1] - 2026-10-22
 
 ### Fixed
