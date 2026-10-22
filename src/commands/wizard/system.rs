@@ -59,8 +59,9 @@ pub trait System {
     fn register(&self, claude: &Path) -> Result<()>;
     /// The Codex CLI, if installed.
     fn find_codex(&self) -> Option<PathBuf>;
-    /// Register the MCP server with Codex (`setup --codex`; prints its own lines).
-    fn register_codex(&self, claude: &Path) -> Result<()>;
+    /// Register the MCP server with Codex (`setup --codex`; prints its own lines). `claude`:
+    /// Claude Code, if installed (passed on as `AGENT_SIDEKICK_CLAUDE`).
+    fn register_codex(&self, claude: Option<&Path>) -> Result<()>;
     /// Create a codex backend's `CODEX_HOME` with its generated config; returns the directory.
     fn prepare_codex_home(&self, backend: &crate::backends::Backend) -> Result<PathBuf, String>;
     /// Whether `path` is an existing file (never read).
@@ -196,13 +197,13 @@ impl System for RealSystem {
         crate::harness::codex::locate_real(None).ok()
     }
 
-    fn register_codex(&self, claude: &Path) -> Result<()> {
+    fn register_codex(&self, claude: Option<&Path>) -> Result<()> {
         let self_exe =
             std::env::current_exe().context("determining the path of this executable")?;
         let path = crate::commands::codex_host::real_config_path()
             .context("cannot determine the Codex config (set CODEX_HOME)")?;
         let cfg = crate::config::Config::load().ok();
-        crate::commands::setup::register_codex(&path, &self_exe, Some(claude), cfg.as_ref())
+        crate::commands::setup::register_codex(&path, &self_exe, claude, cfg.as_ref())
     }
 
     fn prepare_codex_home(&self, backend: &crate::backends::Backend) -> Result<PathBuf, String> {
