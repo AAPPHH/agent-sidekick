@@ -936,7 +936,8 @@ impl SidekickServer {
                 Some(fb) => Some((secs, fb)),
                 None => {
                     return tool_error(format!(
-                        "backend {} is rate limited, retry in {secs}s; choose another backend                          (see sidekick_backends) or set fallback",
+                        "backend {} is rate limited, retry in {secs}s; choose another backend \
+                         (see sidekick_backends) or set fallback",
                         primary.name
                     ))
                 }
@@ -977,19 +978,14 @@ impl SidekickServer {
                 ),
                 Attempt::NotStarted(r) => (
                     format!(
-                        "backend '{}' ({}) failed: {r}
-{reason}",
+                        "backend '{}' ({}) failed: {r}\n{reason}",
                         fb.name,
                         fb.backend_type()
                     ),
                     true,
                 ),
                 Attempt::Stopped(r) => (
-                    format!(
-                        "{}
-{reason}",
-                        stopped_text(fb, &fb_req, &r, None)
-                    ),
+                    format!("{}\n{reason}", stopped_text(fb, &fb_req, &r, None)),
                     true,
                 ),
             }
