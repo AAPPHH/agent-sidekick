@@ -85,28 +85,59 @@ pub(crate) fn run_checks() -> Vec<Check> {
     let (cfg_check, cfg) = check_config();
     let cfg_valid = cfg_check.status != Status::Fail;
     let claude = locate::find_claude(cfg.claude_path.as_deref());
-    checks.push(check_claude(&claude));
+    let codex_found = crate::harness::codex::locate_real(None).is_ok();
+    let resolved = if cfg_valid {
+        backends::resolve(&cfg).ok()
+    } else {
+        None
+    };
+    let needed = claude_needed(resolved.as_ref(), codex_found);
+    checks.push(check_claude(&claude, needed));
     checks.push(check_config_dir());
     checks.push(cfg_check);
     checks.extend(check_backends(cfg_valid, &cfg, claude.is_ok()));
-    checks.push(check_registration(claude.as_ref().ok()));
-    if let Some(c) = check_codex_registration(cfg_valid.then_some(&cfg)) {
-        checks.push(c);
+    checks.push(check_registration(claude.as_ref().ok(), needed));
+    if codex_found {
+        checks.push(check_codex_registration(
+            cfg_valid.then_some(&cfg),
+            claude.is_err(),
+        ));
     }
     checks.push(check_logs_dir());
     checks
 }
 
-/// The registration in the Codex CLI's config, when Codex is installed (`None`: not
-/// installed, nothing to check). Read-only: the file is parsed, Codex is not started.
-fn check_codex_registration(cfg: Option<&Config>) -> Option<Check> {
-    crate::harness::codex::locate_real(None).ok()?;
+/// Whether a missing claude executable is a failure. It is not when the Codex CLI is
+/// installed (agent-sidekick is then used from Codex) and no claude-* backend is
+/// configured; `backends`: `None` when config.toml could not be loaded or resolved (then
+/// it cannot be told, so claude counts as needed). A config without `[backends]` has the
+/// implicit claude-oauth backend `sidekick`, so it needs claude.
+fn claude_needed(backends: Option<&Backends>, codex_found: bool) -> bool {
+    if !codex_found {
+        return true;
+    }
+    backends.is_none_or(|b| {
+        b.iter().any(|b| {
+            matches!(
+                b.kind,
+                BackendKind::ClaudeOauth { .. } | BackendKind::ClaudeEndpoint { .. }
+            )
+        })
+    })
+}
+
+/// The registration in the Codex CLI's config (called only when Codex is installed).
+/// Read-only: the file is parsed, Codex is not started. `only_host`: Claude Code is not
+/// installed, so Codex is the only way to use agent-sidekick and a missing registration
+/// is a failure.
+fn check_codex_registration(cfg: Option<&Config>, only_host: bool) -> Check {
     let path = super::codex_host::real_config_path();
-    Some(codex_registration_check(
+    codex_registration_check(
         path.as_deref(),
         std::env::current_exe().ok().as_deref(),
         cfg,
-    ))
+        only_host,
+    )
 }
 
 /// [`check_codex_registration`] for the Codex config at `path`.
@@ -114,6 +145,7 @@ pub(crate) fn codex_registration_check(
     path: Option<&Path>,
     self_exe: Option<&Path>,
     cfg: Option<&Config>,
+    only_host: bool,
 ) -> Check {
     use super::codex_host;
     const NAME: &str = "Codex MCP registration";
@@ -123,6 +155,18 @@ pub(crate) fn codex_registration_check(
     };
     let entry = match codex_host::read_entry_at(path) {
         Ok(Some(e)) => e,
+        // Without Claude Code, Codex is the only host: then the registration is needed.
+        Ok(None) if only_host => {
+            return Check::fail(
+                NAME,
+                format!(
+                    "not registered in {}; Claude Code is not installed, so Codex is the only \
+                     host {APP_NAME} can be used from",
+                    path.display()
+                ),
+                REGISTER,
+            )
+        }
         // Optional (only needed to use agent-sidekick from Codex): not a warning.
         Ok(None) => {
             return Check::ok(
@@ -200,9 +244,18 @@ const SETUP: &str = "run `agent-sidekick setup`";
 /// Re-registering keeps the stored tokens and the registration's extra variables.
 const REREGISTER: &str = "run `agent-sidekick setup --register-only`";
 
-fn check_claude(claude: &Result<Located, locate::LocateError>) -> Check {
+/// `needed`: see [`claude_needed`]; a missing claude that is not needed is only a note.
+fn check_claude(claude: &Result<Located, locate::LocateError>, needed: bool) -> Check {
     const NAME: &str = "claude executable";
     match claude {
+        Err(_) if !needed => Check::ok(
+            NAME,
+            format!(
+                "not installed; not needed here (no claude-* backend configured, {APP_NAME} is \
+                 used from Codex). To use it from Claude Code too: install Claude Code, then \
+                 run `{APP_NAME} setup --register-only`"
+            ),
+        ),
         Err(e) => Check::fail(
             NAME,
             e.to_string(),
@@ -577,8 +630,14 @@ fn backend_check(
     }
 }
 
-fn check_registration(claude: Option<&Located>) -> Check {
+fn check_registration(claude: Option<&Located>, claude_needed: bool) -> Check {
     const NAME: &str = "MCP registration";
+    if claude.is_none() && !claude_needed {
+        return Check::ok(
+            NAME,
+            "skipped: Claude Code is not installed (not needed; see the Codex MCP registration)",
+        );
+    }
     let Some(found) = claude else {
         return Check::warn(
             NAME,
@@ -1201,9 +1260,13 @@ mod tests {
         std::fs::write(&exe, "").unwrap();
 
         // No config / not registered: OK with a hint (optional feature).
-        let c = codex_registration_check(Some(&path), Some(&exe), None);
+        let c = codex_registration_check(Some(&path), Some(&exe), None, false);
         assert_eq!(c.status, Status::Ok, "{c:?}");
         assert!(c.detail.contains("setup --codex"), "{}", c.detail);
+        // Without Claude Code, Codex is the only host: not registered is a failure.
+        let c = codex_registration_check(Some(&path), Some(&exe), None, true);
+        assert_eq!(c.status, Status::Fail, "{c:?}");
+        assert!(c.next_step.unwrap().contains("setup --codex"));
 
         // Registered by setup: OK.
         let reg = Registration {
@@ -1217,7 +1280,7 @@ mod tests {
              description = \"d\"\ndefault = true\n",
         )
         .unwrap();
-        let c = codex_registration_check(Some(&path), Some(&exe), Some(&cfg));
+        let c = codex_registration_check(Some(&path), Some(&exe), Some(&cfg), false);
         assert_eq!(c.status, Status::Ok, "{c:?}");
         assert!(c.detail.contains("tool_timeout_sec 15000"), "{}", c.detail);
 
@@ -1227,7 +1290,7 @@ mod tests {
              description = \"d\"\ndefault = true\n",
         )
         .unwrap();
-        let c = codex_registration_check(Some(&path), Some(&exe), Some(&cfg2));
+        let c = codex_registration_check(Some(&path), Some(&exe), Some(&cfg2), false);
         assert_eq!(c.status, Status::Warn, "{c:?}");
         assert!(c.detail.contains("does not pass OTHER"), "{}", c.detail);
 
@@ -1240,14 +1303,67 @@ mod tests {
             ),
         )
         .unwrap();
-        let c = codex_registration_check(Some(&path), Some(&exe), None);
+        let c = codex_registration_check(Some(&path), Some(&exe), None, false);
         assert_eq!(c.status, Status::Fail, "{c:?}");
         assert!(c.detail.contains("after 60 s"), "{}", c.detail);
         assert!(c.next_step.unwrap().contains("setup --codex"));
 
         // Unreadable TOML: WARN.
         std::fs::write(&path, "not = = toml").unwrap();
-        let c = codex_registration_check(Some(&path), Some(&exe), None);
+        let c = codex_registration_check(Some(&path), Some(&exe), None, false);
+        assert_eq!(c.status, Status::Warn, "{c:?}");
+    }
+
+    fn resolved(toml_text: &str) -> Backends {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(toml_text).unwrap();
+        backends::resolve_with(
+            &cfg,
+            &backends::ResolveDefaults {
+                home: Some(dir.path().to_path_buf()),
+                legacy_agent_config_dir: Some(dir.path().join(".claude-sidekick")),
+                config_dir: Some(dir.path().join("cfg")),
+            },
+        )
+        .unwrap()
+    }
+
+    /// A missing claude is only a failure when a claude-* backend needs it or no Codex is
+    /// there to use agent-sidekick from.
+    #[test]
+    fn claude_needed_cases() {
+        let codex_only = resolved(
+            "[backends.codex]\nharness = \"codex\"\nauth = \"chatgpt\"\ndescription = \"d\"\n\
+             default = true\n",
+        );
+        let implicit = resolved("");
+        let with_claude = resolved(
+            "[backends.codex]\nharness = \"codex\"\nauth = \"chatgpt\"\ndescription = \"d\"\n\
+             default = true\n\
+             [backends.sidekick]\ntype = \"claude-oauth\"\ndescription = \"d\"\n",
+        );
+        assert!(!claude_needed(Some(&codex_only), true));
+        assert!(claude_needed(Some(&codex_only), false));
+        assert!(claude_needed(Some(&implicit), true), "implicit sidekick");
+        assert!(claude_needed(Some(&with_claude), true));
+        assert!(claude_needed(None, true), "config not loadable");
+    }
+
+    #[test]
+    fn missing_claude_is_a_note_when_not_needed() {
+        let missing: Result<Located, locate::LocateError> = Err(locate::LocateError::NotFound {
+            searched: "PATH".into(),
+        });
+        let c = check_claude(&missing, true);
+        assert_eq!(c.status, Status::Fail, "{c:?}");
+        let c = check_claude(&missing, false);
+        assert_eq!(c.status, Status::Ok, "{c:?}");
+        assert!(c.detail.contains("not needed"), "{}", c.detail);
+        assert!(c.detail.contains("setup --register-only"), "{}", c.detail);
+
+        let c = check_registration(None, false);
+        assert_eq!(c.status, Status::Ok, "{c:?}");
+        let c = check_registration(None, true);
         assert_eq!(c.status, Status::Warn, "{c:?}");
     }
 }
