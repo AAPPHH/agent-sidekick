@@ -18,14 +18,19 @@ pub mod npm;
 pub mod system;
 pub mod templates;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 
 use crate::backends::reach::ProbeResponse;
-use crate::backends::{Backend, BackendKind, Backends, CodexAuth};
+use crate::backends::{
+    Backend, BackendKind, BackendType, Backends, CodexAuth, RawBackend, IMPLICIT_BACKEND,
+    OLD_IMPLICIT_BACKEND,
+};
 use crate::config::Config;
+use crate::harness::HarnessKind;
 use crate::locate::Os;
 use crate::redact::{redact_all, MIN_SECRET_LEN};
 use crate::token::{self, SecretId, Token, EXPECTED_PREFIX};
@@ -57,10 +62,51 @@ impl Profile {
     pub fn backend_name(self) -> &'static str {
         match self {
             Profile::Kiconnect => "kiconnect",
-            Profile::Claude => "sidekick",
+            Profile::Claude => "claude",
             Profile::Gemini => "gemini",
             Profile::Codex => "codex",
             Profile::Groq => "groq",
+        }
+    }
+
+    /// The name of the backend in `map` that is this profile, if any. Besides the name, the
+    /// Claude profile needs a claude-oauth backend and also matches `sidekick`, its backend
+    /// name before v0.6.
+    fn existing_in(self, map: &BTreeMap<String, RawBackend>) -> Option<&'static str> {
+        self.backend_names()
+            .iter()
+            .copied()
+            .find(|n| map.get(*n).is_some_and(|raw| self.accepts_raw(raw)))
+    }
+
+    /// Whether `raw` can be this profile's backend (only checked for the Claude profile).
+    fn accepts_raw(self, raw: &RawBackend) -> bool {
+        self != Profile::Claude
+            || match (raw.harness, raw.kind) {
+                (Some(HarnessKind::Claude), _) => raw.base_url.is_none(),
+                (None, Some(BackendType::ClaudeOauth)) => true,
+                _ => false,
+            }
+    }
+
+    /// This profile's backend in the resolved `backends` (Claude: claude-oauth only).
+    fn resolved_in(self, backends: &Backends) -> Option<&Backend> {
+        self.backend_names().iter().find_map(|n| {
+            backends.get(n).filter(|b| {
+                self != Profile::Claude || matches!(b.kind, BackendKind::ClaudeOauth { .. })
+            })
+        })
+    }
+
+    /// Names under which an existing backend counts as this profile: the Claude profile also
+    /// matches `sidekick`, its backend name before v0.6.
+    pub fn backend_names(self) -> &'static [&'static str] {
+        match self {
+            Profile::Claude => &[IMPLICIT_BACKEND, OLD_IMPLICIT_BACKEND],
+            Profile::Kiconnect => &["kiconnect"],
+            Profile::Gemini => &["gemini"],
+            Profile::Codex => &["codex"],
+            Profile::Groq => &["groq"],
         }
     }
 
@@ -308,35 +354,45 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     let merging = matches!(mode, Mode::Merge { .. });
 
     // Backends to add: the chosen profiles that do not exist yet, plus (merging into a
-    // config without [backends]) the implicit `sidekick`, which a [backends] section would
+    // config without [backends]) the implicit `claude`, which a [backends] section would
     // otherwise remove.
     let mut add: Vec<Profile> = Vec::new();
+    let mut clashing: Vec<Profile> = Vec::new();
     for &prof in &profiles {
-        let exists = existing_backends
+        let exists = existing_backends.as_ref().and_then(|m| prof.existing_in(m));
+        let taken = existing_backends
             .as_ref()
             .is_some_and(|m| m.contains_key(prof.backend_name()));
-        if exists {
+        if let Some(name) = exists {
             p.say(&format!(
-                "Backend `{}` steht schon in der config.toml und bleibt unverändert.",
-                prof.backend_name()
+                "Backend `{name}` steht schon in der config.toml und bleibt unverändert."
             ));
+        } else if taken {
+            p.say(&format!(
+                "Backend `{}` steht schon in der config.toml, ist aber kein {}. Das Profil wird \
+                 übersprungen; benenne den Abschnitt um, wenn du es einrichten willst.",
+                prof.backend_name(),
+                prof.label()
+            ));
+            clashing.push(prof);
         } else {
             add.push(prof);
         }
     }
+    profiles.retain(|prof| !clashing.contains(prof));
     let implicit_sidekick = merging
         && existing_backends.is_none()
         && !add.contains(&Profile::Claude)
         && !add.is_empty();
     if implicit_sidekick && claude.is_none() {
         p.say(
-            "Die bisherige Konfiguration nutzt das eingebaute Backend `sidekick` (zweites \
+            "Die bisherige Konfiguration nutzt das eingebaute Backend `claude` (zweites \
              Claude-Konto). Ohne Claude Code kann es nicht laufen und wird deshalb nicht \
              übernommen.",
         );
     } else if implicit_sidekick {
         p.say(
-            "Die bisherige Konfiguration nutzt das eingebaute Backend `sidekick` (zweites \
+            "Die bisherige Konfiguration nutzt das eingebaute Backend `claude` (zweites \
              Claude-Konto). Es wird als eigener Abschnitt übernommen, damit es erhalten bleibt; \
              sein gespeicherter Token gilt weiter.",
         );
@@ -417,7 +473,7 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     // 7. Secrets (asked before writing, so a cancelled prompt leaves nothing behind).
     let mut secrets: Vec<(String, SecretId, Token)> = Vec::new();
     for &prof in &profiles {
-        let Some(backend) = backends.get(prof.backend_name()) else {
+        let Some(backend) = prof.resolved_in(&backends) else {
             continue;
         };
         if let Some((id, token)) = ask_secret(p, s, prof, backend)? {
@@ -508,7 +564,7 @@ pub fn run(p: &mut dyn Prompter, s: &dyn System) -> Result<Outcome> {
     p.say(s.doctor().trim_end());
 
     // 11. Finish.
-    let example = example_backend(&profiles);
+    let example = example_backend(&profiles, &backends);
     if claude.is_some() {
         p.say(&format!(
             "\nFertig. Nächste Schritte:\n\
@@ -1115,15 +1171,19 @@ fn codex_login(p: &mut dyn Prompter, s: &dyn System, backend: &Backend) -> Resul
     Ok(())
 }
 
-fn example_backend(profiles: &[Profile]) -> &'static str {
+/// The backend the closing hint names: kiconnect if chosen, else the first chosen profile's
+/// backend as it is called in the config (an old Claude backend may still be `sidekick`).
+fn example_backend(profiles: &[Profile], backends: &Backends) -> String {
     if profiles.contains(&Profile::Kiconnect) {
-        "kiconnect"
-    } else {
-        profiles
-            .first()
-            .map(|p| p.backend_name())
-            .unwrap_or("kiconnect")
+        return "kiconnect".to_owned();
     }
+    profiles
+        .first()
+        .map(|p| {
+            p.resolved_in(backends)
+                .map_or_else(|| p.backend_name().to_owned(), |b| b.name.clone())
+        })
+        .unwrap_or_else(|| "kiconnect".to_owned())
 }
 
 #[cfg(test)]

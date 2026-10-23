@@ -9,7 +9,7 @@ use crate::config::Config;
 
 pub const HEADER: &str = include_str!("../../../templates/header.toml");
 pub const KICONNECT: &str = include_str!("../../../templates/kiconnect.toml");
-pub const SIDEKICK: &str = include_str!("../../../templates/sidekick.toml");
+pub const CLAUDE: &str = include_str!("../../../templates/claude.toml");
 pub const GEMINI: &str = include_str!("../../../templates/gemini.toml");
 pub const CODEX: &str = include_str!("../../../templates/codex.toml");
 pub const GROQ: &str = include_str!("../../../templates/groq.toml");
@@ -75,7 +75,7 @@ pub fn section(
     let mut text = match profile {
         Profile::Kiconnect => KICONNECT.to_owned(),
         Profile::Groq => GROQ.to_owned(),
-        Profile::Claude => SIDEKICK.to_owned(),
+        Profile::Claude => CLAUDE.to_owned(),
         Profile::Codex => CODEX.replace(AUTH_PLACEHOLDER, &toml_string(codex_auth.as_str())),
         Profile::Gemini => {
             let paths = gemini
@@ -222,7 +222,7 @@ mod tests {
         let (_, b) = validate(&text, &defaults(dir.path())).unwrap();
         assert_eq!(
             b.names(),
-            ["codex", "gemini", "groq", "kiconnect", "sidekick"]
+            ["claude", "codex", "gemini", "groq", "kiconnect"]
         );
         assert_eq!(b.default_backend().name, "kiconnect");
 
@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(q.secret_id(), Some(SecretId::Backend("groq".into())));
         assert_eq!(q.cost.as_str(), "free");
 
-        let s = b.get("sidekick").unwrap();
+        let s = b.get("claude").unwrap();
         assert!(matches!(s.kind, BackendKind::ClaudeOauth { .. }), "{s:?}");
         assert_eq!(s.secret_id(), Some(SecretId::legacy()));
 
@@ -341,13 +341,13 @@ mod tests {
             node: &node,
             entry: &entry,
         };
-        assert!(existing.contains_key("kiconnect") && existing.contains_key("sidekick"));
+        assert!(existing.contains_key("kiconnect") && existing.contains_key("claude"));
         let add = vec![section(Profile::Gemini, false, Some(&g), CodexAuth::Chatgpt).unwrap()];
         let merged = merged_config(example, &add);
         assert!(merged.starts_with(example));
         let (_, b) = validate(&merged, &defaults(dir.path())).unwrap();
         assert!(b.get("gemini").is_some());
-        assert_eq!(b.default_backend().name, "sidekick");
+        assert_eq!(b.default_backend().name, "claude");
         // The example's kiconnect stays the aider command backend.
         assert!(matches!(
             b.get("kiconnect").unwrap().kind,
@@ -366,7 +366,7 @@ mod tests {
         // Existing text ending in a comment line, the real templates appended: the comment
         // block of each new section is set off by exactly one empty line.
         let existing = "[backends.x]\n# config_dir = \"~/.claude-sidekick\"\n";
-        let merged = merged_config(existing, &[KICONNECT.to_owned(), SIDEKICK.to_owned()]);
+        let merged = merged_config(existing, &[KICONNECT.to_owned(), CLAUDE.to_owned()]);
         assert!(
             merged.contains("\"~/.claude-sidekick\"\n\n# KI:connect.nrw"),
             "{merged}"

@@ -156,7 +156,7 @@ fn handshake_lists_tools_and_validates_params() {
     let list = report["backends"].as_array().expect("backends array");
     assert_eq!(list.len(), 1, "{report}");
     let b = &list[0];
-    assert_eq!(b["name"], "sidekick", "{report}");
+    assert_eq!(b["name"], "claude", "{report}");
     assert_eq!(b["type"], "claude-oauth", "{report}");
     assert_eq!(b["cost"], "quota", "{report}");
     assert_eq!(b["default"], true, "{report}");
@@ -214,7 +214,7 @@ fn handshake_lists_tools_and_validates_params() {
     assert_eq!(res["isError"], json!(true), "{res}");
     let text = text_of(&res);
     assert!(text.contains("unknown backend 'nope'"), "{text}");
-    assert!(text.contains("sidekick"), "{text}");
+    assert!(text.contains("Available backends: claude"), "{text}");
 }
 
 /// Needs the real `token` and `locate` modules (stubs panic in the server branch).
@@ -231,10 +231,10 @@ fn status_reports_token_source_without_leaking() {
     let status = server.call_tool("sidekick_status", json!({}));
     assert_ne!(status["isError"], json!(true), "{status}");
     let text = text_of(&status);
-    assert!(text.contains("token (sidekick): missing"), "{text}");
+    assert!(text.contains("token (claude): missing"), "{text}");
     assert!(text.contains("claude: NOT FOUND"), "{text}");
     assert!(
-        text.contains("sidekick (claude-oauth, default): running 0, queued 0"),
+        text.contains("claude (claude-oauth, default): running 0, queued 0"),
         "{text}"
     );
     drop(server);
@@ -245,7 +245,7 @@ fn status_reports_token_source_without_leaking() {
     let status = server.call_tool("sidekick_status", json!({}));
     let text = text_of(&status);
     assert!(
-        text.contains("token (sidekick): present (environment"),
+        text.contains("token (claude): present (environment"),
         "{text}"
     );
     assert!(!text.contains("sk-ant-"), "{text}");

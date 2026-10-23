@@ -92,7 +92,7 @@ struct OauthRun {
     _dir: tempfile::TempDir,
 }
 
-/// Test A setup: no config.toml (implicit backend `sidekick`), token via
+/// Test A setup: no config.toml (implicit backend `claude`), token via
 /// `AGENT_SIDEKICK_TOKEN`, `ANTHROPIC_BASE_URL` pointing at the fake.
 fn oauth_run(claude: &Path) -> OauthRun {
     let fake = FakeApi::start();

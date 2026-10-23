@@ -1,7 +1,7 @@
 # Delegation with agent-sidekick
 
 These rules are for the main Claude Code session. Adapt the backend names to your
-`config.toml` (this example covers all four backends of `examples/config.toml`: `sidekick`,
+`config.toml` (this example covers all four backends of `examples/config.toml`: `claude`,
 `local`, `aider` and the optional `kiconnect`; drop the rules for backends you do not
 configure and add one for every other backend you do).
 
@@ -16,7 +16,7 @@ configure and add one for every other backend you do).
   - `local` (free, local model): boilerplate, test scaffolding, docstrings/comments,
     mechanical refactors (renames, moving code, applying a pattern you have already
     shown), formatting and lint fixes.
-  - `sidekick` (second Claude account, uses its quota): complex multi-file changes,
+  - `claude` (second Claude account, uses its quota): complex multi-file changes,
     debugging, anything that needs real reasoning about the codebase.
   - `aider` (free, edits files directly without asking): small, well-specified edits to
     files you name in the prompt. Review the diff afterwards; its changes are not committed.
@@ -26,7 +26,7 @@ configure and add one for every other backend you do).
     prompt goes to a hosted service, so do not use it for confidential code. Review the diff
     afterwards. Models: `openai-gpt-oss-120b` (default, general tasks) and
     `qwen-qwen3-8-27b` (code-heavy tasks).
-  - On `sidekick`, use the default model for routine work and `model: "opus"` only for the
+  - On `claude`, use the default model for routine work and `model: "opus"` only for the
     hardest tasks.
   - Keep work you need to judge carefully (security, data migrations, public APIs) in this
     session.
@@ -40,8 +40,8 @@ configure and add one for every other backend you do).
   fallback run.
 - Never put secrets (tokens, passwords, API keys, customer data) into prompts. Prompts and
   output are written to the run log.
-- Prefer `local`/`aider`/`kiconnect` when the `sidekick` account is busy (see `sidekick_status`) or for
-  bulk work; do not fan out many parallel `sidekick` runs.
+- Prefer `local`/`aider`/`kiconnect` when the `claude` account is busy (see `sidekick_status`) or for
+  bulk work; do not fan out many parallel `claude` runs.
 - After a delegated run, read the result (exit code, output tail) and verify the change
   yourself (diff, tests) before building on it. The first line of the result names the
   backend and model that actually ran; after a fallback, a note says when the fallback did

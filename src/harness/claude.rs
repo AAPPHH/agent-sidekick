@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use super::{wrong_harness, CheckDeps, Harness, HarnessKind, LaunchInput, SecretLoader};
 use crate::backends::launch::{child_env, eq_name, BASE_URL_ENV, BASE_URL_WARNING};
-use crate::backends::{Backend, BackendKind, Credential, Reachability, IMPLICIT_BACKEND};
+use crate::backends::{is_primary_oauth_name, Backend, BackendKind, Credential, Reachability};
 use crate::redact::Secrets;
 use crate::runner::{Launch, RunRequest};
 use crate::token::{SecretId, Token, TokenError};
@@ -244,7 +244,7 @@ fn find_claude(claude_path: Option<&Path>) -> Result<PathBuf, String> {
 }
 
 fn missing_oauth_message(name: &str) -> String {
-    if name == IMPLICIT_BACKEND {
+    if is_primary_oauth_name(name) {
         format!(
             "No token stored for backend '{name}'. Run 'agent-sidekick setup' (or \
              'agent-sidekick setup --backend {name}') in a terminal."
@@ -267,7 +267,7 @@ mod tests {
         build_launch, resolve_with, BackendKind, Backends, Credential, PermissionMode,
         ResolveDefaults,
     };
-    use crate::commands::wizard::templates::SIDEKICK;
+    use crate::commands::wizard::templates::CLAUDE;
     use crate::config::Config;
     use crate::runner::{Launch, RunRequest};
     use crate::token::Token;
@@ -465,14 +465,11 @@ mod tests {
 
     #[test]
     fn the_wizard_template_resolves_and_launches() {
-        let text = SIDEKICK.replace(
-            "[backends.sidekick]\n",
-            "[backends.sidekick]\ndefault = true\n",
-        );
+        let text = CLAUDE.replace("[backends.claude]\n", "[backends.claude]\ndefault = true\n");
         let b = resolved(&text);
-        let p = b.get("sidekick").unwrap().claude_permissions().unwrap();
+        let p = b.get("claude").unwrap().claude_permissions().unwrap();
         assert_eq!(p.mode, PermissionMode::AcceptEdits);
-        let l = launch(&b, "sidekick", None);
+        let l = launch(&b, "claude", None);
         let a = args(&l);
         let at = |flag: &str| a.iter().position(|x| *x == flag).unwrap();
         assert_eq!(a[at("--permission-mode") + 1], "acceptEdits");
@@ -506,7 +503,7 @@ mod tests {
             ]
         );
         assert_eq!(a[a.len() - 2..], ["--", "do it"]);
-        for line in SIDEKICK.lines().filter(|l| l.starts_with('#')) {
+        for line in CLAUDE.lines().filter(|l| l.starts_with('#')) {
             assert!(line.len() < 100, "{line}");
         }
     }

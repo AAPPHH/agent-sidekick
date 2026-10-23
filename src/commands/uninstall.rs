@@ -131,6 +131,12 @@ pub fn secrets_to_delete(resolved: &Result<Backends, String>) -> (Vec<SecretId>,
         }
     }
     ids.push(SecretId::legacy());
+    // `claude` and `sidekick` share the v0.1 secret; delete it once.
+    for id in &mut ids {
+        if id.is_legacy() {
+            *id = SecretId::legacy();
+        }
+    }
     let mut seen = std::collections::HashSet::new();
     ids.retain(|id| seen.insert(id.clone()));
     (ids, note)
@@ -309,7 +315,8 @@ mod tests {
                 SecretId::Command("aider".into()),
                 SecretId::Endpoint("envkey".into()),
                 SecretId::Endpoint("local".into()),
-                SecretId::Oauth("sidekick".into()),
+                // sidekick's token is the legacy secret (`claude`), listed once.
+                SecretId::legacy(),
                 SecretId::Oauth("work".into()),
             ],
             "sidekick is the legacy secret and must appear once"

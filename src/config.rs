@@ -28,7 +28,7 @@ pub struct Config {
     /// though they would normally be removed (see `backends::launch`).
     pub pass_env: Vec<String>,
     /// `[backends.<name>]` tables as written. `None`: no `[backends]` section, which means
-    /// the implicit claude-oauth backend `sidekick` (v0.1 behaviour). Validated and turned
+    /// the implicit claude-oauth backend `claude` (v0.1 behaviour). Validated and turned
     /// into [`crate::backends::Backends`] by [`crate::backends::resolve`].
     pub backends: Option<BTreeMap<String, RawBackend>>,
 }
