@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-23
+
 ### Changed
 
 - The second Claude account's backend is now called `claude` (was `sidekick`): the implicit backend of a config.toml without `[backends]`, the wizard's Claude profile, its template and the examples. Use `agent-sidekick setup --backend claude` and `backend: "claude"` in `sidekick_run`.
