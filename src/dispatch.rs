@@ -76,6 +76,7 @@ fn default_provider(backend: &Backend) -> String {
     match &backend.kind {
         BackendKind::ClaudeOauth { .. } => "anthropic".into(),
         BackendKind::ClaudeEndpoint { base_url, .. } => url_host(base_url),
+        BackendKind::Codex { base_url: Some(url), .. } => url_host(url),
         BackendKind::Codex { .. } => "openai".into(),
         BackendKind::OpenCode { provider: OpencodeProvider::OpenaiCompatible, base_url: Some(url), .. } => url_host(url),
         BackendKind::OpenCode { provider, .. } => provider.as_str().into(),

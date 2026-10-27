@@ -45,3 +45,18 @@ fn openai_compatible_opencode_uses_base_url_host() {
     assert_eq!(provider_of(&opencode(OpencodeProvider::Ollama, Some("http://localhost:11434"))), "ollama");
     assert_eq!(provider_of(&opencode(OpencodeProvider::Openrouter, None)), "openrouter");
 }
+
+#[test]
+fn codex_with_base_url_uses_host() {
+    let mut b = opencode(OpencodeProvider::Ollama, None);
+    b.kind = BackendKind::Codex {
+        auth: agent_sidekick::backends::CodexAuth::ApiKey,
+        base_url: Some("https://chat.kiconnect.nrw/api/v1".into()),
+        api_key_env: None,
+        harness_path: None,
+        read_only: false,
+        windows_sandbox: Default::default(),
+        base_dir: PathBuf::from("/x"),
+    };
+    assert_eq!(provider_of(&b), "chat.kiconnect.nrw");
+}
