@@ -293,10 +293,14 @@ impl DataStore {
                 bail!("unknown job_id {job_id} in the local log of this session");
             }
             let completed = status_summary(Status::Completed);
+            let nochange = status_summary(Status::NoChange);
             let base = mine
                 .into_iter()
-                .find(|e| e.outcome == Outcome::Note && e.summary.as_deref() == Some(completed.as_str()))
-                .ok_or_else(|| anyhow!("job {job_id} did not complete with a result; only completed jobs get a verdict"))?;
+                .find(|e| {
+                    e.outcome == Outcome::Note
+                        && (e.summary.as_deref() == Some(completed.as_str()) || (!e.dimension.is_write() && e.summary.as_deref() == Some(nochange.as_str())))
+                })
+                .ok_or_else(|| anyhow!("job {job_id} delivered no result to judge; only completed jobs (write dimensions) or finished search/inventory/decisions jobs without a diff get a verdict"))?;
             let now = chrono::Utc::now().timestamp_millis();
             let mut e = Event::new(&base.model_id, base.dimension, base.scope.clone(), outcome, now);
             e.machine_id = self.machine_id.clone();

@@ -52,7 +52,7 @@ fn only_completed_jobs_get_a_verdict() {
         e.summary = Some(format!("status: {status}"));
         s.append(e).unwrap();
         let err = s.record_verdict(&format!("j-{status}"), Outcome::Accepted, None, Visibility::Private).unwrap_err().to_string();
-        assert!(err.contains("only completed jobs"), "{err}");
+        assert!(err.contains("get a verdict"), "{err}");
     }
     s.append(job_event("j-aborted-event", Outcome::Aborted, 1000)).unwrap();
     assert!(s.record_verdict("j-aborted-event", Outcome::Accepted, None, Visibility::Private).is_err());
@@ -119,4 +119,20 @@ fn rejection_needs_a_formulation_rule() {
     }
     assert!(own(&s).iter().all(|e| e.outcome != Outcome::Rejected));
     s.record_verdict("jr", Outcome::Rejected, Some("Zielmodul nennen".into()), Visibility::Private).unwrap();
+}
+
+#[test]
+fn non_write_nochange_jobs_get_a_verdict_but_write_ones_do_not() {
+    let (_d, s) = store();
+    let mut e = job_event("js", Outcome::Note, 1000);
+    e.dimension = Dimension::Search;
+    e.summary = Some("status: nochange".into());
+    s.append(e).unwrap();
+    s.record_verdict("js", Outcome::Accepted, None, Visibility::Private).unwrap();
+    assert!(own(&s).iter().any(|e| e.outcome == Outcome::Accepted && e.dimension == Dimension::Search));
+    let mut w = job_event("jw", Outcome::Note, 1000);
+    w.summary = Some("status: nochange".into());
+    s.append(w).unwrap();
+    let err = s.record_verdict("jw", Outcome::Rejected, Some("Datei nennen".into()), Visibility::Private).unwrap_err().to_string();
+    assert!(err.contains("get a verdict"), "{err}");
 }
