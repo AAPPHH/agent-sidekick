@@ -8,6 +8,7 @@ fn opencode(provider: OpencodeProvider, base_url: Option<&str>) -> Backend {
     Backend {
         name: "b".into(),
         description: "t".into(),
+            account: None,
         cost: Cost::Free,
         is_default: false,
         max_concurrent: None,

@@ -243,6 +243,7 @@ pub struct Server {
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     next_id: u64,
+    _data: tempfile::TempDir,
 }
 
 impl Server {
@@ -250,6 +251,7 @@ impl Server {
     /// [`unwanted_inherited_vars`]), the keyring disabled, `config_dir` as its config dir,
     /// and `env` on top. PATH, HOME/USERPROFILE etc. are inherited unchanged.
     pub fn start(config_dir: &Path, env: &[(&str, &str)]) -> Self {
+        let data = tempfile::tempdir().expect("data dir");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent-sidekick"));
         cmd.arg("serve");
         for k in unwanted_inherited_vars() {
@@ -257,6 +259,7 @@ impl Server {
         }
         cmd.env("AGENT_SIDEKICK_CONFIG_DIR", config_dir)
             .env("AGENT_SIDEKICK_DISABLE_KEYRING", "1")
+            .env("AGENT_SIDEKICK_DATA_DIR", data.path())
             // Cut claude's side traffic to third parties; harmless if unknown.
             .env("DISABLE_AUTOUPDATER", "1")
             .env("DISABLE_TELEMETRY", "1")
@@ -286,6 +289,7 @@ impl Server {
             stdin: Some(stdin),
             lines,
             next_id: 1,
+            _data: data,
         };
         server.initialize();
         server

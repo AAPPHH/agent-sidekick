@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use agent_sidekick::backends::{Backend, BackendKind, Cost, OpencodeProvider};
-use agent_sidekick::data::{pseudonym, read_events, write_events, DataDir, ModelRow, ProtectedRow};
+use agent_sidekick::data::{pseudonym, read_events, write_events, DataDir, ModelRow, Profile, ProtectedRow};
 use agent_sidekick::dispatch::{technical_sperre, Identity};
 use agent_sidekick::trust::{Dimension, Event, Outcome, Scope};
 
@@ -13,6 +13,7 @@ fn backend(kind: BackendKind) -> Backend {
     Backend {
         name: "b".into(),
         description: "t".into(),
+            account: None,
         cost: Cost::Free,
         is_default: false,
         max_concurrent: None,
@@ -44,6 +45,22 @@ fn dgx() -> Backend {
     })
 }
 
+fn openai_compatible(base_url: &str) -> Backend {
+    let mut b = dgx();
+    if let BackendKind::OpenCode { base_url: url, .. } = &mut b.kind {
+        *url = Some(base_url.into());
+    }
+    b
+}
+
+fn kiconnect() -> Backend {
+    openai_compatible("https://chat.kiconnect.nrw/api/v1")
+}
+
+fn groq() -> Backend {
+    openai_compatible("https://api.groq.com/openai/v1")
+}
+
 fn row(b: &Backend, model: &str, cost: &str, max_steps: i64, context_tokens: Option<i64>, budget: i64) -> ModelRow {
     ModelRow {
         key: Identity::default().key(b, Some(model)),
@@ -61,9 +78,41 @@ fn row(b: &Backend, model: &str, cost: &str, max_steps: i64, context_tokens: Opt
 fn models() -> Vec<ModelRow> {
     vec![
         row(&dgx(), QWEN, "shared-dgx", 80, Some(262_144), 64_000),
-        row(&claude(), "claude-sonnet-5-5", "quota", 100, Some(200_000), 150_000),
-        row(&claude(), "claude-opus-5-5", "quota", 100, Some(200_000), 150_000),
+        row(&claude(), "claude-sonnet-5-5", "quota", 100, Some(1_000_000), 150_000),
+        row(&claude(), "claude-opus-5-5", "quota", 100, Some(1_000_000), 150_000),
+        row(&kiconnect(), "openai-gpt-oss-120b", "free", 40, Some(131_072), 64_000),
+        row(&kiconnect(), "qwen-qwen3-8-27b", "free", 40, Some(131_072), 64_000),
+        row(&groq(), "openai/gpt-oss-120b", "free", 20, Some(131_072), 16_000),
+        row(&groq(), "qwen/qwen3.8-27b", "free", 20, Some(131_072), 16_000),
+        row(&groq(), "openai/gpt-oss-20b", "free", 20, Some(131_072), 16_000),
+        row(&claude(), "claude-haiku-5-5", "quota", 100, Some(1_000_000), 150_000),
+        row(&claude(), "claude-fable-5-1", "quota", 100, Some(1_000_000), 150_000),
     ]
+}
+
+fn load_profiles(path: &Path) -> HashMap<String, Profile> {
+    let table: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
+    let default_as_of = table.get("defaults").and_then(|d| d.get("profile_as_of")).and_then(|v| v.as_str()).map(String::from);
+    let rows = models();
+    let mut out = HashMap::new();
+    for entry in table.get("profile").and_then(|p| p.as_array()).into_iter().flatten() {
+        let text = |k: &str| entry.get(k).and_then(|v| v.as_str()).map(String::from);
+        let (provider, model) = (text("provider").expect("profile.provider"), text("model").expect("profile.model"));
+        let found = rows.iter().find(|r| r.key.provider == provider && r.key.model == model);
+        let id = found.unwrap_or_else(|| panic!("profile {provider}/{model} matches no registry row")).model_id();
+        let profile = Profile {
+            strengths: text("strengths"),
+            weaknesses: text("weaknesses"),
+            task_scope: text("task_scope"),
+            dims_prior: text("dims_prior"),
+            benchmarks: text("benchmarks"),
+            sources: text("sources"),
+            profile_as_of: text("profile_as_of").or_else(|| default_as_of.clone()),
+            prompting: text("prompting"),
+        };
+        assert!(out.insert(id, profile).is_none(), "duplicate profile {provider}/{model}");
+    }
+    out
 }
 
 fn events(qwen_id: &str) -> Vec<Event> {
@@ -80,7 +129,7 @@ fn events(qwen_id: &str) -> Vec<Event> {
     incident.duration_s = Some(142.0);
     incident.block_reason = Some("Validierung decided_by entfernt".into());
     incident.summary = Some("Qwen3-Coder-Next hat bei einer Code-Aufgabe eine Validierung entfernt, damit der eigene Test durchgeht.".into());
-    incident.conclusion = None;
+    incident.conclusion = Some("Schutzbegriff decided_by und Validierungen dürfen nicht entfernt werden – im Auftrag nennen; Tests sind unveränderlich".into());
     let mut search = make(Dimension::Search, Outcome::Seed, 2_000);
     search.seed_value = Some(0.55);
     let mut inventory = make(Dimension::Inventory, Outcome::Seed, 3_000);
@@ -88,8 +137,8 @@ fn events(qwen_id: &str) -> Vec<Event> {
     vec![incident, search, inventory]
 }
 
-fn write_start_data(data: &Path) {
-    ModelRow::write_all(&data.join("models.parquet"), &models()).unwrap();
+fn write_start_data(data: &Path, profiles: &HashMap<String, Profile>) {
+    ModelRow::write_all_with(&data.join("models.parquet"), &models(), profiles).unwrap();
     ProtectedRow::write_all(&data.join("protected.parquet"), &ProtectedRow::defaults()).unwrap();
     let qwen_id = models()[0].model_id();
     let existing = DataDir::experience_files(data).unwrap();
@@ -103,17 +152,22 @@ fn write_start_data(data: &Path) {
     std::fs::write(data.join("peers.toml"), "owners = [\"AAPPHH\"]\naapphh = \"AAPPHH\"\n").unwrap();
 }
 
+fn sample() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/profiles.sample.toml")
+}
+
 fn generated() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().to_path_buf();
-    write_start_data(&data);
+    write_start_data(&data, &load_profiles(&sample()));
     (dir, data)
 }
 
 #[test]
 #[ignore]
 fn generate_start_data() {
-    write_start_data(&PathBuf::from(std::env::var("SIDEKICK_DATA_OUT").unwrap()));
+    let profiles = std::env::var("SIDEKICK_PROFILES").map(|p| load_profiles(Path::new(&p))).unwrap_or_default();
+    write_start_data(&PathBuf::from(std::env::var("SIDEKICK_DATA_OUT").unwrap()), &profiles);
 }
 
 #[test]
@@ -136,6 +190,18 @@ fn generated_start_data_matches_dispatch_identity() {
 }
 
 #[test]
+fn generated_registry_context_and_cost_match_cli_and_config() {
+    let (_dir, root) = generated();
+    for m in DataDir::new(root).models().unwrap() {
+        match m.key.model.as_str() {
+            "claude-sonnet-5-5" | "claude-opus-5-5" | "claude-haiku-5-5" => assert_eq!(m.context_tokens, Some(1_000_000)),
+            "openai-gpt-oss-120b" | "qwen-qwen3-8-27b" => assert_eq!(m.cost, "free"),
+            _ => {}
+        }
+    }
+}
+
+#[test]
 fn generated_incident_event_is_plain_and_peers_name_owners() {
     let (_dir, data) = generated();
     let files = DataDir::experience_files(&data).unwrap();
@@ -146,7 +212,52 @@ fn generated_incident_event_is_plain_and_peers_name_owners() {
         incident.summary.as_deref(),
         Some("Qwen3-Coder-Next hat bei einer Code-Aufgabe eine Validierung entfernt, damit der eigene Test durchgeht.")
     );
-    assert_eq!(incident.conclusion, None);
+    assert_eq!(incident.conclusion.as_deref(), Some("Schutzbegriff decided_by und Validierungen dürfen nicht entfernt werden – im Auftrag nennen; Tests sind unveränderlich"));
     let peers = std::fs::read_to_string(data.join("peers.toml")).unwrap();
     assert!(peers.contains("owners = [\"AAPPHH\"]"));
+}
+
+#[test]
+fn every_configured_model_is_registered_with_the_id_dispatch_computes() {
+    let rows = models();
+    let ids: std::collections::HashSet<String> = rows.iter().map(ModelRow::model_id).collect();
+    assert_eq!(ids.len(), rows.len());
+    let expect = [
+        (dgx(), "Qwen3-Coder-Next"),
+        (kiconnect(), "openai-gpt-oss-120b"),
+        (kiconnect(), "qwen-qwen3-8-27b"),
+        (groq(), "openai/gpt-oss-120b"),
+        (groq(), "qwen/qwen3.8-27b"),
+        (groq(), "openai/gpt-oss-20b"),
+        (claude(), "opus"),
+        (claude(), "sonnet"),
+        (claude(), "haiku"),
+        (claude(), "fable"),
+    ];
+    for (b, m) in expect {
+        let id = Identity::default().key(&b, Some(m)).model_id();
+        assert!(ids.contains(&id), "no registry row for {m}");
+    }
+    let mut default_claude = claude();
+    default_claude.model = Some("opus".into());
+    assert!(Identity::default().key(&default_claude, None).is_gold());
+    assert_eq!(rows.len(), 10);
+}
+
+#[test]
+fn sample_profiles_attach_to_rows_and_do_not_change_trust() {
+    let (_with_dir, with_root) = generated();
+    let plain_dir = tempfile::tempdir().unwrap();
+    write_start_data(plain_dir.path(), &HashMap::new());
+    let now = chrono::Utc::now().timestamp_millis();
+    let (with, plain) = (DataDir::new(with_root), DataDir::new(plain_dir.path()));
+    let id = models()[0].model_id();
+    let (a, b) = (with.steckbrief(&id, &Scope::Global, None, now).unwrap(), plain.steckbrief(&id, &Scope::Global, None, now).unwrap());
+    let values = |sb: &agent_sidekick::data::Steckbrief| sb.rows.iter().map(|r| (r.dimension, r.trust.to_bits(), r.pruefanteil.to_bits())).collect::<Vec<_>>();
+    assert_eq!(values(&a), values(&b));
+    assert_eq!((a.write_right_code, a.decisions_right), (b.write_right_code, b.decisions_right));
+    assert!(a.render().contains("Profil (öffentliche Daten, Stand 2026-01-01; kein Einfluss auf Vertrauen)"));
+    assert!(a.render().contains("Platzhalter Stärken") && !b.render().contains("Profil"));
+    assert_eq!(with.profiles().unwrap().values().filter(|p| **p != Profile::default()).count(), 2);
+    assert!(plain.profiles().unwrap().values().all(|p| *p == Profile::default()));
 }

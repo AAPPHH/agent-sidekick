@@ -204,6 +204,48 @@ pub fn load_credential(backend: &Backend) -> Result<(Credential, String), String
     )
 }
 
+pub const OAUTH_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+
+pub fn oauth_profile_account(token: &str) -> Result<String, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .build()
+        .into();
+    let mut resp = agent
+        .get(OAUTH_PROFILE_URL)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .call()
+        .map_err(|e| format!("profile request failed: {e}"))?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return Err(format!("profile endpoint answered HTTP {status}"));
+    }
+    let body = resp.body_mut().read_to_string().map_err(|e| format!("profile unreadable: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("profile unreadable: {e}"))?;
+    json.pointer("/account/email")
+        .or_else(|| json.pointer("/account/email_address"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "profile has no e-mail".to_owned())
+}
+
+pub fn detect_account(backend: &Backend) -> Result<String, String> {
+    match &backend.kind {
+        BackendKind::ClaudeOauth { config_dir, .. } => match super::claude_account(Some(config_dir.clone())) {
+            Some(email) => Ok(email),
+            None => match load_credential(backend)? {
+                (Credential::OauthToken(t), _) => oauth_profile_account(t.expose()),
+                _ => Err("no OAuth token".to_owned()),
+            },
+        },
+        BackendKind::Codex { base_dir, .. } => super::codex_account(&base_dir.join(crate::harness::codex::AUTH_FILE))
+            .ok_or_else(|| "no e-mail in the Codex login".to_owned()),
+        _ => Err("no account to detect".to_owned()),
+    }
+}
+
 /// Testable core of [`load_credential`]: environment and secret store are injected.
 /// Dispatches to the adapter of the backend's harness.
 fn load_credential_with(
@@ -665,6 +707,7 @@ mod tests {
         Backend {
             name: name.to_owned(),
             description: "test".to_owned(),
+            account: None,
             cost: Cost::Free,
             is_default: false,
             max_concurrent: None,

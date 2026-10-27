@@ -114,10 +114,12 @@ fn handshake_lists_tools_and_validates_params() {
         "timeout_s",
         "backend",
         "fallback",
+        "dimension",
+        "scope",
     ] {
         assert!(props.contains_key(key), "missing property {key}: {schema}");
     }
-    assert_eq!(props.len(), 8, "unexpected properties: {schema}");
+    assert_eq!(props.len(), 10, "unexpected properties: {schema}");
     assert_eq!(schema["required"], json!(["prompt"]), "{schema}");
     for key in ["backend", "fallback"] {
         let p = &props[key];
@@ -552,7 +554,7 @@ fn handshake_unchanged_with_opencode_backend() {
         .unwrap();
     assert_eq!(
         run["inputSchema"]["properties"].as_object().unwrap().len(),
-        8
+        10
     );
 
     let text = text_of(&server.call_tool("sidekick_backends", json!({})));

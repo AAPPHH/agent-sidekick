@@ -680,7 +680,7 @@ fn claude_falls_back_to_opencode_and_the_oauth_token_stays_behind() {
     let f = Fixture::new();
     let claude = failing_claude(f.dir.path());
     let config = format!(
-        "[backends.sidekick]\nharness = \"claude\"\ndescription = \"claude account\"\n\
+        "[backends.sidekick]\nharness = \"claude\"\ndescription = \"claude account\"\naccount = \"claude-user@example.com\"\n\
          default = true\nconfig_dir = '{}'\n\n{}",
         f.dir.path().join("claude-cfg").display(),
         f.oc_backend(false, &answer_lines(ANSWER), 0)

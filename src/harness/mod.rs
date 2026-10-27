@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn normalize_output_is_identity_for_claude_and_command() {
-        let raw = "line 1\n\u{1b}[31mred\u{1b}[0m\n{\"json\": true}\n";
+        let raw = "line 1\n\u{1b}[31mred\u{1b}[0m\n{\"json\": true}\n{\"type\":\"result\",\"is_error\":true,\"subtype\":\"error_during_execution\"}\n";
         for h in [HarnessKind::Claude, HarnessKind::Command] {
             assert_eq!(h.adapter().normalize_output(raw), None);
         }

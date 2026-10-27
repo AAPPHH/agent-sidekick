@@ -286,6 +286,7 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
             }
         }
     }
+    lines.push(account_line(backend, prerequisites_ok));
     if let (BackendKind::ClaudeEndpoint { base_url, .. }, false) = (&backend.kind, prerequisites_ok)
     {
         // `check_backend` stops before probing; show the server's state anyway.
@@ -311,6 +312,20 @@ fn test(cfg: &Config, backends: &Backends, name: &str) -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+fn account_line(backend: &Backend, can_detect: bool) -> String {
+    let configured = backend.account.as_deref().unwrap_or("not set");
+    if !backend.account_bound() || !can_detect {
+        return format!("account:     {configured}");
+    }
+    match backends::detect_account(backend) {
+        Ok(found) if backend.account.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&found)) => {
+            format!("account:     {configured} (matches the detected login)")
+        }
+        Ok(found) => format!("account:     {configured}; detected {found}"),
+        Err(e) => format!("account:     {configured} (not detected: {e})"),
+    }
 }
 
 /// Where the backend's credential comes from (never the value).
@@ -588,6 +603,7 @@ pub(crate) mod tests {
         Backend {
             name: name.to_owned(),
             description: format!("description of {name}"),
+            account: None,
             cost: Cost::Free,
             is_default,
             max_concurrent: None,

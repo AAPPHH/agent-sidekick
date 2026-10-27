@@ -29,6 +29,47 @@ Homebrew:            brew install --cask claude-code
 WinGet:              winget install Anthropic.ClaudeCode
 (see https://code.claude.com/docs/en/setup)";
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaudeReport {
+    pub text: String,
+    pub is_error: bool,
+    pub subtype: String,
+    pub models: Vec<String>,
+}
+
+fn usage_weight(v: &serde_json::Value) -> f64 {
+    ["costUSD", "outputTokens", "inputTokens"].iter().map(|k| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0)).fold(0.0, |a, x| a * 1e6 + x)
+}
+
+pub fn parse_report(raw: &str) -> Option<ClaudeReport> {
+    let json = std::iter::once(raw.trim()).chain(raw.lines().rev().map(str::trim)).filter(|l| l.starts_with('{')).find_map(|l| {
+        serde_json::from_str::<serde_json::Value>(l).ok().filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("result"))
+    })?;
+    let mut usage: Vec<(String, f64)> = json
+        .get("modelUsage")
+        .and_then(|m| m.as_object())
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), usage_weight(v))).collect())
+        .unwrap_or_default();
+    usage.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Some(ClaudeReport {
+        text: json.get("result").and_then(|r| r.as_str()).map(str::to_string).unwrap_or_else(|| {
+            json.get("errors")
+                .and_then(|e| e.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default()
+        }),
+        is_error: json.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false),
+        subtype: json.get("subtype").and_then(|e| e.as_str()).unwrap_or_default().to_string(),
+        models: usage.into_iter().map(|(k, _)| k).collect(),
+    })
+}
+
+pub fn model_matches(reported: &str, expected: &str) -> bool {
+    reported.strip_prefix(expected).is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with('[') || rest.strip_prefix('-').is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 /// Adapter of the `claude` harness.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeHarness;

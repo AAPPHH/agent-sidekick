@@ -43,7 +43,8 @@ pick one by description and cost. `sidekick_run`: run a prompt in a working dire
 (optional `backend`, `model`, `fallback`); it returns when the agent is done, which can take \
 many minutes. `sidekick_status`: running/queued jobs and setup problems. Without `backend`, a \
 run goes to the configured default backend. The result names the backend and model that ran, \
-the exit code, the log path and the tail of the output. If a run fails because no token, key \
+the exit code, the log path and the tail of the output. Registered models need `dimension` \
+(dispatch path, then record a verdict with `sidekick_record_experience` and `job_id`). If a run fails because no token, key \
 or login is stored, ask the user to run `agent-sidekick setup` (or `agent-sidekick setup \
 --backend <name>`) in a terminal.";
 
@@ -104,6 +105,12 @@ pub struct RunParams {
     /// own full `timeout_s` (and may wait in its own queue), so a request with a fallback can
     /// take up to about 2x timeout_s plus queue time.
     pub fallback: Option<String>,
+    /// search | inventory | write-tests | write-code | decisions. Required when the resolved
+    /// backend and model have a registry row (then the run is a dispatch: own worktree, gated
+    /// tools, diff check, logged job); ignored for unregistered backends.
+    pub dimension: Option<String>,
+    /// global (default) | repo:<name> | module:<repo>/<path>; only used for registered models.
+    pub scope: Option<String>,
 }
 
 /// Parameters of `sidekick_steckbrief`.
@@ -117,6 +124,8 @@ pub struct SteckbriefParams {
     pub model: Option<String>,
     /// global (default) | repo:<name> | module:<repo>/<path>.
     pub scope: Option<String>,
+    /// true: full table with counters, limits, profile and benchmarks instead of the short delegation guide.
+    pub detail: Option<bool>,
 }
 
 /// Parameters of `sidekick_record_experience`.
@@ -125,13 +134,20 @@ pub struct RecordParams {
     pub model_id: Option<String>,
     pub backend: Option<String>,
     pub model: Option<String>,
-    /// search | inventory | write-tests | write-code | decisions.
-    pub dimension: String,
-    /// accepted | rejected | aborted | note | seed. `blocked` is written by the sidekick only.
-    /// seed sets the trust value directly: only for search and inventory, needs `seed_value`.
+    /// search | inventory | write-tests | write-code | decisions. Required without `job_id` (not for reset).
+    pub dimension: Option<String>,
+    /// With `job_id`: accepted | rejected. Otherwise accepted | rejected | aborted | note | seed.
+    /// `blocked` is written by the sidekick only. reset (no job_id; dimension and scope are
+    /// ignored; only for data_name prefixes whose owner is listed in peers.toml) starts the
+    /// model's trust over except for earlier blocks. seed sets the trust value directly: only for
+    /// search and inventory, needs `seed_value`.
     pub outcome: String,
     /// global (default) | repo:<name> | module:<repo>/<path>.
     pub scope: Option<String>,
+    /// The verdict path: id of a job returned by sidekick_dispatch (or sidekick_run on a
+    /// registered backend). Model, dimension, scope, repo, steps and duration are taken from
+    /// that job's logged event and review_s is measured; only outcome (accepted | rejected),
+    /// conclusion and visibility are yours. One verdict per job, none for blocked jobs.
     pub job_id: Option<String>,
     pub steps: Option<i64>,
     pub duration_s: Option<f64>,
@@ -140,6 +156,7 @@ pub struct RecordParams {
     /// 0..1, only for outcome seed.
     pub seed_value: Option<f64>,
     pub summary: Option<String>,
+    /// Required and non-empty for outcome rejected: the formulation rule for next time.
     pub conclusion: Option<String>,
     /// private (default; summary and conclusion never leave this machine) | shared.
     pub visibility: Option<String>,
@@ -622,6 +639,7 @@ struct BackendInfo {
     #[serde(rename = "type")]
     kind: &'static str,
     description: String,
+    account: Option<String>,
     cost: &'static str,
     default: bool,
     /// Allowlist of models (`null`: claude-* accepts any model, a command backend without
@@ -994,7 +1012,7 @@ struct State {
     shutdown: CancellationToken,
     /// Backend name -> end of its rate-limit cooldown.
     cooldowns: std::sync::Mutex<CooldownMap>,
-    data: std::sync::OnceLock<Arc<DataStore>>,
+    data: tokio::sync::OnceCell<Arc<DataStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1041,6 +1059,14 @@ fn redact_with(secrets: &[Secrets], text: &str) -> String {
     out
 }
 
+fn push_note(id: &str, pushed: bool, visibility: Visibility) -> String {
+    let sent = match visibility {
+        Visibility::Private => "pushed (Zahlen; summary/conclusion lokal)",
+        Visibility::Shared => "pushed (Zahlen und Texte)",
+    };
+    format!("recorded event {id}; {}", if pushed { sent } else { "not pushed (offline, rejected or data_name not set); sidekick_sync retries" })
+}
+
 fn format_dispatch(r: &DispatchResult) -> String {
     let mut s = format!(
         "status: {:?}\nmodel_id: {}\nwrite_right: {}\nwrite_tools_withheld: {}\nsperre: {}\nduration_s: {:.1}\nexit_code: {:?}\nlog: {}\n",
@@ -1055,6 +1081,10 @@ fn format_dispatch(r: &DispatchResult) -> String {
     opt(&mut s, "branch", r.branch.clone());
     opt(&mut s, "patch", r.patch_path.as_ref().map(|p| p.display().to_string()));
     opt(&mut s, "block_reason", r.block_reason.clone());
+    opt(&mut s, "reason", r.reason.clone());
+    if r.proposal_mode {
+        s.push_str("mode: Vorschlagsmodus (no write right; the proposed diff was applied only in the job worktree)\n");
+    }
     opt(&mut s, "evidence_hash", r.evidence_hash.clone());
     opt(&mut s, "event_id", r.event_id.clone());
     let _ = writeln!(s, "applied: {}\ndiff_discarded: {}", r.applied, r.diff_discarded);
@@ -1097,7 +1127,7 @@ impl SidekickServer {
                 per_backend: std::sync::Mutex::default(),
                 shutdown: CancellationToken::new(),
                 cooldowns: std::sync::Mutex::default(),
-                data: std::sync::OnceLock::new(),
+                data: tokio::sync::OnceCell::new(),
             }),
         }
     }
@@ -1127,7 +1157,12 @@ impl SidekickServer {
     /// description and cost) and `model` one of that backend's models (validated against its
     /// allowlist), `fallback` names a backend to use if the chosen one is unreachable, lacks credentials,
     /// fails to start or exits with an error (not after a timeout; the fallback gets its own
-    /// timeout_s, so the request can take up to about 2x timeout_s). The agent runs in `cwd`
+    /// timeout_s, so the request can take up to about 2x timeout_s). If the resolved backend and
+    /// model are registered (have a Steckbrief), `dimension` is required and the run is a
+    /// dispatch (see sidekick_dispatch); a registered `fallback` runs as a dispatch with the same
+    /// `dimension` too, and the request is rejected without `dimension`; a model that is not
+    /// registered on a backend that has registered models is rejected; other backends run as before without
+    /// any trust effect. The agent runs in `cwd`
     /// with the given limits and cannot see this conversation, so the prompt must be
     /// self-contained. Runs beyond the concurrency limits wait in a queue. Returns which
     /// backend ran, the exit code, the path of the full log file, the duration and the last
@@ -1162,7 +1197,7 @@ impl SidekickServer {
         };
         let home = crate::paths::home_dir().ok();
         let (backend_param, fallback_param) = (params.backend.clone(), params.fallback.clone());
-        let req = match resolve_request(params, &snap.config, &base_dir, home.as_deref()) {
+        let req = match resolve_request(params.clone(), &snap.config, &base_dir, home.as_deref()) {
             Ok(r) => r,
             Err(msg) => return tool_error_with(&snap, msg),
         };
@@ -1177,6 +1212,59 @@ impl SidekickServer {
         // A model the primary does not offer is an invalid parameter: no run, no fallback.
         if let Err(msg) = primary.effective_model(req.model.as_deref()) {
             return tool_error_with(&snap, msg);
+        }
+        let caller = backends::caller_account();
+        if let Err(msg) = primary.account_guard(caller.as_deref()) {
+            return tool_error_with(&snap, msg);
+        }
+        if let Some(Err(msg)) = fallback.map(|fb| fb.account_guard(caller.as_deref())) {
+            return tool_error_with(&snap, format!("fallback: {msg}"));
+        }
+        let dimension = params.dimension.clone().filter(|d| !d.trim().is_empty());
+        let dispatch_params = |backend: &Backend, model: Option<String>, dimension: String| DispatchParams {
+            prompt: params.prompt.clone(),
+            cwd: params.cwd.clone(),
+            dimension,
+            scope: params.scope.clone(),
+            backend: Some(backend.name.clone()),
+            model,
+            max_turns: params.max_turns,
+            timeout_s: params.timeout_s,
+            ..Default::default()
+        };
+        let needs_dimension = |backend: &Backend| {
+            format!(
+                "backend {} with this model is registered (has a Steckbrief), so sidekick_run needs `dimension` \
+                 (search | inventory | write-tests | write-code | decisions) and optionally `scope`; the run goes through \
+                 the dispatch path (worktree, gated tools, diff check, logged job)",
+                backend.name
+            )
+        };
+        match self.registry_gate(&snap, primary, req.model.as_deref()).await {
+            Err(msg) => return tool_error_with(&snap, msg),
+            Ok(true) => {
+                let Some(dimension) = dimension else { return tool_error_with(&snap, needs_dimension(primary)) };
+                return self.sidekick_dispatch(Parameters(dispatch_params(primary, params.model.clone(), dimension)), ctx).await;
+            }
+            Ok(false) => {}
+        }
+        let fallback_dispatch = match fallback {
+            None => None,
+            Some(fb) => {
+                let fb_model = fallback_request(fb, &req).0.model;
+                match self.registry_gate(&snap, fb, fb_model.as_deref()).await {
+                    Err(msg) => return tool_error_with(&snap, format!("fallback: {msg}")),
+                    Ok(false) => None,
+                    Ok(true) => match dimension {
+                        Some(dimension) => Some(dispatch_params(fb, fb_model, dimension)),
+                        None => return tool_error_with(&snap, format!("fallback: {}", needs_dimension(fb))),
+                    },
+                }
+            }
+        };
+        if let (Some(secs), Some(dp)) = (state.cooldown(&primary.name), &fallback_dispatch) {
+            tracing::info!(primary = %primary.name, secs, "primary rate limited; the registered fallback runs as dispatch");
+            return self.sidekick_dispatch(Parameters(dp.clone()), ctx).await;
         }
         let direct = match state.cooldown(&primary.name) {
             None => None,
@@ -1263,6 +1351,11 @@ impl SidekickServer {
                             true,
                         ),
                     }
+                }
+                (first, Some(fb)) if fallback_eligible(&first) && fallback_dispatch.is_some() => {
+                    tracing::warn!(primary = %primary.name, fallback = %fb.name, "primary backend failed; the registered fallback runs as dispatch");
+                    drop(ticker);
+                    return self.sidekick_dispatch(Parameters(fallback_dispatch.clone().expect("checked above")), ctx).await;
                 }
                 (first, Some(fb)) if fallback_eligible(&first) => {
                     let why = match &first {
@@ -1397,9 +1490,12 @@ impl SidekickServer {
         Ok(text_result(redact_all(&text), false))
     }
 
-    /// Steckbrief (profile) of a model: registry data, harness limits not enforced, trust per
+    /// Short Steckbrief (about 6 lines, German) of a model as delegation guide: role, what it is
+    /// good for, how to word the task, what not to give it, lessons from earlier rejections and
+    /// blocks. Read this before choosing what to delegate and how to phrase the task. With
+    /// detail=true the full table: registry data, harness limits not enforced, trust per
     /// dimension and scope with counters, last block, review share, write and decisions right,
-    /// cost balance and the newest conclusions. Read this before choosing what to delegate.
+    /// cost balance, newest conclusions, profile and benchmarks.
     #[tool]
     async fn sidekick_steckbrief(
         &self,
@@ -1419,13 +1515,22 @@ impl SidekickServer {
             Err(e) => return tool_error_with(&snap, e),
         };
         let now = chrono::Utc::now().timestamp_millis();
+        let detail = p.detail.unwrap_or(false);
+        let label = backend.as_ref().map(|b| match &b.account {
+            Some(a) => format!("{}, {a}", b.name),
+            None => b.name.clone(),
+        });
         let built = blocking(move || {
-            store.data.steckbrief(&id, &scope, Some(&store.local_root), now).map(|s| s.render()).map_err(|e| format!("{e:#}"))
+            store
+                .data
+                .steckbrief(&id, &scope, Some(&store.local_root), now)
+                .map(|s| if detail { s.render() } else { s.render_short(label.as_deref()) })
+                .map_err(|e| format!("{e:#}"))
         })
         .await;
         match built {
             Ok(Ok(mut text)) => {
-                if let Some(b) = backend {
+                if let Some(b) = backend.filter(|_| detail) {
                     let unsupported = dispatch::unsupported_limits(&b);
                     if !unsupported.is_empty() {
                         let _ = write!(text, "\nharness limits not enforced: {}", unsupported.join(", "));
@@ -1439,7 +1544,8 @@ impl SidekickServer {
 
     /// Write one experience event about a delegated job: outcome accepted | rejected | aborted |
     /// note | seed, with review_s (your review time), conclusion and visibility (private by
-    /// default). Trust is computed from these events; seed (search/inventory only) sets a value
+    /// default). Outcome rejected REQUIRES a non-empty conclusion phrased as a formulation rule
+    /// for next time (what the task must say); it shows up in the Steckbrief under "Aus Fehlern". Trust is computed from these events; seed (search/inventory only) sets a value
     /// directly. Pushes the event to the shared data repository when data_name is configured.
     #[tool]
     async fn sidekick_record_experience(
@@ -1451,14 +1557,36 @@ impl SidekickServer {
             Ok(s) => s,
             Err(e) => return tool_error(e),
         };
+        if let Some(job_id) = p.job_id.clone().filter(|j| !j.trim().is_empty()) {
+            let verdict = (|| -> anyhow::Result<(Outcome, Visibility)> {
+                Ok((Outcome::parse(&p.outcome)?, p.visibility.as_deref().map(Visibility::parse).transpose()?.unwrap_or(Visibility::Private)))
+            })();
+            let (outcome, visibility) = match verdict {
+                Ok(v) => v,
+                Err(e) => return tool_error(format!("{e:#}")),
+            };
+            let conclusion = p.conclusion;
+            return match blocking(move || store.record_verdict(job_id.trim(), outcome, conclusion, visibility).map_err(|e| format!("{e:#}"))).await {
+                Ok(Ok((id, pushed))) => Ok(text_result(push_note(&id, pushed, visibility), false)),
+                Ok(Err(e)) | Err(e) => tool_error(e),
+            };
+        }
         let (model_id, _) = match Self::model_id_for(&snap, p.model_id, p.backend.as_deref(), p.model.as_deref()) {
             Ok(v) => v,
             Err(e) => return tool_error_with(&snap, e),
         };
+        let visibility = match p.visibility.as_deref().map(Visibility::parse).transpose() {
+            Ok(v) => v.unwrap_or(Visibility::Private),
+            Err(e) => return tool_error(format!("{e:#}")),
+        };
         let input = (|| -> anyhow::Result<ExperienceInput> {
             Ok(ExperienceInput {
                 model_id,
-                dimension: Dimension::parse(&p.dimension)?,
+                dimension: match (p.dimension.as_deref(), p.outcome.as_str()) {
+                    (Some(d), _) => Dimension::parse(d)?,
+                    (None, "reset") => Dimension::Search,
+                    (None, _) => anyhow::bail!("dimension is required without job_id"),
+                },
                 scope: p.scope.as_deref().map(Scope::parse).transpose()?.unwrap_or(Scope::Global),
                 outcome: Outcome::parse(&p.outcome)?,
                 job_id: p.job_id,
@@ -1468,7 +1596,7 @@ impl SidekickServer {
                 seed_value: p.seed_value,
                 summary: p.summary,
                 conclusion: p.conclusion,
-                visibility: p.visibility.as_deref().map(Visibility::parse).transpose()?.unwrap_or(Visibility::Private),
+                visibility,
             })
         })();
         let input = match input {
@@ -1476,10 +1604,7 @@ impl SidekickServer {
             Err(e) => return tool_error(format!("{e:#}")),
         };
         match blocking(move || store.record(input).map_err(|e| format!("{e:#}"))).await {
-            Ok(Ok((id, pushed))) => Ok(text_result(
-                format!("recorded event {id}; {}", if pushed { "pushed" } else { "not pushed (offline, rejected or data_name not set); sidekick_sync retries" }),
-                false,
-            )),
+            Ok(Ok((id, pushed))) => Ok(text_result(push_note(&id, pushed, visibility), false)),
             Ok(Err(e)) | Err(e) => tool_error(e),
         }
     }
@@ -1566,6 +1691,9 @@ impl SidekickServer {
         if let Err(msg) = backend.effective_model(req.model.as_deref()) {
             return tool_error_with(&snap, msg);
         }
+        if let Err(msg) = backend.account_guard(backends::caller_account().as_deref()) {
+            return tool_error_with(&snap, msg);
+        }
         if let Some(secs) = state.cooldown(&backend.name) {
             return tool_error_with(&snap, format!("backend {} is rate limited, retry in {secs}s; choose another backend", backend.name));
         }
@@ -1630,7 +1758,7 @@ impl SidekickServer {
                 }
             }
         }
-        Ok(text_result(redact_all(&text), result.status == dispatch::Status::Blocked))
+        Ok(text_result(redact_all(&text), matches!(result.status, dispatch::Status::Blocked | dispatch::Status::Failed)))
     }
 }
 
@@ -1676,16 +1804,37 @@ impl SidekickServer {
     }
 
     async fn store(&self, snap: &Snapshot) -> Result<Arc<DataStore>, String> {
-        if let Some(s) = self.state.data.get() {
-            return Ok(s.clone());
+        self.state
+            .data
+            .get_or_try_init(|| async {
+                let base = crate::paths::data_dir().map_err(|e| format!("{e:#}"))?;
+                let (repo, name) = (snap.config.data_repo.clone(), snap.config.data_name.clone());
+                blocking(move || {
+                    DataStore::open(&base, &repo, name.as_deref()).map(Arc::new).map_err(|e| format!("data store: {e:#}"))
+                })
+                .await?
+            })
+            .await
+            .cloned()
+    }
+
+    async fn registry_gate(&self, snap: &Snapshot, backend: &Backend, model: Option<&str>) -> Result<bool, String> {
+        let model = backend.effective_model(model)?;
+        let store = self.store(snap).await?;
+        let rows = store.data.models().map_err(|e| format!("registry cannot be read: {e:#}"))?;
+        let id = Identity::default().key(backend, model.as_deref()).model_id();
+        if rows.iter().any(|r| r.model_id() == id) {
+            return Ok(true);
         }
-        let base = crate::paths::data_dir().map_err(|e| format!("{e:#}"))?;
-        let (repo, name) = (snap.config.data_repo.clone(), snap.config.data_name.clone());
-        let opened = blocking(move || {
-            DataStore::open(&base, &repo, name.as_deref()).map(Arc::new).map_err(|e| format!("data store: {e:#}"))
-        })
-        .await??;
-        Ok(self.state.data.get_or_init(|| opened).clone())
+        if rows.iter().any(|r| dispatch::same_registry_scope(backend, &r.key)) {
+            return Err(format!(
+                "backend {} has registered models, but `{}` is not one of them (model_id {id}); it would run without gating. \
+                 Register it or choose a registered model (see sidekick_steckbrief)",
+                backend.name,
+                model.as_deref().unwrap_or("default")
+            ));
+        }
+        Ok(false)
     }
 
     fn model_id_for(
@@ -1909,6 +2058,7 @@ impl SidekickServer {
                 name: b.name.clone(),
                 kind: b.backend_type().as_str(),
                 description: b.description.clone(),
+                account: b.account.clone(),
                 cost: b.cost.as_str(),
                 default: b.is_default,
                 models: b.models.clone(),
@@ -2753,6 +2903,7 @@ mod tests {
         Backend {
             name: name.to_owned(),
             description: format!("{name} backend"),
+            account: None,
             cost: backends::Cost::Free,
             is_default,
             max_concurrent: None,

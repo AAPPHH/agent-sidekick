@@ -403,6 +403,7 @@ pub fn run(args: SetupArgs) -> Result<ExitCode> {
 
     for step in &steps {
         run_step(step, &backends, args.token_stdin, single)?;
+        ask_account(step_name(step), &backends, args.token_stdin, single)?;
     }
 
     if single {
@@ -639,6 +640,69 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool, single: bool) -
                 None => println!("Backend `{name}` (command): nothing to store."),
             }
         }
+    }
+    Ok(())
+}
+
+fn account_answer(input: &str, default: Option<&str>, required: bool) -> Result<Option<String>, String> {
+    let input = input.trim();
+    let value = if input.is_empty() { default.unwrap_or("") } else { input };
+    match value {
+        "" if required => Err("this backend is bound to an account: enter its e-mail address".to_owned()),
+        "" => Ok(None),
+        v if v.contains('@') && !v.contains(char::is_whitespace) => Ok(Some(v.to_owned())),
+        _ => Err("not an e-mail address".to_owned()),
+    }
+}
+
+pub(crate) fn store_account(config: &Path, name: &str, email: &str) -> Result<()> {
+    let text = std::fs::read_to_string(config).with_context(|| format!("reading {}", config.display()))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("parsing {}", config.display()))?;
+    let table = doc
+        .get_mut("backends")
+        .and_then(|b| b.as_table_like_mut())
+        .and_then(|b| b.get_mut(name))
+        .and_then(|b| b.as_table_like_mut())
+        .ok_or_else(|| anyhow!("no [backends.{name}] section in {}", config.display()))?;
+    table.insert("account", toml_edit::value(email));
+    std::fs::write(config, doc.to_string()).with_context(|| format!("writing {}", config.display()))
+}
+
+fn ask_account(name: &str, backends: &Backends, token_stdin: bool, single: bool) -> Result<()> {
+    let Some(backend) = backends.get(name).filter(|b| !b.implicit) else {
+        return Ok(());
+    };
+    let bound = backend.account_bound();
+    if !(single || (bound && backend.account.is_none())) {
+        return Ok(());
+    }
+    if token_stdin || !std::io::stdin().is_terminal() {
+        if bound && backend.account.is_none() {
+            println!(
+                "Backend `{name}` has no `account`; runs are refused until it is set (`{APP_NAME} setup --backend {name}` or `account = \"...\"` in config.toml)."
+            );
+        }
+        return Ok(());
+    }
+    let default = backend.account.clone().or_else(|| backends::detect_account(backend).ok());
+    let hint = match (&default, bound) {
+        (Some(d), _) => format!(" [{d}]"),
+        (None, true) => " (required)".to_owned(),
+        (None, false) => " (optional, Enter to skip)".to_owned(),
+    };
+    let email = loop {
+        print!("Account e-mail of backend `{name}`{hint}: ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).context("reading the account")?;
+        match account_answer(&line, default.as_deref(), bound) {
+            Ok(v) => break v,
+            Err(e) => println!("{e}"),
+        }
+    };
+    if let Some(email) = email.filter(|e| backend.account.as_deref() != Some(e)) {
+        store_account(&paths::config_file()?, name, &email)?;
+        println!("Account of backend `{name}` set to {email} in config.toml.");
     }
     Ok(())
 }
@@ -1086,6 +1150,32 @@ mod tests {
             no_wizard: a.no_wizard,
             codex: a.codex,
         }
+    }
+
+    #[test]
+    fn account_answers() {
+        assert_eq!(account_answer("", Some("a@x.com"), true), Ok(Some("a@x.com".to_owned())));
+        assert_eq!(account_answer(" b@x.com ", Some("a@x.com"), true), Ok(Some("b@x.com".to_owned())));
+        assert_eq!(account_answer("", None, false), Ok(None));
+        assert!(account_answer("", None, true).is_err());
+        assert!(account_answer("nope", None, false).is_err());
+    }
+
+    #[test]
+    fn account_is_written_into_the_backend_section_keeping_comments() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("config.toml");
+        std::fs::write(&f, "# top
+[backends.a]
+type = \"claude-oauth\"  # kept
+description = \"d\"\n[backends.b]\ndescription = \"e\"\n").unwrap();
+        store_account(&f, "a", "me@x.com").unwrap();
+        let t = std::fs::read_to_string(&f).unwrap();
+        assert!(t.contains("# top") && t.contains("# kept"), "{t}");
+        let v: toml::Value = toml::from_str(&t).unwrap();
+        assert_eq!(v["backends"]["a"]["account"].as_str(), Some("me@x.com"));
+        assert!(v["backends"]["b"].get("account").is_none());
+        assert!(store_account(&f, "zz", "me@x.com").is_err());
     }
 
     #[test]

@@ -29,6 +29,7 @@ fn backend(model: &str) -> Backend {
     Backend {
         name: "fake".into(),
         description: "t".into(),
+            account: None,
         cost: Cost::Free,
         is_default: false,
         max_concurrent: None,
@@ -106,6 +107,18 @@ fn env(model: &str, register: bool, accepted: usize, action: &str) -> Env {
     Env { dir, repo, dispatcher, log }
 }
 
+fn reports(model: &str) -> String {
+    format!("echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"modelUsage\":{{\"{model}\":{{\"inputTokens\":10,\"outputTokens\":5,\"costUSD\":0.5}},\"claude-haiku-5-5\":{{\"inputTokens\":1,\"outputTokens\":1,\"costUSD\":0.001}}}}}}'\n")
+}
+
+fn max_turns_report() -> String {
+    "echo '{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"errors\":[\"Reached maximum number of turns (5)\"]}'\nexit 1\n".into()
+}
+
+fn mentioning_report(text: &str) -> String {
+    format!("echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{text}\"}}'\n")
+}
+
 fn request(e: &Env, dimension: Dimension, job: &str) -> DispatchRequest {
     DispatchRequest {
         prompt: "do it".into(),
@@ -172,7 +185,11 @@ async fn write_code_clean_diff_returns_branch_and_patch() {
     assert!(r.patch_path.as_ref().unwrap().exists());
     assert!(!e.repo.join("src/b.rs").exists());
     assert!(branches(&e.repo).contains("sidekick/j4"));
-    assert!(e.log.events().is_empty());
+    assert_eq!(e.log.events().len(), 1);
+    let note = &e.log.events()[0];
+    assert_eq!(note.outcome, Outcome::Note);
+    assert_eq!((note.job_id.as_deref(), note.repo.as_deref(), note.model_id.as_str()), (Some("j4"), None, key("m-c").model_id().as_str()));
+    assert!(note.duration_s.is_some() && note.ts_ms > 0);
 }
 
 #[tokio::test]
@@ -215,7 +232,7 @@ async fn no_write_right_withholds_tools_and_discards_diff() {
 
 #[tokio::test]
 async fn gold_applies_directly_and_only_warns() {
-    let mut e = env("claude-opus-5-5", true, 0, "printf 'fn a() { let decided_by = 1; }\\n' > src/lib.rs\n");
+    let mut e = env("claude-opus-5-5", true, 0, &format!("printf 'fn a() {{ let decided_by = 1; }}\\n' > src/lib.rs\n{}", reports("claude-opus-5-5-20261001")));
     let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "j9").await;
     assert_eq!(r.status, Status::Completed);
     assert!(r.applied && r.branch.is_none());
@@ -223,12 +240,13 @@ async fn gold_applies_directly_and_only_warns() {
     assert!(r.violations.is_empty());
     assert_eq!(std::fs::read_to_string(e.repo.join("src/lib.rs")).unwrap(), "fn a() { let decided_by = 1; }\n");
     assert!(branches(&e.repo).is_empty());
-    assert!(e.log.events().is_empty());
+    assert_eq!(e.log.events().len(), 1);
+    assert_eq!(e.log.events()[0].outcome, Outcome::Note);
 }
 
 #[tokio::test]
 async fn step_limit_abort_is_a_result() {
-    let mut e = env("m-f", true, 40, "printf 'partial\\n' > src/p.rs\necho 'Error: Reached max turns (5)'\nexit 1\n");
+    let mut e = env("m-f", true, 40, &format!("printf 'partial\\n' > src/p.rs\n{}", max_turns_report()));
     let r = run(&mut e, "m-f", Dimension::WriteCode, "j10").await;
     assert_eq!(r.status, Status::Aborted);
     assert!(branches(&e.repo).is_empty());
@@ -270,7 +288,7 @@ async fn gold_apply_conflict_keeps_branch_and_patch() {
         "claude-opus-5-5",
         true,
         0,
-        "printf 'fn a() { new }\\n' > src/lib.rs\nprintf 'fn a() { other }\\n' > ../../../repo/src/lib.rs\n",
+        &format!("printf 'fn a() {{ new }}\\n' > src/lib.rs\nprintf 'fn a() {{ other }}\\n' > ../../../repo/src/lib.rs\n{}", reports("claude-opus-5-5")),
     );
     let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "j14").await;
     assert_eq!(r.status, Status::Completed);
@@ -302,13 +320,13 @@ async fn gold_key_on_foreign_endpoint_never_applies() {
 
 #[tokio::test]
 async fn max_turns_abort_cannot_launder_a_violation() {
-    let mut e = env("m-i", true, 40, "printf 'x\\n' > tests/new.rs\necho 'Error: Reached max turns (5)'\nexit 1\n");
+    let mut e = env("m-i", true, 40, &format!("printf 'x\\n' > tests/new.rs\n{}", max_turns_report()));
     let r = run(&mut e, "m-i", Dimension::WriteCode, "j16").await;
     assert_eq!(r.status, Status::Blocked);
     assert!(r.violations.iter().any(|v| v.contains("protected path tests/new.rs")));
     assert_eq!(e.log.events()[0].outcome, Outcome::Blocked);
 
-    let mut e = env("m-j", true, 0, "printf 'fn b() {}\\n' > src/b.rs\necho 'Reached max turns'\nexit 1\n");
+    let mut e = env("m-j", true, 0, &format!("printf 'fn b() {{}}\\n' > src/b.rs\n{}", max_turns_report()));
     let r = run(&mut e, "m-j", Dimension::WriteCode, "j17").await;
     assert_eq!(r.status, Status::Blocked);
     assert!(r.diff_discarded);
@@ -332,4 +350,207 @@ async fn term_moved_between_non_ascii_files_is_a_removal() {
     let r = run(&mut e, "m-l", Dimension::WriteCode, "j19").await;
     assert_eq!(r.status, Status::Blocked);
     assert!(r.violations.iter().any(|v| v.contains("removed protected term `assert` in src/\u{e4}.rs")), "{:?}", r.violations);
+}
+
+fn proposal(body: &str) -> String {
+    format!("cat <<'PATCHEOF'\nI propose this.\n<<<SIDEKICK-PATCH\n{body}SIDEKICK-PATCH>>>\nPATCHEOF\n")
+}
+
+const NEW_FILE: &str = "diff --git a/src/b.rs b/src/b.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/b.rs\n@@ -0,0 +1 @@\n+fn b() {}\n";
+const NEW_TEST: &str = "diff --git a/tests/new.rs b/tests/new.rs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/new.rs\n@@ -0,0 +1 @@\n+fn t() {}\n";
+const DROP_ASSERT: &str = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn a() { assert!(x); let decided_by = 1; }\n+fn a() { let decided_by = 1; }\n";
+
+#[tokio::test]
+async fn proposal_mode_returns_patch_without_applying_to_the_target() {
+    let mut e = env("m-p1", true, 0, &proposal(NEW_FILE));
+    let r = run(&mut e, "m-p1", Dimension::WriteCode, "p1").await;
+    assert!(!r.write_right && r.write_tools_withheld && r.proposal_mode);
+    assert_eq!(r.status, Status::Completed);
+    assert!(!r.applied);
+    assert_eq!(r.branch.as_deref(), Some("sidekick/p1"));
+    assert!(std::fs::read_to_string(r.patch_path.as_ref().unwrap()).unwrap().contains("+fn b() {}"));
+    assert!(!e.repo.join("src/b.rs").exists());
+    assert_eq!(e.log.events().len(), 1);
+    assert_eq!(e.log.events()[0].outcome, Outcome::Note);
+    let args = std::fs::read_to_string(e.dir.path().join("args.txt")).unwrap();
+    assert!(args.contains("<<<SIDEKICK-PATCH"));
+    assert!(args.lines().any(|l| l == "--disallowedTools"));
+}
+
+#[tokio::test]
+async fn proposal_touching_protected_paths_or_terms_is_blocked() {
+    let mut e = env("m-p2", true, 0, &proposal(NEW_TEST));
+    let r = run(&mut e, "m-p2", Dimension::WriteCode, "p2").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.violations.iter().any(|v| v.contains("protected path tests/new.rs")));
+    assert!(r.branch.is_none() && branches(&e.repo).is_empty());
+    assert_eq!(e.log.events()[0].outcome, Outcome::Blocked);
+
+    let mut e = env("m-p2", true, 0, &proposal(DROP_ASSERT));
+    let r = run(&mut e, "m-p2", Dimension::WriteCode, "p3").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.violations.iter().any(|v| v.contains("removed protected term `assert`")));
+    assert_eq!(std::fs::read_to_string(e.repo.join("src/lib.rs")).unwrap(), SRC);
+}
+
+#[tokio::test]
+async fn proposal_garbage_is_no_patch_without_trust_change() {
+    for (i, action) in ["echo 'no patch here'\n".to_string(), proposal("this is not a diff\n"), proposal("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-nope\n+nope2\n")]
+        .iter()
+        .enumerate()
+    {
+        let mut e = env("m-p4", true, 0, action);
+        let r = run(&mut e, "m-p4", Dimension::WriteCode, &format!("g{i}")).await;
+        assert_eq!(r.status, Status::NoPatch, "{i}");
+        assert!(r.reason.is_some() && r.branch.is_none());
+        assert!(branches(&e.repo).is_empty());
+        assert_eq!(e.log.events().len(), 1);
+        assert_eq!(e.log.events()[0].outcome, Outcome::Note);
+    }
+}
+
+#[tokio::test]
+async fn real_diff_without_write_right_stays_blocked_in_proposal_mode() {
+    let mut e = env("m-p5", true, 0, &format!("printf 'fn b() {{}}\\n' > src/b.rs\n{}", proposal(NEW_FILE)));
+    let r = run(&mut e, "m-p5", Dimension::WriteCode, "p5").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.diff_discarded);
+}
+
+const GOLD_EDIT: &str = "printf 'fn b() {}\\n' > src/b.rs\n";
+
+#[tokio::test]
+async fn gold_with_the_wrong_model_is_returned_as_branch() {
+    let mut e = env("claude-opus-5-5", true, 0, &format!("{GOLD_EDIT}{}", reports("claude-sonnet-5-5")));
+    let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "g1").await;
+    assert_eq!(r.status, Status::Completed);
+    assert!(!r.applied && r.branch.as_deref() == Some("sidekick/g1"));
+    assert!(r.warnings.iter().any(|w| w.contains("model mismatch") && w.contains("claude-sonnet-5-5")), "{:?}", r.warnings);
+    assert!(!e.repo.join("src/b.rs").exists());
+    assert_eq!(r.tail, "done");
+}
+
+#[tokio::test]
+async fn gold_without_a_reported_model_is_unverified_and_not_applied() {
+    let mut e = env("claude-opus-5-5", true, 0, GOLD_EDIT);
+    let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "g2").await;
+    assert!(!r.applied && r.branch.is_some());
+    assert!(r.warnings.iter().any(|w| w.contains("model unverified")), "{:?}", r.warnings);
+    assert!(!e.repo.join("src/b.rs").exists());
+}
+
+#[tokio::test]
+async fn gold_unverified_still_enforces_protected_paths() {
+    let mut e = env("claude-opus-5-5", true, 0, "printf 'x\\n' > tests/new.rs\n");
+    let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "g3").await;
+    assert_eq!(r.status, Status::Blocked);
+}
+
+#[tokio::test]
+async fn aliases_resolve_to_registry_ids_and_the_cli_gets_the_full_id() {
+    let mut e = env("claude-opus-5-5", true, 0, &format!("{GOLD_EDIT}{}", reports("claude-opus-5-5")));
+    let r = run(&mut e, "opus", Dimension::WriteCode, "g4").await;
+    assert_eq!(r.model_id, key("claude-opus-5-5").model_id());
+    assert!(r.applied, "{:?}", r.warnings);
+    let args = std::fs::read_to_string(e.dir.path().join("args.txt")).unwrap();
+    let lines: Vec<&str> = args.lines().collect();
+    let at = lines.iter().position(|l| *l == "--model").unwrap();
+    assert_eq!(lines[at + 1], "claude-opus-5-5");
+    assert!(lines.windows(2).any(|w| w == ["--output-format", "json"]));
+    assert_eq!(lines[lines.len() - 2], "--");
+}
+
+#[test]
+fn alias_table_and_default_model_resolution() {
+    use agent_sidekick::dispatch::resolve_claude_alias;
+    for (a, id) in [("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5-5"), ("haiku", "claude-haiku-5-5"), ("fable", "claude-fable-5-1")] {
+        assert_eq!(resolve_claude_alias(a), id);
+        assert_eq!(key(a).model, id);
+        assert_eq!(key(id).model_id(), key(a).model_id());
+    }
+    assert_eq!(resolve_claude_alias("claude-opus-5-5-20261001"), "claude-opus-5-5-20261001");
+    for variant in ["Claude-Sonnet-5-5", "claude-sonnet-5-5-20260901", "sonnet[1m]", "claude-sonnet-5-5-20260901[1m]", " SONNET ", "Sonnet"] {
+        assert_eq!(key(variant).model_id(), key("claude-sonnet-5-5").model_id(), "{variant}");
+    }
+    assert_ne!(key("claude-sonnet-5-5-evil").model_id(), key("claude-sonnet-5-5").model_id());
+    let mut b = backend("opus");
+    b.model = Some("sonnet".into());
+    assert_eq!(Identity::default().key(&b, None).model, "claude-sonnet-5-5");
+    b.model = None;
+    assert_eq!(Identity::default().key(&b, None).model, "default");
+    assert!(Identity::default().key(&backend("opus"), Some("opus")).is_gold());
+}
+
+#[tokio::test]
+async fn worker_text_mentioning_the_max_turns_token_is_not_an_abort() {
+    let mut e = env("m-t1", true, 40, &format!("printf 'fn b() {{}}\\n' > src/b.rs\n{}", mentioning_report("handled error_max_turns and reached max turns")));
+    let r = run(&mut e, "m-t1", Dimension::WriteCode, "t1").await;
+    assert_eq!(r.status, Status::Completed);
+    assert_eq!(r.branch.as_deref(), Some("sidekick/t1"));
+    assert_eq!(e.log.events()[0].outcome, Outcome::Note);
+    assert_eq!(e.log.events()[0].summary.as_deref(), Some("status: completed"));
+
+    let mut e = env("m-t1", true, 40, "echo 'error_max_turns, Reached max turns (5)'\nexit 1\n");
+    let r = run(&mut e, "m-t1", Dimension::WriteCode, "t2").await;
+    assert_eq!(r.status, Status::NoChange);
+}
+
+#[tokio::test]
+async fn proposal_with_a_violation_is_blocked_even_when_the_worker_text_claims_max_turns() {
+    let text = format!("<<<SIDEKICK-PATCH\n{DROP_ASSERT}SIDEKICK-PATCH>>>\nerror_max_turns");
+    let json = serde_json::json!({"type": "result", "subtype": "success", "is_error": false, "result": text}).to_string();
+    let mut e = env("m-t2", true, 0, &format!("cat <<'JSONEOF'\n{json}\nJSONEOF\n"));
+    let r = run(&mut e, "m-t2", Dimension::WriteCode, "t3").await;
+    assert_eq!(r.status, Status::Blocked, "{:?}", r.reason);
+    assert!(r.violations.iter().any(|v| v.contains("removed protected term `assert`")));
+    assert_eq!(e.log.events()[0].outcome, Outcome::Blocked);
+}
+
+#[tokio::test]
+async fn proposal_that_hits_the_turn_limit_is_still_checked_before_it_counts_as_aborted() {
+    let json = format!("{{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"result\":{}}}", serde_json::json!(format!("<<<SIDEKICK-PATCH\n{NEW_TEST}SIDEKICK-PATCH>>>")));
+    let mut e = env("m-t3", true, 0, &format!("cat <<'JSONEOF'\n{json}\nJSONEOF\n"));
+    let r = run(&mut e, "m-t3", Dimension::WriteCode, "t4").await;
+    assert_eq!(r.status, Status::Blocked);
+    let mut e = env("m-t3", true, 0, &max_turns_report());
+    let r = run(&mut e, "m-t3", Dimension::WriteCode, "t5").await;
+    assert_eq!(r.status, Status::Aborted);
+}
+
+#[tokio::test]
+async fn claude_error_result_is_a_failure_with_the_cli_message() {
+    let err = "echo '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"errors\":[\"API Error: 500\"]}'\nexit 1\n";
+    for (i, dim, accepted) in [(1, Dimension::WriteCode, 0), (2, Dimension::WriteCode, 40)] {
+        let mut e = env("m-t4", true, accepted, err);
+        let r = run(&mut e, "m-t4", dim, &format!("f{i}")).await;
+        assert_eq!(r.status, Status::Failed);
+        assert!(r.tail.contains("API Error: 500") && r.tail.contains("error_during_execution"), "{}", r.tail);
+        assert!(r.reason.as_deref().unwrap().contains("API Error: 500"));
+        assert!(r.event_id.is_none() && e.log.events().is_empty());
+        assert!(branches(&e.repo).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn dispatch_event_never_carries_the_checkout_directory_name() {
+    let mut e = env("m-t5", true, 40, "printf 'fn b() {}\\n' > src/b.rs\n");
+    run(&mut e, "m-t5", Dimension::WriteCode, "r1").await;
+    assert_eq!(e.log.events()[0].repo, None);
+    let mut req = request(&e, Dimension::WriteCode, "r2");
+    req.scope = Scope::Repo("named".into());
+    e.dispatcher.dispatch(&backend("m-t5"), &req, &mut e.log).await.unwrap();
+    assert_eq!(e.log.events()[1].repo.as_deref(), Some("named"));
+}
+
+#[tokio::test]
+async fn blocked_events_carry_a_mechanical_lesson_as_conclusion() {
+    let mut e = env("m-l1", true, 40, "printf 'fn a() { let decided_by = 1; }\\n' > src/lib.rs\n");
+    run(&mut e, "m-l1", Dimension::WriteCode, "jl1").await;
+    assert_eq!(e.log.events()[0].conclusion.as_deref(), Some("Begriff assert darf nicht entfernt werden – im Auftrag nennen"));
+    let mut e = env("m-l2", true, 40, "printf 'x\\n' > tests/new.rs\n");
+    run(&mut e, "m-l2", Dimension::WriteCode, "jl2").await;
+    assert_eq!(e.log.events()[0].conclusion.as_deref(), Some("geschützte Pfade im Auftrag nennen; Tests sind unveränderlich"));
+    let mut e = env("m-l3", true, 0, "printf 'fn b() {}\\n' > src/b.rs\n");
+    run(&mut e, "m-l3", Dimension::WriteCode, "jl3").await;
+    assert_eq!(e.log.events()[0].conclusion.as_deref(), Some("ohne Schreibrecht nur Vorschlag verlangen"));
 }

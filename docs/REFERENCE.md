@@ -128,6 +128,16 @@ agent-sidekick does no routing of its own, so write descriptions for that reader
 - An unknown backend name is a tool error that lists the configured names.
 - If `config.toml` cannot be parsed or validated, `sidekick_run` fails with a tool error that names the problem; it never silently falls back to the implicit backend. `sidekick_backends` and `sidekick_status` show the error too.
 
+### Account guard
+
+`account = "name@example.com"` (optional, not a secret) names the account a backend runs under. It is required for account-bound backends (claude-oauth, codex with `auth = "chatgpt"`; the implicit `claude` backend is exempt). Before every launch (`sidekick_run` incl. `fallback`, `sidekick_dispatch`) the account is compared, case-insensitively, with the caller's:
+
+- same account: refused with "gleiches Konto wie der Aufrufer" (no delegating to your own quota);
+- account-bound backend without `account`: refused with "Konto unbekannt – `account` in config.toml setzen";
+- caller account unknown: allowed.
+
+The caller's account is read from `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json` (`oauthAccount.emailAddress`), else from the Codex login (`$CODEX_HOME/auth.json` or `~/.codex/auth.json`, e-mail claim of the id token). `agent-sidekick setup [--backend X]` asks for the account after the key and writes it into config.toml. It is prefilled from the backend's config dir (`.claude.json`), the OAuth profile endpoint (works only for tokens with profile scope, not for `claude setup-token` tokens: HTTP 403) or the Codex login. `sidekick_backends` shows `account`.
+
 ### Fallback
 
 `sidekick_run` accepts `fallback`, the name of a second backend that is used when the primary one fails:
@@ -135,6 +145,7 @@ agent-sidekick does no routing of its own, so write descriptions for that reader
 - **Triggers:** the primary backend is not reachable (endpoint probe failed), its credential is missing, its executable is not found or cannot be started, or the primary run **exits with a non-zero exit code**, or (opencode) exits 0 **without an answer** (e.g. a permission was auto-rejected; the result shows `failed: no answer: ...`). A detected rate limit is a trigger too (see [Rate limits](#rate-limits-http-429)).
 - **Never** after a timeout or a cancellation, and not for invalid parameters (`prompt`, `cwd`, `max_turns`, ...).
 - **The primary may have changed files.** After a non-zero exit the primary agent did run; the result says so explicitly, with its exit code and log path. Only use a fallback for tasks that are safe to retry, and check `git status` afterwards.
+- **Registered fallback:** every attempted backend goes through the registry check. A fallback with a registry row runs as `sidekick_dispatch` with the caller's `dimension` (and `scope`); without `dimension` the request is rejected. It never takes the ungated path.
 - Single level: the fallback has no fallback of its own. `fallback` equal to `backend` is an error.
 - **A fallback from a `claude-oauth` backend to another `claude-oauth` backend is rejected** with an explanatory error: switching from one Claude account to another when the first one fails (for example because its usage limit is reached) would be account switching / rate-limit circumvention, which agent-sidekick does not do (see [Terms of use](#terms-of-use)).
 - The primary run's concurrency slots (per backend and global) are released before the fallback waits for its own.
@@ -420,7 +431,7 @@ No parameters. Returns a JSON object:
 ```
 
 - `config_error`: `null`, or the problem with `config.toml`. Then `backends` is empty and `sidekick_run` fails until the file is fixed.
-- Per backend: `name`, `type`, `description`, `cost`, `default`, `models` (the allowlist for `sidekick_run`'s `model`; `null`: a claude-* backend accepts any model, a command backend without `{model}` takes none), `default_model` (used when `model` is omitted; `null`: the account's/endpoint's default, or no model), `reachable`, `detail` (why it is or is not reachable), `max_concurrent` (`null` without a per-backend limit), `running` and `queued`.
+- Per backend: `name`, `type`, `description`, `account` (`null` when not set), `cost`, `default`, `models` (the allowlist for `sidekick_run`'s `model`; `null`: a claude-* backend accepts any model, a command backend without `{model}` takes none), `default_model` (used when `model` is omitted; `null`: the account's/endpoint's default, or no model), `reachable`, `detail` (why it is or is not reachable), `max_concurrent` (`null` without a per-backend limit), `running` and `queued`.
 - Pick the backend by `description` and `cost`, and the model from its `models`.
 
 It never contains secrets or environment values.
@@ -434,9 +445,10 @@ Without a `[backends]` section it also shows the global `default model` and the 
 
 Experience data lives in the separate private repository `data_repo` (default `AAPPHH/sidekick-data`; layout at the repo root: `models.parquet`, `protected.parquet`, `peers.toml`, `experiences/<name>/`, `aggregate/latest.parquet`). The sidekick keeps a full clone in `<config-dir>/data/checkout` (override: `AGENT_SIDEKICK_DATA_DIR`), never in a project worktree, and full local copies of its own session files in `<data>/local`. `secret` (HMAC key, never pushed), `machine_id` and a `pending` flag sit next to them.
 
-- `sidekick_steckbrief(model_id | backend[+model], scope?)`: rendered profile (registry, trust per dimension and scope, counters, last block, review share, write and decisions right, cost balance, newest conclusions).
-- `sidekick_dispatch(prompt, dimension, scope?, backend?, model?, cwd?, job_id?, max_turns?, timeout_s?, checkpoint?, quant?)`: job in its own git worktree, same queues and progress as `sidekick_run`. No write right: no write tools, any diff is a block. Diff checks: protected paths and terms, module path bound, file and line limits. Result as branch `sidekick/<job_id>` plus patch; applied only for the Gold model (provider `anthropic`, model `claude-opus-5-5`, harness `claude-code` and a `claude-oauth` backend; the provider is always derived from the backend, never from the caller; on a conflict branch and patch are kept). Blocked and aborted outcomes are recorded automatically.
-- `sidekick_record_experience(model_id | backend[+model], dimension, outcome, scope?, review_s?, conclusion?, visibility?, ...)`: outcome `accepted|rejected|aborted|note|seed`. `seed` only for search and inventory with `seed_value`. `visibility` defaults to `private`.
+- `sidekick_steckbrief(model_id | backend[+model], scope?, detail?)`: by default a short German delegation guide of five lines: `<model> (<backend>) – <role>`, `Gut für` (profile strengths and task_scope), `So formulieren` (mechanical from trust: decisions below 0.85 -> decide in the task; write below 0.50 -> demand a diff as proposal; 0.50-0.85 -> finished immutable test first, diff read fully; from 0.85 free writing with spot checks; Gold -> no review; plus profile `prompting`), `Nicht geben` (profile weaknesses, `nicht für <dimension>` below 0.30) and `Aus Fehlern` (newest three lessons of rejected and blocked events in the scope chain). With `detail=true` the full rendered profile (registry, trust per dimension and scope, counters, last block, review share, write and decisions right, cost balance, newest conclusions).
+- `sidekick_dispatch(prompt, dimension, scope?, backend?, model?, cwd?, job_id?, max_turns?, timeout_s?, checkpoint?, quant?)`: job in its own git worktree, same queues and progress as `sidekick_run`. No write right: no write tools (proposal mode: the prompt asks for one unified diff between `<<<SIDEKICK-PATCH` / `SIDEKICK-PATCH>>>`, which is checked with `git apply --check`, applied only in the job worktree and then diff-checked like any other; status `NoPatch` with a reason if there is none or it does not apply); a real diff from a job without write right is a block. Diff checks: protected paths and terms, module path bound, file and line limits. Result as branch `sidekick/<job_id>` plus patch; applied only for the Gold model (provider `anthropic`, model `claude-opus-5-5`, harness `claude-code` and a `claude-oauth` backend; the provider is always derived from the backend, never from the caller; on a conflict branch and patch are kept). Every dispatch logs one event for its `job_id` (`note`, `blocked` or `aborted`). `sidekick_run` on a registered backend and model takes `dimension` (required) and `scope` and runs exactly this path.
+- `sidekick_record_experience(job_id, outcome, conclusion?, visibility?)`: verdict on a dispatched job; `accepted|rejected` only, once per job, only for jobs with status Completed (not blocked, aborted, failed, NoChange or NoPatch); `rejected` requires a non-empty `conclusion` written as a formulation rule for next time; model, dimension and scope come from the job's logged event and `review_s` is measured (now minus the job's result time). The verdict row carries no duration or steps, so the cost balance counts each job once.
+- `sidekick_record_experience(model_id | backend[+model], dimension, outcome, scope?, review_s?, conclusion?, visibility?, ...)`: free-form path for seeds and notes; outcome `accepted|rejected|aborted|note|seed`; `rejected` needs a non-empty `conclusion` (formulation rule for next time). `seed` only for search and inventory with `seed_value`. `visibility` defaults to `private`.
 - `sidekick_query(sql)`: read-only SQL over `models`, `protected`, `experiences`.
 - `sidekick_sync()`: pull, then push pending commits.
 

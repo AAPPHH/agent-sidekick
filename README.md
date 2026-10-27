@@ -220,7 +220,7 @@ Seit Version 0.5.0 liest agent-sidekick die `config.toml` beim nächsten Aufruf 
 
 ### Vertrauen und Steckbriefe
 
-Neben `sidekick_run` gibt es `sidekick_steckbrief`, `sidekick_dispatch`, `sidekick_record_experience`, `sidekick_query` und `sidekick_sync`. Erfahrungsdaten liegen im privaten Repo `AAPPHH/sidekick-data`; `data_repo` (`owner/name`, volle Git-URL oder lokaler Pfad) und `data_name` in der `config.toml` legen Repo und Präfix fest (ohne `data_name` wird nichts gepusht). Nutzer- und Maschinen-IDs werden vor dem Push pseudonymisiert. Details: [docs/REFERENCE.md](docs/REFERENCE.md#trust-tools).
+Für registrierte Modelle läuft `sidekick_run` über den Dispatch-Pfad (dann mit `dimension`); Urteile gehen über `sidekick_record_experience` mit `job_id`. Neben `sidekick_run` gibt es `sidekick_steckbrief`, `sidekick_dispatch`, `sidekick_record_experience`, `sidekick_query` und `sidekick_sync`. Erfahrungsdaten liegen im privaten Repo `AAPPHH/sidekick-data`; `data_repo` (`owner/name`, volle Git-URL oder lokaler Pfad) und `data_name` in der `config.toml` legen Repo und Präfix fest (ohne `data_name` wird nichts gepusht). Nutzer- und Maschinen-IDs werden vor dem Push pseudonymisiert. Details: [docs/REFERENCE.md](docs/REFERENCE.md#trust-tools).
 
 ### Der KI:connect-Schlüssel ist abgelaufen
 

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::data::{DataDir, SessionLog};
-use crate::dispatch::{git, GIT_IDENT};
+use crate::dispatch::{git, status_summary, Status, GIT_IDENT};
 use crate::trust::{Dimension, Event, Outcome, Scope, Visibility};
 
 pub const BRANCH: &str = "main";
@@ -54,6 +54,13 @@ fn read_or_create(path: &Path, make: impl FnOnce() -> String) -> Result<String> 
     Ok(v)
 }
 
+fn add_remote(checkout: &Path, remote: &str) -> Result<()> {
+    git(checkout, &["remote", "add", REMOTE, remote]).map(|_| ()).or_else(|e| match git(checkout, &["remote", "get-url", REMOTE]) {
+        Ok(u) if u.trim() == remote => Ok(()),
+        _ => Err(e),
+    })
+}
+
 pub fn remote_url(repo: &str) -> String {
     let slug = repo.split_once('/').is_some_and(|(o, n)| {
         let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
@@ -66,8 +73,31 @@ pub fn remote_url(repo: &str) -> String {
     }
 }
 
+pub fn peers_check(table: &toml::Table) -> Result<()> {
+    let mut seen = std::collections::BTreeMap::new();
+    for key in table.keys() {
+        if let Some(other) = seen.insert(key.to_ascii_lowercase(), key) {
+            bail!("peers.toml: keys `{other}` and `{key}` differ only in case");
+        }
+    }
+    Ok(())
+}
+
+pub fn peers_owner(table: &toml::Table, prefix: &str) -> bool {
+    let owner = table.get(prefix).filter(|_| prefix != "owners").and_then(|v| v.as_str());
+    let owners = table.get("owners").and_then(|o| o.as_array());
+    peers_check(table).is_ok() && matches!((owner, owners), (Some(o), Some(a)) if a.iter().filter_map(|x| x.as_str()).any(|x| x.eq_ignore_ascii_case(o)))
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn require_rejection_rule(conclusion: &Option<String>) -> Result<()> {
+    if conclusion.as_deref().is_none_or(|c| c.trim().is_empty()) {
+        bail!("outcome rejected needs a non-empty `conclusion`: the formulation rule for next time (what the task must say so the result is accepted)");
+    }
+    Ok(())
 }
 
 impl DataStore {
@@ -89,9 +119,9 @@ impl DataStore {
         fs::create_dir_all(&local_root)?;
         if !checkout.join(".git").exists() {
             git(&checkout, &["init", "-q", "-b", BRANCH])?;
-            git(&checkout, &["remote", "add", REMOTE, remote])?;
+            add_remote(&checkout, remote)?;
         } else if git(&checkout, &["remote", "get-url", REMOTE]).map(|u| u.trim() != remote).unwrap_or(true) {
-            git(&checkout, &["remote", "set-url", REMOTE, remote]).or_else(|_| git(&checkout, &["remote", "add", REMOTE, remote]))?;
+            git(&checkout, &["remote", "set-url", REMOTE, remote]).map(|_| ()).or_else(|_| add_remote(&checkout, remote))?;
         }
         let secret = read_or_create(&base.join("secret"), || {
             format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
@@ -173,12 +203,17 @@ impl DataStore {
     }
 
     pub fn append(&self, event: Event) -> Result<(String, bool)> {
-        let id = event.event_id.clone();
-        let (shared, session) = {
+        self.append_checked(|_| Ok(event))
+    }
+
+    fn append_checked(&self, make: impl FnOnce(&[Event]) -> Result<Event>) -> Result<(String, bool)> {
+        let (id, shared, session) = {
             let mut log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let event = make(log.events())?;
+            let id = event.event_id.clone();
             log.append(event)?;
             let session = log.shared_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            (log.shared_path.clone(), session)
+            (id, log.shared_path.clone(), session)
         };
         if !self.push_enabled {
             return Ok((id, false));
@@ -187,6 +222,12 @@ impl DataStore {
         let rel = shared.strip_prefix(&self.checkout).map_err(|_| anyhow!("session file outside the checkout"))?;
         self.commit_own(rel, &format!("{COMMIT_PREFIX}{} {session} {id}", self.name))?;
         Ok((id, self.push_locked()))
+    }
+
+    pub fn is_owner(&self) -> bool {
+        let Ok(text) = fs::read_to_string(self.checkout.join("peers.toml")) else { return false };
+        let Ok(table) = text.parse::<toml::Table>() else { return false };
+        peers_owner(&table, &self.name)
     }
 
     pub fn record(&self, input: ExperienceInput) -> Result<(String, bool)> {
@@ -201,13 +242,25 @@ impl DataStore {
                     _ => bail!("seed needs seed_value between 0 and 1"),
                 }
             }
+            Outcome::Reset => {
+                if input.job_id.is_some() {
+                    bail!("reset takes no job_id");
+                }
+                if !self.is_owner() {
+                    bail!("reset is only allowed for owners listed in peers.toml (prefix `{}`)", self.name);
+                }
+            }
             _ => {}
+        }
+        if input.outcome == Outcome::Rejected {
+            require_rejection_rule(&input.conclusion)?;
         }
         if input.review_s.is_some_and(|v| v < 0.0) || input.duration_s.is_some_and(|v| v < 0.0) {
             bail!("review_s and duration_s must not be negative");
         }
         self.data.model(&input.model_id)?;
-        let mut e = Event::new(&input.model_id, input.dimension, input.scope, input.outcome, chrono::Utc::now().timestamp_millis());
+        let scope = if input.outcome == Outcome::Reset { Scope::Global } else { input.scope };
+        let mut e = Event::new(&input.model_id, input.dimension, scope, input.outcome, chrono::Utc::now().timestamp_millis());
         e.machine_id = self.machine_id.clone();
         e.user_id = self.user_id.clone();
         e.job_id = input.job_id;
@@ -219,6 +272,41 @@ impl DataStore {
         e.conclusion = input.conclusion;
         e.visibility = input.visibility;
         self.append(e)
+    }
+
+    pub fn record_verdict(&self, job_id: &str, outcome: Outcome, conclusion: Option<String>, visibility: Visibility) -> Result<(String, bool)> {
+        if !matches!(outcome, Outcome::Accepted | Outcome::Rejected) {
+            bail!("a verdict on a job is accepted or rejected");
+        }
+        if outcome == Outcome::Rejected {
+            require_rejection_rule(&conclusion)?;
+        }
+        self.append_checked(|events| {
+            let mine: Vec<&Event> = events.iter().filter(|e| e.job_id.as_deref() == Some(job_id)).collect();
+            if mine.iter().any(|e| e.outcome == Outcome::Blocked) {
+                bail!("job {job_id} was blocked; blocked jobs get no verdict");
+            }
+            if mine.iter().any(|e| matches!(e.outcome, Outcome::Accepted | Outcome::Rejected)) {
+                bail!("job {job_id} already has a verdict");
+            }
+            if mine.is_empty() {
+                bail!("unknown job_id {job_id} in the local log of this session");
+            }
+            let completed = status_summary(Status::Completed);
+            let base = mine
+                .into_iter()
+                .find(|e| e.outcome == Outcome::Note && e.summary.as_deref() == Some(completed.as_str()))
+                .ok_or_else(|| anyhow!("job {job_id} did not complete with a result; only completed jobs get a verdict"))?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut e = Event::new(&base.model_id, base.dimension, base.scope.clone(), outcome, now);
+            e.machine_id = self.machine_id.clone();
+            e.user_id = self.user_id.clone();
+            e.job_id = base.job_id.clone();
+            e.review_s = Some(((now - base.ts_ms).max(0) as f64) / 1000.0);
+            e.conclusion = conclusion;
+            e.visibility = visibility;
+            Ok(e)
+        })
     }
 
     pub fn sync(&self) -> Result<String> {
@@ -244,7 +332,7 @@ impl DataStore {
         let push = if ahead == 0 && !self.pending() {
             "nothing to push"
         } else if self.push_locked() {
-            "pushed"
+            "pushed (private summary/conclusion stay local)"
         } else {
             "push pending (offline or rejected)"
         };

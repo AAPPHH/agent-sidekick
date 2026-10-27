@@ -5,7 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-10-27
+
+### Added
+
+- Account guard (no self-dispatch): optional backend key `account` (e-mail, not a secret), required for account-bound backends (claude-oauth, codex with a ChatGPT login; the implicit `claude` backend is exempt). `sidekick_run` (primary and fallback) and `sidekick_dispatch` refuse a backend whose `account` equals the caller's (case-insensitive; "gleiches Konto wie der Aufrufer") and an account-bound backend without `account` ("Konto unbekannt"). The caller's account comes from `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json` (`oauthAccount.emailAddress`), else from the Codex login (`$CODEX_HOME/auth.json`, e-mail of the id token); unknown caller: allowed. `setup` and `setup --backend` ask for the account after the key (prefilled when detectable, required for account-bound backends) and write it into the backend's section of config.toml, comments kept. `backends test` shows the configured and, where possible, detected account. `sidekick_backends` lists `account`, the short Steckbrief names it in its model line. A long-lived token from `claude setup-token` cannot read the OAuth profile (HTTP 403), so a claude-oauth account is entered by hand unless the backend's config dir holds a login.
+- `sidekick_steckbrief` returns a short German delegation guide by default (role, "Gut für", "So formulieren", "Nicht geben", "Aus Fehlern"), derived mechanically from trust and the profile; the full table, counters and benchmarks need `detail=true`. New nullable profile column `prompting` (vendor formulation hints, shown under "So formulieren"; appended to models.parquet, validators must know it).
+- Outcome `rejected` requires a non-empty `conclusion` phrased as a formulation rule for next time (tool error otherwise). Blocked jobs store a mechanical lesson derived from the block reason as their conclusion; the newest three lessons (scope chain) appear under "Aus Fehlern", also in the shared view where private conclusion text is stripped.
+- Outcome `reset` (owners only, no job_id; `data validate` rejects it from other prefixes): trust of the model restarts from the start values at the reset time, only earlier blocked events are re-applied. The Steckbrief shows "zurückgesetzt am <date>". Files containing a reset row are written with schema_version 2, all other files stay version 1; this build reads 1 and 2. Older builds (0.7.x) reject version 2 files and the whole load fails, so release the binary used by the data workflows (validate, aggregate) before any reset row is pushed. The new models.parquet profile columns likewise need a validator that knows them.
+- Optional profile columns in models.parquet (strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of) and a Steckbrief section "Profil" that never influences trust. Old files without the columns still read and validate.
+- Job-bound verdicts: every `sidekick_dispatch` appends one event to the own session log (outcome `note`, or the blocked/aborted event) with job_id, model_id, dimension, scope, repo, duration and the time the result was returned. `sidekick_record_experience` takes `job_id`: model, dimension, scope, repo, steps and duration come from that event, `review_s` is measured, the caller supplies only `accepted|rejected`, `conclusion` and `visibility`. One verdict per job, none for blocked jobs. The free-form path stays for seeds and notes.
+- Proposal mode: write-tests and write-code jobs below the write threshold still get no write tools, but are asked for the complete change as one unified diff between `<<<SIDEKICK-PATCH` and `SIDEKICK-PATCH>>>`. The sidekick checks (`git apply --check`) and applies it only in the job worktree, runs the same mechanical diff check and returns branch and patch for review, never applied to the target. No or invalid patch gives the new status `NoPatch` with the reason and no trust change.
+
+### Changed
+
+- claude-oauth model aliases (opus, sonnet, haiku, fable) resolve to full ids for the model_id and the CLI call. Dispatch runs claude with `--output-format json`, compares the reported model with the expected id and warns on mismatch; Gold is applied only with a verified model, otherwise returned as branch/patch.
+- `sidekick_run` on a backend and model with a registry row requires `dimension` (optional `scope`) and runs the dispatch path. Unregistered backends run as before, without trust effect.
+- `record_experience` says what was pushed (numbers only for private events); `sidekick_sync` likewise. The Steckbrief shows the last block as a UTC date, never prints `-0s`, and marks missing write right as "nein (Vorschlagsmodus)" for write-code and write-tests.
+
+### Fixed
+
+- `sidekick_run` registry gate: every attempted backend is checked, including the fallback. A registered fallback runs as dispatch with the caller's `dimension` (rejected without one), never the ungated path. The store is opened (created) for the check and a store error is a tool error instead of a plain run. Claude model strings are normalised before hashing (case-fold, `-YYYYMMDD` and `[..]` suffixes, aliases); on a backend that has any registered model, an unregistered model string is rejected.
+- Dispatch abort detection (`error_max_turns`) comes from the parsed claude result only, never from substrings of worker or tool text; the text marker is gone. Proposals are always extracted and checked first, so a violation is blocked even when the run hit the turn limit.
+- Claude error results (`is_error`, not max turns) give the new status `Failed` with the CLI's `errors` and subtype as tail, are tool errors, log no event and are no longer reported as NoChange/NoPatch. Plain `sidekick_run` output of the claude harness is not normalised any more.
+- Verdicts: check and append run under one lock (no double verdict); only jobs whose note records `status: completed` (in the note's summary) get a verdict. Verdict rows carry `review_s` only, no duration or steps, and the Steckbrief counts each job's duration once.
+- Note, aborted and reset events no longer create a scope cell (counters only on existing cells), so they cannot freeze a value against later changes of a coarser scope.
+- Dispatch events no longer carry the checkout directory name as `repo`; `repo` comes from the scope only.
+- `peers.toml`: the prefix key must match exactly; keys that differ only in case are rejected.
 
 ## [0.7.1] - 2026-10-27
 

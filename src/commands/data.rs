@@ -155,6 +155,12 @@ impl Validator<'_> {
         Ok(out)
     }
 
+    fn reset_allowed(&self, rel: &str) -> bool {
+        let Some(prefix) = prefix_of(rel) else { return rel.starts_with("aggregate/") };
+        let text = std::fs::read_to_string(self.root.join(PEERS)).unwrap_or_default();
+        text.parse::<toml::Table>().is_ok_and(|t| crate::sync::peers_owner(&t, prefix))
+    }
+
     fn base_event_ids(&self, rev: &str) -> Result<Vec<(String, String)>> {
         let mut ids = Vec::new();
         let files = git_z(self.root, &["ls-tree", "-r", "--name-only", "-z", rev, "--", "experiences"])?;
@@ -164,7 +170,9 @@ impl Validator<'_> {
             if !blob.status.success() {
                 continue;
             }
-            let tmp = std::env::temp_dir().join(format!("sidekick-validate-{}-{n}.parquet", std::process::id()));
+            static TMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = std::env::temp_dir().join(format!("sidekick-validate-{}-{n}-{seq}.parquet", std::process::id()));
             std::fs::write(&tmp, &blob.stdout)?;
             let events = read_events(&tmp);
             let _ = std::fs::remove_file(&tmp);
@@ -182,6 +190,7 @@ impl Validator<'_> {
             git(self.root, &["show", &format!("{base}:{PEERS}")]).unwrap_or_default()
         };
         let table: toml::Table = text.parse().with_context(|| format!("parse {PEERS}"))?;
+        crate::sync::peers_check(&table)?;
         let owners = table
             .get("owners")
             .and_then(|o| o.as_array())
@@ -222,7 +231,8 @@ impl Validator<'_> {
         } else if name == "protected.parquet" {
             check_schema(full, ProtectedRow::schema()).and_then(|_| ProtectedRow::read_all(full).map(|_| Vec::new()))
         } else if name.starts_with("experiences/") || name.starts_with("aggregate/") {
-            check_schema(full, experience_schema()).and_then(|_| event_violations(full))
+            let reset_ok = self.reset_allowed(rel);
+            check_schema(full, experience_schema()).and_then(|_| event_violations(full, reset_ok))
         } else {
             Ok(Vec::new())
         };
@@ -237,13 +247,15 @@ impl Validator<'_> {
 fn check_schema(path: &Path, expected: SchemaRef) -> Result<()> {
     let found = read_schema(path)?;
     let sig = |s: &SchemaRef| s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
-    if sig(&found) != sig(&expected) {
+    let (found_sig, expected_sig) = (sig(&found), sig(&expected));
+    let appended_nullable = expected.fields().iter().skip(found_sig.len()).all(|f| f.is_nullable());
+    if found_sig.len() > expected_sig.len() || expected_sig[..found_sig.len()] != found_sig[..] || !appended_nullable {
         return Err(anyhow!("schema does not match the expected columns"));
     }
     Ok(())
 }
 
-fn event_violations(path: &Path) -> Result<Vec<String>> {
+fn event_violations(path: &Path, reset_ok: bool) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for e in read_events(path)? {
         let id = &e.event_id;
@@ -257,6 +269,9 @@ fn event_violations(path: &Path) -> Result<Vec<String>> {
         }
         if e.outcome == crate::trust::Outcome::Seed && !e.dimension.seedable() {
             out.push(format!("event {id}: seed for dimension {} (only search/inventory)", e.dimension));
+        }
+        if e.outcome == crate::trust::Outcome::Reset && !reset_ok {
+            out.push(format!("event {id}: reset row from a prefix whose owner is not listed in peers.toml owners"));
         }
     }
     Ok(out)
