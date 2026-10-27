@@ -971,6 +971,7 @@ pub struct Steckbrief {
     pub profile: Option<Profile>,
     pub effective: Vec<(Dimension, f64)>,
     pub lessons: Vec<String>,
+    pub proven: Vec<String>,
     pub questions: u32,
 }
 
@@ -1058,6 +1059,24 @@ impl Steckbrief {
                 lessons.push(t);
             }
         }
+        let mut proven: Vec<String> = Vec::new();
+        for c in own
+            .iter()
+            .filter(|e| e.outcome == Outcome::Accepted && chain.contains(&e.scope))
+            .filter_map(|e| {
+                e.conclusion
+                    .clone()
+                    .filter(|c| !c.trim().is_empty())
+                    .map(|c| (e.ts_ms, c))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .rev()
+        {
+            if proven.len() < 2 && !proven.contains(&c) {
+                proven.push(c);
+            }
+        }
         conclusions.truncate(NEWEST_CONCLUSIONS);
         Self {
             model: model.clone(),
@@ -1087,6 +1106,7 @@ impl Steckbrief {
                 .map(|d| (*d, standing.effective_trust(*d, scope)))
                 .collect(),
             lessons,
+            proven,
             questions: crate::ask::count_questions(events, &standing.model_id),
         }
     }
@@ -1202,7 +1222,15 @@ impl Steckbrief {
             }
         }
         how.extend(fit(part(&p.prompting), LINE_MAX));
-        let mut avoid: Vec<String> = part(&p.weaknesses);
+        let weak = part(&p.weaknesses);
+        let mut avoid: Vec<String> = weak
+            .iter()
+            .filter(|c| c.chars().filter(char::is_ascii_digit).count() < 3 && !c.contains('%'))
+            .cloned()
+            .collect();
+        if avoid.is_empty() {
+            avoid.extend(weak.into_iter().take(1));
+        }
         if !self.gold {
             avoid.extend(
                 Dimension::ALL
@@ -1211,24 +1239,33 @@ impl Steckbrief {
                     .map(|d| format!("nicht für {d}")),
             );
         }
+        let scope_clauses = part(&p.task_scope);
         let good: Vec<String> = fit(
-            [&p.strengths, &p.task_scope]
-                .into_iter()
-                .flat_map(part)
-                .collect(),
+            if scope_clauses.is_empty() {
+                part(&p.strengths)
+            } else {
+                scope_clauses
+            },
             LINE_MAX,
         );
-        let lessons = fit(self.lessons.clone(), LINE_MAX);
-        format!(
-            "{} ({}) – {}\nGut für: {}\nSo formulieren: {}\nNicht geben: {}\nAus Fehlern: {}\n",
+        let mut out = format!(
+            "{} ({}) – {}\nGut für: {}\nSo formulieren: {}\nNicht geben: {}\n",
             k.model,
             backend.unwrap_or(&k.provider),
             role,
             join(good),
             join(how),
-            join(fit(avoid, LINE_MAX)),
-            join(lessons)
-        )
+            join(fit(avoid, LINE_MAX))
+        );
+        for (label, items) in [("Bewährt", &self.proven), ("Aus Fehlern", &self.lessons)] {
+            if !items.is_empty() {
+                out.push_str(&format!(
+                    "{label}: {}\n",
+                    join(fit(items.clone(), LINE_MAX))
+                ));
+            }
+        }
+        out
     }
 
     pub fn render(&self) -> String {
@@ -1746,12 +1783,12 @@ mod tests {
     fn short_steckbrief_fresh_model_is_not_deactivated() {
         let text = short_for(&[], Some(profile()));
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 5, "{text}");
+        assert_eq!(lines.len(), 4, "{text}");
         assert!(
             lines[0].starts_with("qwen3-coder-next (dgx) – Vorschlagsgeber"),
             "{text}"
         );
-        assert_eq!(lines[1], "Gut für: stark; klein");
+        assert_eq!(lines[1], "Gut für: klein");
         assert!(
             lines[2].starts_with("So formulieren: search/inventory: "),
             "{text}"
@@ -1763,7 +1800,6 @@ mod tests {
         );
         assert!(lines[2].ends_with("; XML-Tags, Ziel zuerst"), "{text}");
         assert_eq!(lines[3], "Nicht geben: schwach");
-        assert_eq!(lines[4], "Aus Fehlern: -");
         assert!(!text.contains("nicht für") && !text.contains("Benchmarks"));
     }
 
@@ -1964,5 +2000,34 @@ mod tests {
         );
         assert_eq!(sb.lessons.len(), 2);
         assert!(!sb.render_short(None).contains("Dateinamen"));
+    }
+
+    #[test]
+    fn short_steckbrief_proven_weakness_filter_and_omitted_lines() {
+        let id = qwen_row().model_id();
+        let mut ok =
+            [1, 2, 3].map(|i| ev(&id, Dimension::WriteCode, "global", Outcome::Accepted, i));
+        ok[0].conclusion = Some("alt".into());
+        ok[1].conclusion = Some("mittel".into());
+        ok[2].conclusion = Some("neu".into());
+        let mut p = profile();
+        p.weaknesses = Some("SWE-bench 61.2 %; lange Refactorings".into());
+        let sb = Steckbrief::build(&qwen_row(), &ok, &Scope::Global, NOW).with_profile(Some(p));
+        let t = sb.render_short(None);
+        assert!(t.contains("Nicht geben: lange Refactorings\n"), "{t}");
+        assert!(
+            t.contains("\nBewährt: neu; mittel\n") && !t.contains("alt"),
+            "{t}"
+        );
+        assert!(!t.contains("Aus Fehlern"), "{t}");
+        let mut private = ok.clone();
+        private
+            .iter_mut()
+            .for_each(|e| e.visibility = Visibility::Private);
+        let stripped: Vec<Event> = private.iter().map(strip_private).collect();
+        let sb = Steckbrief::build(&qwen_row(), &stripped, &Scope::Global, NOW);
+        assert!(!sb.render_short(None).contains("Bewährt"));
+        let none = Steckbrief::build(&qwen_row(), &[], &Scope::Global, NOW);
+        assert!(!none.render_short(None).contains("Bewährt"));
     }
 }
