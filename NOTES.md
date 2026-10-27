@@ -834,3 +834,14 @@ Practice test 2 (all with `max_turns` 100):
 | 5 | REFERENCE example + CHANGELOG [0.5.0] | kiconnect / gpt-oss-120b | 33 s, 9 steps | usable as is | none |
 
 Findings: with 100 turns no run hit the turn limit (0.4.0: 2 of 4 with 20). The explicit string-literal rule in the prompt cut the raw-line-break defects from 3 of 4 Rust results to 1 of 4. kiconnect stays reliable for doc edits with all facts in the prompt.
+
+## Dispatch (src/dispatch.rs)
+
+- Identity: provider from backend kind (claude-oauth anthropic, claude-endpoint host of base_url, codex openai, opencode provider, command basename), model = effective model, checkpoint = model unless `Identity.checkpoint` is given (CLI-reported name), quant `none` unless given, harness `claude-code|codex|opencode|command`. Overrides come per request via `Identity`, no new config fields.
+- Sperre per harness: claude technisch (allowedTools read-only + disallowedTools Edit/Write/MultiEdit/NotebookEdit/Bash, permission mode reset to default), codex technisch (read-only sandbox), opencode technisch (read_only: edit/bash/webfetch denied), command nur-diff. The registry sperre is downgraded to nur-diff if the harness cannot withhold.
+- Limits: only claude supports max_steps (`--max-turns`, min of request and registry). tool_output_lines and context_budget_tokens are supported by no harness; every result lists `unsupported_limits`.
+- Diff limits (files / changed lines): global 8/300, repo 15/600, module 25/1000 (broader scope = tighter). Gold gets the same check as warnings.
+- Write-tests: only `tests/**`, `spec/**` may be touched; removed_term still applies. No write right (or non-write dimension): any diff is discarded.
+- Non-Gold: commit on branch `sidekick/<job_id>` plus patch under `<work_dir>/patches`; Gold: `git apply` to the target tree. Blocked and aborted outcomes are appended to the SessionLog by the dispatcher; accepted/rejected come from the control model later.
+- Abort detection: timeout, cancel, or "reached max turns" in the output.
+- Not done: module scope does not restrict paths to the module; opencode/codex step limits.

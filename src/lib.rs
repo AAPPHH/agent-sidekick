@@ -7,6 +7,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod data;
+pub mod dispatch;
 pub mod harness;
 pub mod locate;
 pub mod logging;
