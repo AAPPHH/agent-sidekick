@@ -795,7 +795,7 @@ fn read_existing(path: &Path) -> Result<Option<Existing>> {
 enum Mode {
     Fresh,
     Rewrite,
-    Merge { text: String, cfg: Config },
+    Merge { text: String, cfg: Box<Config> },
 }
 
 /// `None`: cancelled.
@@ -825,7 +825,7 @@ fn choose_mode(
                 match p.choose_one("Wie soll es weitergehen?", &options, 0)? {
                     0 => Some(Mode::Merge {
                         text: existing.text,
-                        cfg,
+                        cfg: Box::new(cfg),
                     }),
                     1 => Some(Mode::Rewrite),
                     _ => None,

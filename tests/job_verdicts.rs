@@ -23,8 +23,7 @@ fn job_event(job: &str, outcome: Outcome, age_ms: i64) -> Event {
 }
 
 fn own(store: &DataStore) -> Vec<Event> {
-    agent_sidekick::data::read_events(
-        &store.local_root.join(format!(
+    agent_sidekick::data::read_events(&store.local_root.join(format!(
             "experiences/local/{}",
             std::fs::read_dir(store.local_root.join("experiences/local"))
                 .unwrap()
@@ -33,8 +32,7 @@ fn own(store: &DataStore) -> Vec<Event> {
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-        )),
-    )
+        )))
     .unwrap()
 }
 
