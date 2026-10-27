@@ -996,7 +996,7 @@ impl Steckbrief {
             out.push_str(&format!("zurückgesetzt am {}\n", utc(t).split(' ').next().unwrap_or_default()));
         }
         for c in &self.conclusions {
-            out.push_str(&format!("Fazit ({}, ts {}): {}\n", c.scope, c.ts_ms, c.text));
+            out.push_str(&format!("Fazit ({}, {}): {}\n", c.scope, utc(c.ts_ms), c.text));
         }
         out
     }
@@ -1134,7 +1134,7 @@ mod tests {
         assert!(text.contains("blk 1"));
         assert!(text.contains("Validierung decided_by entfernt"));
         assert!(text.contains("Schreibrecht write-code: nein"));
-        assert!(text.contains("Fazit (global"));
+        assert!(text.contains("Fazit (global, ") && !text.contains(", ts "));
         assert!(text.contains("write-tests: nein (Vorschlagsmodus)"));
         assert!(text.contains(" UTC \"Validierung"), "{text}");
         assert!(!text.contains("-0s"));
