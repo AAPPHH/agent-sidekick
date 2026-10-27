@@ -1134,6 +1134,61 @@ pub async fn run_launch(
     logs_dir: &Path,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<RunOutcome, RunError> {
+    run_launch_with(launch, req, logs_dir, cancel, None).await
+}
+
+#[derive(Debug, Default)]
+pub struct Pause {
+    state: Mutex<(usize, Option<Instant>, Duration)>,
+}
+
+pub struct PauseGuard(Arc<Pause>);
+
+impl Pause {
+    pub fn hold(self: &Arc<Self>) -> PauseGuard {
+        let mut st = pause_lock(&self.state);
+        if st.0 == 0 {
+            st.1 = Some(Instant::now());
+        }
+        st.0 += 1;
+        PauseGuard(self.clone())
+    }
+
+    pub fn paused_total(&self) -> Duration {
+        let st = pause_lock(&self.state);
+        st.2 + st.1.map_or(Duration::ZERO, |s| s.elapsed())
+    }
+
+    fn expired(&self, started: Instant, timeout: Duration) -> bool {
+        pause_lock(&self.state).0 == 0 && started.elapsed().saturating_sub(self.paused_total()) >= timeout
+    }
+}
+
+impl Drop for PauseGuard {
+    fn drop(&mut self) {
+        let mut st = pause_lock(&self.0.state);
+        st.0 -= 1;
+        if st.0 == 0 {
+            if let Some(since) = st.1.take() {
+                st.2 += since.elapsed();
+            }
+        }
+    }
+}
+
+fn pause_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+const PAUSE_POLL: Duration = Duration::from_millis(200);
+
+pub async fn run_launch_with(
+    launch: Launch,
+    req: RunRequest,
+    logs_dir: &Path,
+    cancel: tokio_util::sync::CancellationToken,
+    pause: Option<Arc<Pause>>,
+) -> Result<RunOutcome, RunError> {
     if !req.cwd.is_dir() {
         return Err(RunError::CwdMissing(req.cwd));
     }
@@ -1231,9 +1286,19 @@ pub async fn run_launch(
         readers.push(tokio::spawn(pump(err, sink.clone(), secrets.clone())));
     }
 
+    let timeout_at = async {
+        match &pause {
+            None => tokio::time::sleep(req.timeout).await,
+            Some(p) => {
+                while !p.expired(started, req.timeout) {
+                    tokio::time::sleep(PAUSE_POLL).await;
+                }
+            }
+        }
+    };
     let ended = tokio::select! {
         status = child.wait() => Ended::Exited(status),
-        _ = tokio::time::sleep(req.timeout) => Ended::TimedOut,
+        _ = timeout_at => Ended::TimedOut,
         _ = cancel.cancelled() => Ended::Cancelled,
     };
     let (status, timed_out, cancelled) = match ended {
@@ -1258,7 +1323,7 @@ pub async fn run_launch(
             (None, false, true)
         }
     };
-    let duration = started.elapsed();
+    let duration = started.elapsed().saturating_sub(pause.as_ref().map_or(Duration::ZERO, |p| p.paused_total()));
 
     let grace = if timed_out || cancelled {
         READER_GRACE_AFTER_KILL

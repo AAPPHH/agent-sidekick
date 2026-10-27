@@ -775,6 +775,7 @@ pub struct Steckbrief {
     pub profile: Option<Profile>,
     pub effective: Vec<(Dimension, f64)>,
     pub lessons: Vec<String>,
+    pub questions: u32,
 }
 
 fn utc(ts_ms: i64) -> String {
@@ -847,6 +848,7 @@ impl Steckbrief {
             profile: None,
             effective: Dimension::ALL.iter().map(|d| (*d, standing.effective_trust(*d, scope))).collect(),
             lessons,
+            questions: crate::ask::count_questions(events, &standing.model_id),
         }
     }
 
@@ -916,7 +918,11 @@ impl Steckbrief {
             how.extend(self.rules([Dimension::Search, Dimension::Inventory], "search/inventory", Self::read_rule));
             how.extend(self.rules([Dimension::WriteTests, Dimension::WriteCode], "write", Self::write_rule));
             if !self.deactivated(Dimension::Decisions) {
-                how.push(if self.at_least(Dimension::Decisions, DECISIONS_RIGHT_MIN) { "darf selbst entscheiden" } else { "Entscheidungen im Auftrag vorgeben" }.to_string());
+                let free = self.at_least(Dimension::Decisions, DECISIONS_RIGHT_MIN);
+                how.push(if free { "darf selbst entscheiden" } else { "Entscheidungen im Auftrag vorgeben" }.to_string());
+                if !free {
+                    how.push("Rückfragen erwünscht".to_string());
+                }
             }
         }
         how.extend(fit(part(&p.prompting), LINE_MAX));
@@ -985,6 +991,7 @@ impl Steckbrief {
             self.duration_s.round() as i64,
             self.review_s.round() as i64
         ));
+        out.push_str(&format!("Rückfragen der Worker: {}\n", self.questions));
         if let Some(t) = self.reset_at {
             out.push_str(&format!("zurückgesetzt am {}\n", utc(t).split(' ').next().unwrap_or_default()));
         }
@@ -1298,6 +1305,22 @@ mod tests {
         let gold = ModelRow { key: ModelKey::new("anthropic", "claude-opus-5-5", "x", "-", "claude-code"), ..qwen_row() };
         let text = Steckbrief::build(&gold, &[], &Scope::Global, NOW).render_short(None);
         assert!(text.contains("Gold, keine Prüfung") && text.contains("So formulieren: keine Prüfung") && !text.contains("nicht für") && text.contains("(anthropic)"), "{text}");
+    }
+
+    #[test]
+    fn short_steckbrief_asks_for_questions_below_the_decision_threshold_and_detail_counts_them() {
+        let qwen = qwen_row();
+        let low = with_trust(&qwen, &[(Dimension::Decisions, 0.84)], false);
+        assert!(low.contains("Entscheidungen im Auftrag vorgeben; Rückfragen erwünscht"), "{low}");
+        let high = with_trust(&qwen, &[(Dimension::Decisions, 0.85)], false);
+        assert!(high.contains("darf selbst entscheiden") && !high.contains("Rückfragen erwünscht"), "{high}");
+        let gold = ModelRow { key: ModelKey::new("anthropic", "claude-opus-5-5", "x", "-", "claude-code"), ..qwen_row() };
+        assert!(!Steckbrief::build(&gold, &[], &Scope::Global, NOW).render_short(None).contains("Rückfragen"));
+        let mut note = ev(&qwen.model_id(), Dimension::Search, "global", Outcome::Note, 1);
+        note.summary = Some("questions: 3".into());
+        let sb = Steckbrief::build(&qwen, &[note], &Scope::Global, NOW);
+        assert_eq!(sb.questions, 3);
+        assert!(sb.render().contains("Rückfragen der Worker: 3"));
     }
 
     #[test]

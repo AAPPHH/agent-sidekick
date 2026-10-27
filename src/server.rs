@@ -25,7 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backends::reach::PROBE_TIMEOUT;
 use crate::backends::{self, Backend, BackendType, Backends, Credential};
-use crate::dispatch::{self, DispatchRequest, DispatchResult, Dispatcher, Identity};
+use crate::ask::{self, AskJob, AskServer, AskWire, Answered, JobEvent, Session};
+use crate::dispatch::{self, DispatchRequest, DispatchResult, Dispatcher, Identity, RunExtras};
 use crate::sync::{DataStore, ExperienceInput};
 use crate::trust::{Dimension, Outcome, Scope, Visibility};
 use crate::config::{Config, MAX_TIMEOUT_S, MAX_TURNS_LIMIT};
@@ -44,7 +45,7 @@ pick one by description and cost. `sidekick_run`: run a prompt in a working dire
 many minutes. `sidekick_status`: running/queued jobs and setup problems. Without `backend`, a \
 run goes to the configured default backend. The result names the backend and model that ran, \
 the exit code, the log path and the tail of the output. Registered models need `dimension` \
-(dispatch path, then record a verdict with `sidekick_record_experience` and `job_id`). If a run fails because no token, key \
+(dispatch path, then record a verdict with `sidekick_record_experience` and `job_id`). A worker may ask a question: the call then returns status `question`; reply with `sidekick_answer`. If a run fails because no token, key \
 or login is stored, ask the user to run `agent-sidekick setup` (or `agent-sidekick setup \
 --backend <name>`) in a terminal.";
 
@@ -190,6 +191,15 @@ pub struct DispatchParams {
     /// Identity overrides for the registry lookup (default: derived from the backend).
     pub checkpoint: Option<String>,
     pub quant: Option<String>,
+}
+
+/// Parameters of `sidekick_answer`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+pub struct AnswerParams {
+    /// The job_id of the question (from the `question` result).
+    pub job_id: String,
+    /// Your answer; the blocked worker receives it as the result of ask_orchestrator.
+    pub answer: String,
 }
 
 /// Validate `params` and apply defaults from `cfg`. `base_dir` resolves relative `cwd`s,
@@ -732,7 +742,7 @@ fn progress_interval() -> Duration {
 /// Reset when the fallback attempt begins, so the fallback's queue wait is reported as queued
 /// and its own timeout is added to `total`.
 #[derive(Debug, Clone)]
-struct RunPhase {
+pub(crate) struct RunPhase {
     /// Name of the fallback backend once the fallback attempt has begun; `None` for the
     /// primary attempt.
     fallback: Option<String>,
@@ -743,7 +753,7 @@ struct RunPhase {
 }
 
 impl RunPhase {
-    fn primary() -> Self {
+    pub(crate) fn primary() -> Self {
         Self {
             fallback: None,
             attempt_began: Instant::now(),
@@ -760,7 +770,7 @@ impl RunPhase {
     }
 }
 
-type SharedPhase = Arc<std::sync::Mutex<RunPhase>>;
+pub(crate) type SharedPhase = Arc<std::sync::Mutex<RunPhase>>;
 
 /// Run `f` on the phase; a poisoned lock is still usable (the data is plain timestamps).
 fn with_phase<T>(phase: &std::sync::Mutex<RunPhase>, f: impl FnOnce(&mut RunPhase) -> T) -> T {
@@ -896,7 +906,7 @@ fn active_cooldowns(map: &mut CooldownMap, now: Instant) -> Vec<(String, u64)> {
 }
 
 #[derive(Debug)]
-struct Snapshot {
+pub(crate) struct Snapshot {
     config: Config,
     /// `Config::load` error, reported by `sidekick_status` and `sidekick_backends`.
     config_error: Option<String>,
@@ -1013,6 +1023,7 @@ struct State {
     /// Backend name -> end of its rate-limit cooldown.
     cooldowns: std::sync::Mutex<CooldownMap>,
     data: tokio::sync::OnceCell<Arc<DataStore>>,
+    broker: Arc<ask::Broker>,
 }
 
 #[derive(Debug, Clone)]
@@ -1128,6 +1139,7 @@ impl SidekickServer {
                 shutdown: CancellationToken::new(),
                 cooldowns: std::sync::Mutex::default(),
                 data: tokio::sync::OnceCell::new(),
+                broker: Arc::default(),
             }),
         }
     }
@@ -1643,35 +1655,97 @@ impl SidekickServer {
     /// without write right the agent gets no write tools; the diff is checked against protected
     /// paths and terms and the scope limits. The result is a branch and patch (never applied,
     /// except for the Gold model); violations discard the diff and record a block. Backends
-    /// without a registry row are rejected. Waits in the same queues as sidekick_run.
+    /// without a registry row are rejected. Waits in the same queues as sidekick_run. The worker
+    /// may ask a question: the call then returns status `question` with the job_id; answer with
+    /// sidekick_answer.
     #[tool]
     async fn sidekick_dispatch(
         &self,
         Parameters(p): Parameters<DispatchParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let state = &self.state;
-        let snap = state.refresh();
-        let backends = match &snap.backends {
-            Ok(b) => b,
-            Err(e) => return tool_error(config_invalid_message(e)),
+        let snap = self.state.refresh();
+        let prep = match self.prepare_dispatch(&snap, &p).await {
+            Ok(v) => v,
+            Err(msg) => return tool_error_with(&snap, msg),
         };
-        let store = match self.store(&snap).await {
-            Ok(s) => s,
-            Err(e) => return tool_error(e),
-        };
-        let base_dir = match std::env::current_dir() {
-            Ok(d) => d,
-            Err(e) => return tool_error_with(&snap, format!("Cannot determine the server's current directory: {e}. Pass an absolute 'cwd'.")),
-        };
+        let phase: SharedPhase = Arc::new(std::sync::Mutex::new(RunPhase::primary()));
+        let session = self.state.broker.open(&prep.dreq.job_id, &self.state.shutdown, phase, prep.dreq.timeout);
+        let (server, job_snap, job_session) = (self.clone(), snap.clone(), session.clone());
+        tokio::spawn(async move {
+            let report = server.execute_job(job_snap, prep, job_session.clone(), JobExtras::default()).await;
+            job_session.send(JobEvent::Done { text: report.text, is_error: report.is_error });
+        });
+        self.wait_event(&session, &ctx).await
+    }
+
+    /// Answer a question a delegated worker asked (status `question` of sidekick_dispatch,
+    /// sidekick_run, sidekick_workflow or an earlier sidekick_answer). The answer is delivered to
+    /// the blocked worker; the call then waits for the job's next event (another question or the
+    /// final result) and returns it in the same format as sidekick_dispatch.
+    #[tool]
+    async fn sidekick_answer(
+        &self,
+        Parameters(p): Parameters<AnswerParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.state.broker.answer(p.job_id.trim(), p.answer) {
+            Answered::Unknown => tool_error(format!("no running job `{}` with a question (finished, cancelled or unknown)", p.job_id.trim())),
+            Answered::Delivered(session) => self.wait_event(&session, &ctx).await,
+            Answered::NoOpenQuestion(session) => {
+                let r = self.wait_event(&session, &ctx).await?;
+                let note = "note: the worker has no open question (already answered, or it got no answer in time); your answer was not delivered\n";
+                Ok(text_result(format!("{note}{}", text_of(&r)), r.is_error.unwrap_or(false)))
+            }
+        }
+    }
+}
+
+pub(crate) struct Prepared {
+    pub backend: Backend,
+    pub dreq: DispatchRequest,
+    pub store: Arc<DataStore>,
+}
+
+#[derive(Default)]
+pub(crate) struct JobExtras {
+    pub base: Option<String>,
+    pub hold_gold: bool,
+    pub step: Option<String>,
+}
+
+pub(crate) struct JobReport {
+    pub text: String,
+    pub is_error: bool,
+    pub result: Option<DispatchResult>,
+}
+
+fn format_question(job_id: &str, step: Option<&str>, workflow: &str, text: &str) -> String {
+    let mut s = format!("status: question\njob_id: {job_id}\n");
+    if let Some(step) = step {
+        let _ = writeln!(s, "workflow: {workflow}\nstep: {step}");
+    }
+    let _ = write!(s, "question: {text}\nanswer with sidekick_answer(job_id, answer); the call returns the job's next event");
+    s
+}
+
+fn text_of(r: &CallToolResult) -> String {
+    r.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n")
+}
+
+type LocateResult = Result<Result<Located, LocateError>, String>;
+type TokenResults = Result<Vec<(SecretId, Result<(Token, TokenSource), TokenError>)>, String>;
+
+impl SidekickServer {
+    pub(crate) async fn prepare_dispatch(&self, snap: &Snapshot, p: &DispatchParams) -> Result<Prepared, String> {
+        let backends = snap.backends.as_ref().map_err(|e| config_invalid_message(e))?;
+        let store = self.store(snap).await?;
+        let base_dir = std::env::current_dir().map_err(|e| format!("Cannot determine the server's current directory: {e}. Pass an absolute 'cwd'."))?;
         let home = crate::paths::home_dir().ok();
         let parsed = (|| -> anyhow::Result<(Dimension, Scope)> {
             Ok((Dimension::parse(&p.dimension)?, p.scope.as_deref().map(Scope::parse).transpose()?.unwrap_or(Scope::Global)))
         })();
-        let (dimension, scope) = match parsed {
-            Ok(v) => v,
-            Err(e) => return tool_error(format!("{e:#}")),
-        };
+        let (dimension, scope) = parsed.map_err(|e| format!("{e:#}"))?;
         let run_params = RunParams {
             prompt: p.prompt.clone(),
             cwd: p.cwd.clone(),
@@ -1680,22 +1754,12 @@ impl SidekickServer {
             timeout_s: p.timeout_s,
             ..Default::default()
         };
-        let req = match resolve_request(run_params, &snap.config, &base_dir, home.as_deref()) {
-            Ok(r) => r,
-            Err(msg) => return tool_error_with(&snap, msg),
-        };
-        let backend = match select_backends(backends, p.backend.as_deref(), None) {
-            Ok((b, _)) => b,
-            Err(msg) => return tool_error_with(&snap, msg),
-        };
-        if let Err(msg) = backend.effective_model(req.model.as_deref()) {
-            return tool_error_with(&snap, msg);
-        }
-        if let Err(msg) = backend.account_guard(backends::caller_account().as_deref()) {
-            return tool_error_with(&snap, msg);
-        }
-        if let Some(secs) = state.cooldown(&backend.name) {
-            return tool_error_with(&snap, format!("backend {} is rate limited, retry in {secs}s; choose another backend", backend.name));
+        let req = resolve_request(run_params, &snap.config, &base_dir, home.as_deref())?;
+        let (backend, _) = select_backends(backends, p.backend.as_deref(), None)?;
+        backend.effective_model(req.model.as_deref())?;
+        backend.account_guard(backends::caller_account().as_deref())?;
+        if let Some(secs) = self.state.cooldown(&backend.name) {
+            return Err(format!("backend {} is rate limited, retry in {secs}s; choose another backend", backend.name));
         }
         let dreq = DispatchRequest {
             prompt: req.prompt.clone(),
@@ -1706,11 +1770,28 @@ impl SidekickServer {
             model: req.model.clone(),
             max_turns: req.max_turns,
             timeout: req.timeout,
-            identity: Identity { checkpoint: p.checkpoint, quant: p.quant },
+            identity: Identity { checkpoint: p.checkpoint.clone(), quant: p.quant.clone() },
         };
+        Ok(Prepared { backend: backend.clone(), dreq, store })
+    }
+
+    pub(crate) async fn execute_job(&self, snap: Arc<Snapshot>, prep: Prepared, session: Arc<Session>, extras: JobExtras) -> JobReport {
+        let fail = |msg: String| JobReport { text: redact_all(&msg), is_error: true, result: None };
+        let st = &self.state;
+        let Prepared { backend, dreq, store } = prep;
+        let cancel = session.cancel.clone();
+        let (backend_permit, global_permit) = match self.acquire_permits(&snap, &backend, &cancel).await {
+            Ok(p) => p,
+            Err(msg) => return fail(msg),
+        };
+        if cancel.is_cancelled() {
+            return fail(CANCELLED_QUEUED_MSG.into());
+        }
+        let counters = st.backend_counters(&backend.name);
+        let _running = CountGuard::all([&st.counters.running, &counters.running]);
         let logs_dir = match crate::paths::logs_dir() {
             Ok(d) => d,
-            Err(e) => return tool_error(format!("Cannot determine the logs directory: {e:#}")),
+            Err(e) => return fail(format!("Cannot determine the logs directory: {e:#}")),
         };
         let dispatcher = Dispatcher {
             data: store.data.clone(),
@@ -1721,51 +1802,77 @@ impl SidekickServer {
             user_id: store.user_id.clone(),
             launcher: dispatch::real_launcher(snap.config.claude_path.clone(), snap.config.pass_env.clone()),
         };
-        let (cancel, _forward) = run_cancel_token(&ctx.ct, &state.shutdown);
-        let phase: SharedPhase = Arc::new(std::sync::Mutex::new(RunPhase::primary()));
-        let ticker = ctx.meta.get_progress_token().map(|token| {
-            spawn_progress_ticker(ctx.peer.clone(), token, phase.clone(), req.timeout, progress_interval())
+        let pause = Arc::new(runner::Pause::default());
+        st.broker.attach(&dreq.job_id, &session.id);
+        let ask_job = AskJob::new(&dreq.job_id, extras.step.clone(), session.clone(), st.broker.clone(), pause.clone());
+        let ask_server = AskServer::start(&dispatcher.work_dir.join("ask"), ask_job.clone())
+            .map_err(|e| tracing::warn!(job = %dreq.job_id, "ask_orchestrator unavailable: {e:#}"))
+            .ok();
+        let wire = ask_server.as_ref().and_then(|s| {
+            let exe = std::env::current_exe().map_err(|e| tracing::warn!("ask_orchestrator unavailable: {e}")).ok()?;
+            Some(AskWire { exe, job_id: dreq.job_id.clone(), endpoint: s.endpoint.clone() })
         });
-        let (backend_permit, global_permit) = match self.acquire_permits(&snap, backend, &cancel).await {
-            Ok(p) => p,
-            Err(msg) => return tool_error_with(&snap, msg),
-        };
-        if cancel.is_cancelled() || ctx.ct.is_cancelled() {
-            return tool_error_with(&snap, CANCELLED_QUEUED_MSG);
-        }
-        let counters = state.backend_counters(&backend.name);
-        let _running = CountGuard::all([&state.counters.running, &counters.running]);
-        with_phase(&phase, |p| p.started = Some(Instant::now()));
         tracing::info!(backend = %backend.name, job = %dreq.job_id, "sidekick_dispatch started");
-        let outcome = dispatcher.run(backend, &dreq, cancel.clone()).await;
+        let run_extras = RunExtras { ask: wire, base: extras.base, hold_gold: extras.hold_gold, pause: Some(pause) };
+        let outcome = dispatcher.run_with(&backend, &dreq, cancel.clone(), run_extras).await;
+        drop(ask_server);
         drop(global_permit);
         drop(backend_permit);
-        drop(ticker);
         let (result, event) = match outcome {
             Ok(v) => v,
-            Err(e) => return tool_error_with(&snap, format!("{e:#}")),
+            Err(e) => return fail(format!("{e:#}")),
         };
         let mut text = format_dispatch(&result);
+        let asked = ask_job.asked();
+        if !asked.is_empty() {
+            let _ = write!(text, "\nquestions asked: {}", asked.len());
+        }
         if let Some(event) = event {
-            match blocking(move || store.append(event).map_err(|e| format!("{e:#}"))).await {
-                Ok(Ok((_, pushed))) => {
-                    if !pushed {
-                        text.push_str("\nnote: event stored locally, not pushed yet (sidekick_sync retries)");
+            let extra = ask::question_events(&event, &asked);
+            let mut all = vec![event];
+            all.extend(extra);
+            for e in all {
+                let store = store.clone();
+                match blocking(move || store.append(e).map_err(|e| format!("{e:#}"))).await {
+                    Ok(Ok((_, pushed))) => {
+                        if !pushed && !text.contains("not pushed yet") {
+                            text.push_str("\nnote: event stored locally, not pushed yet (sidekick_sync retries)");
+                        }
                     }
-                }
-                Ok(Err(e)) | Err(e) => {
-                    let _ = write!(text, "\nwarning: event could not be recorded: {e}");
+                    Ok(Err(e)) | Err(e) => {
+                        let _ = write!(text, "\nwarning: event could not be recorded: {e}");
+                    }
                 }
             }
         }
-        Ok(text_result(redact_all(&text), matches!(result.status, dispatch::Status::Blocked | dispatch::Status::Failed)))
+        let is_error = matches!(result.status, dispatch::Status::Blocked | dispatch::Status::Failed);
+        JobReport { text: redact_all(&text), is_error, result: Some(result) }
     }
-}
 
-type LocateResult = Result<Result<Located, LocateError>, String>;
-type TokenResults = Result<Vec<(SecretId, Result<(Token, TokenSource), TokenError>)>, String>;
+    async fn wait_event(&self, session: &Arc<Session>, ctx: &RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+        let ticker = ctx.meta.get_progress_token().map(|token| {
+            spawn_progress_ticker(ctx.peer.clone(), token, session.phase.clone(), session.timeout, progress_interval())
+        });
+        let event = tokio::select! {
+            e = session.next() => e,
+            _ = ctx.ct.cancelled() => {
+                session.cancel.cancel();
+                self.state.broker.close(&session.id);
+                drop(ticker);
+                return tool_error(CANCELLED_LINE);
+            }
+        };
+        drop(ticker);
+        match event {
+            Some(JobEvent::Question { job_id, step, text }) => Ok(text_result(redact_all(&format_question(&job_id, step.as_deref(), &session.id, &text)), false)),
+            Some(JobEvent::Done { text, is_error }) => {
+                self.state.broker.close(&session.id);
+                Ok(text_result(text, is_error))
+            }
+            None => tool_error("the job ended without a result"),
+        }
+    }
 
-impl SidekickServer {
     async fn acquire_permits(
         &self,
         snap: &Snapshot,
@@ -1818,7 +1925,7 @@ impl SidekickServer {
             .cloned()
     }
 
-    async fn registry_gate(&self, snap: &Snapshot, backend: &Backend, model: Option<&str>) -> Result<bool, String> {
+    pub(crate) async fn registry_gate(&self, snap: &Snapshot, backend: &Backend, model: Option<&str>) -> Result<bool, String> {
         let model = backend.effective_model(model)?;
         let store = self.store(snap).await?;
         let rows = store.data.models().map_err(|e| format!("registry cannot be read: {e:#}"))?;

@@ -1,16 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::ask::{self, AskWire, ASK_PROMPT_LINE};
 use crate::backends::{self, Backend, BackendKind, OpencodeProvider, PermissionMode};
 use crate::data::{block_lesson, DataDir, ModelRow, ProtectedKind, ProtectedRow, SessionLog};
 use crate::harness::claude::{model_matches, parse_report};
 use crate::harness::HarnessKind;
-use crate::runner::{self, Launch, RunRequest};
+use crate::runner::{self, Launch, Pause, RunRequest};
 use crate::trust::{Dimension, Event, ModelKey, Outcome, Scope, Sperre, Standing};
 
 pub const GLOBAL_LIMITS: Limits = Limits { max_files: 8, max_lines: 300 };
@@ -383,12 +385,21 @@ pub struct DispatchResult {
     pub block_reason: Option<String>,
     pub reason: Option<String>,
     pub proposal_mode: bool,
+    pub gold: bool,
     pub evidence_hash: Option<String>,
     pub event_id: Option<String>,
     pub exit_code: Option<i32>,
     pub duration_s: f64,
     pub log_path: PathBuf,
     pub tail: String,
+}
+
+#[derive(Default)]
+pub struct RunExtras {
+    pub ask: Option<AskWire>,
+    pub base: Option<String>,
+    pub hold_gold: bool,
+    pub pause: Option<Arc<Pause>>,
 }
 
 pub type Launcher = Box<dyn Fn(&Backend, &RunRequest) -> Result<Launch, String> + Send + Sync>;
@@ -428,15 +439,16 @@ struct Worktree {
 }
 
 impl Worktree {
-    fn create(repo: &Path, work_dir: &Path, job_id: &str) -> Result<Self> {
+    fn create(repo: &Path, work_dir: &Path, job_id: &str, from: Option<&str>) -> Result<Self> {
         if job_id.is_empty() || job_id.contains(['/', '\\', ' ']) || job_id.starts_with('.') {
             bail!("invalid job_id `{job_id}`");
         }
-        let base = git(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+        let start = from.unwrap_or("HEAD");
+        let base = git(repo, &["rev-parse", start])?.trim().to_string();
         let path = work_dir.join("worktrees").join(job_id);
         let branch = format!("{BRANCH_PREFIX}{job_id}");
         std::fs::create_dir_all(path.parent().unwrap())?;
-        git(repo, &["worktree", "add", "-b", &branch, &path.to_string_lossy(), "HEAD"])?;
+        git(repo, &["worktree", "add", "-b", &branch, &path.to_string_lossy(), &base])?;
         Ok(Self { repo: repo.to_path_buf(), path, branch, base })
     }
 
@@ -479,6 +491,10 @@ impl Dispatcher {
     }
 
     pub async fn run(&self, backend: &Backend, req: &DispatchRequest, cancel: CancellationToken) -> Result<(DispatchResult, Option<Event>)> {
+        self.run_with(backend, req, cancel, RunExtras::default()).await
+    }
+
+    pub async fn run_with(&self, backend: &Backend, req: &DispatchRequest, cancel: CancellationToken, extras: RunExtras) -> Result<(DispatchResult, Option<Event>)> {
         let model = backend.effective_model(req.model.as_deref()).map_err(|e| anyhow!(e))?;
         let key = req.identity.key(backend, model.as_deref());
         let model_id = key.model_id();
@@ -506,9 +522,18 @@ impl Dispatcher {
             _ => req.max_turns,
         };
         let proposal = req.dimension.is_write() && !write_right;
-        let wt = Worktree::create(&req.repo, &self.work_dir, &req.job_id)?;
+        let wt = Worktree::create(&req.repo, &self.work_dir, &req.job_id, extras.base.as_deref())?;
         let run_req = RunRequest {
-            prompt: if proposal { format!("{}\n\n{PROPOSAL_INSTRUCTION}", req.prompt) } else { req.prompt.clone() },
+            prompt: {
+                let mut prompt = req.prompt.clone();
+                if extras.ask.is_some() {
+                    prompt = format!("{prompt}\n\n{ASK_PROMPT_LINE}");
+                }
+                if proposal {
+                    prompt = format!("{prompt}\n\n{PROPOSAL_INSTRUCTION}");
+                }
+                prompt
+            },
             cwd: wt.path.clone(),
             max_turns,
             model,
@@ -516,15 +541,18 @@ impl Dispatcher {
             timeout: req.timeout,
         };
         let json_output = matches!(backend.kind, BackendKind::ClaudeOauth { .. });
-        let launched = (self.launcher)(&prepared, &run_req).map(|mut l| {
+        let launched = (self.launcher)(&prepared, &run_req).map_err(|e| anyhow!(e)).and_then(|mut l| {
             if json_output {
                 let at = if l.args.len() >= 2 && l.args[l.args.len() - 2] == "--" { l.args.len() - 2 } else { l.args.len() };
                 l.args.splice(at..at, ["--output-format".into(), "json".into()]);
             }
-            l
-        }).map_err(|e| anyhow!(e));
+            if let Some(wire) = &extras.ask {
+                ask::wire_launch(backend.harness_kind(), &mut l, wire)?;
+            }
+            Ok(l)
+        });
         let outcome = match launched {
-            Ok(launch) => runner::run_launch(launch, run_req, &self.logs_dir, cancel).await.map_err(anyhow::Error::from),
+            Ok(launch) => runner::run_launch_with(launch, run_req, &self.logs_dir, cancel, extras.pause.clone()).await.map_err(anyhow::Error::from),
             Err(e) => Err(e),
         };
         let outcome = match outcome {
@@ -551,6 +579,7 @@ impl Dispatcher {
             block_reason: None,
             reason: None,
             proposal_mode: proposal,
+            gold: false,
             evidence_hash: None,
             event_id: None,
             exit_code: outcome.exit_code,
@@ -680,7 +709,8 @@ impl Dispatcher {
             std::fs::create_dir_all(&patches)?;
             let patch_path = patches.join(format!("{}.patch", req.job_id));
             std::fs::write(&patch_path, &patch)?;
-            if gold {
+            result.gold = gold;
+            if gold && !extras.hold_gold {
                 match git(&req.repo, &["apply", "--whitespace=nowarn", &patch_path.to_string_lossy()]) {
                     Ok(_) => {
                         result.applied = true;

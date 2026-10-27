@@ -37,6 +37,16 @@ pub enum Command {
     Update,
     /// Validate or aggregate the data repository (used by its workflows).
     Data(commands::data::DataArgs),
+    #[command(hide = true)]
+    AskBridge(AskBridgeArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AskBridgeArgs {
+    #[arg(long)]
+    pub job: String,
+    #[arg(long)]
+    pub socket: String,
 }
 
 pub fn main() -> ExitCode {
@@ -69,6 +79,10 @@ pub fn main() -> ExitCode {
         Command::Data(args) => {
             let _guard = logging::init(logging::Mode::Cli);
             commands::data::run(args)
+        }
+        Command::AskBridge(args) => {
+            let _guard = logging::init(logging::Mode::Cli);
+            run_async(crate::ask::run_bridge(&args.job, &args.socket))
         }
         Command::Update => {
             let _guard = logging::init(logging::Mode::Cli);

@@ -2,6 +2,7 @@
 //! agent running with its own credentials (a configured backend: Claude Code, OpenCode or
 //! another agent CLI).
 
+pub mod ask;
 pub mod backends;
 pub mod cli;
 pub mod commands;
