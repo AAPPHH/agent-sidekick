@@ -40,14 +40,13 @@ impl Limits {
 
 #[derive(Clone, Debug, Default)]
 pub struct Identity {
-    pub provider: Option<String>,
     pub checkpoint: Option<String>,
     pub quant: Option<String>,
 }
 
 impl Identity {
     pub fn key(&self, backend: &Backend, model: Option<&str>) -> ModelKey {
-        let provider = self.provider.clone().unwrap_or_else(|| default_provider(backend));
+        let provider = default_provider(backend);
         let model = model.unwrap_or("default");
         let checkpoint = self.checkpoint.as_deref().unwrap_or(model);
         let quant = self.quant.as_deref().unwrap_or("none");
@@ -476,7 +475,8 @@ impl Dispatcher {
             }
             let checker = DiffChecker { protected: &protected, dimension: req.dimension, limits: Limits::for_scope(&req.scope), scope: &req.scope };
             let check = checker.check(&files, &wt.diff("-U0")?);
-            if !check.violations.is_empty() && !standing.apply_without_review() {
+            let gold = standing.apply_without_review() && matches!(backend.kind, BackendKind::ClaudeOauth { .. });
+            if !check.violations.is_empty() && !gold {
                 let reason = check.violations.join("; ");
                 result.status = Status::Blocked;
                 result.evidence_hash = Some(sha256_hex(patch.as_bytes()));
@@ -493,7 +493,7 @@ impl Dispatcher {
             std::fs::create_dir_all(&patches)?;
             let patch_path = patches.join(format!("{}.patch", req.job_id));
             std::fs::write(&patch_path, &patch)?;
-            if standing.apply_without_review() {
+            if gold {
                 match git(&req.repo, &["apply", "--whitespace=nowarn", &patch_path.to_string_lossy()]) {
                     Ok(_) => {
                         result.applied = true;

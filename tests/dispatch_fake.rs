@@ -280,3 +280,22 @@ async fn gold_apply_conflict_keeps_branch_and_patch() {
     assert!(r.warnings.iter().any(|w| w.contains("gold apply failed")));
     assert!(branches(&e.repo).contains("sidekick/j14"));
 }
+
+#[tokio::test]
+async fn gold_key_on_foreign_endpoint_never_applies() {
+    let mut e = env("claude-opus-5-5", true, 0, "printf 'fn b() {}\\n' > src/b.rs\n");
+    let mut b = backend("claude-opus-5-5");
+    b.kind = BackendKind::ClaudeEndpoint {
+        base_url: "http://anthropic/v1".into(),
+        api_key_env: None,
+        auth: Default::default(),
+        config_dir: PathBuf::from("/cfg"),
+        permissions: Default::default(),
+    };
+    assert!(Identity::default().key(&b, Some("claude-opus-5-5")).is_gold());
+    let req = request(&e, Dimension::WriteCode, "j15");
+    let r = e.dispatcher.dispatch(&b, &req, &mut e.log).await.unwrap();
+    assert!(!r.applied);
+    assert!(!e.repo.join("src/b.rs").exists());
+    assert_eq!(r.branch.as_deref(), Some("sidekick/j15"));
+}

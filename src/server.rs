@@ -171,7 +171,6 @@ pub struct DispatchParams {
     pub max_turns: Option<u32>,
     pub timeout_s: Option<u64>,
     /// Identity overrides for the registry lookup (default: derived from the backend).
-    pub provider: Option<String>,
     pub checkpoint: Option<String>,
     pub quant: Option<String>,
 }
@@ -1579,7 +1578,7 @@ impl SidekickServer {
             model: req.model.clone(),
             max_turns: req.max_turns,
             timeout: req.timeout,
-            identity: Identity { provider: p.provider, checkpoint: p.checkpoint, quant: p.quant },
+            identity: Identity { checkpoint: p.checkpoint, quant: p.quant },
         };
         let logs_dir = match crate::paths::logs_dir() {
             Ok(d) => d,
