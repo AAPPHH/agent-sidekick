@@ -45,7 +45,7 @@ pick one by description and cost. `sidekick_run`: run a prompt in a working dire
 many minutes. `sidekick_status`: running/queued jobs and setup problems. Without `backend`, a \
 run goes to the configured default backend. The result names the backend and model that ran, \
 the exit code, the log path and the tail of the output. Registered models need `dimension` \
-(dispatch path, then record a verdict with `sidekick_record_experience` and `job_id`). A worker may ask a question: the call then returns status `question`; reply with `sidekick_answer`. If a run fails because no token, key \
+(dispatch path, then record a verdict with `sidekick_record_experience` and `job_id`). A worker may ask a question: the call then returns status `question`; reply with `sidekick_answer`. Mixed tasks: `sidekick_workflow` (steps with one dimension each). If a run fails because no token, key \
 or login is stored, ask the user to run `agent-sidekick setup` (or `agent-sidekick setup \
 --backend <name>`) in a terminal.";
 
@@ -201,6 +201,8 @@ pub struct AnswerParams {
     /// Your answer; the blocked worker receives it as the result of ask_orchestrator.
     pub answer: String,
 }
+
+pub use crate::workflow::WorkflowParams;
 
 /// Validate `params` and apply defaults from `cfg`. `base_dir` resolves relative `cwd`s,
 /// `home` expands a leading `~`. The error is a user-facing message. `backend` and
@@ -1699,8 +1701,41 @@ impl SidekickServer {
             }
         }
     }
+
+    /// Submit a workflow: steps [{id, prompt, dimension, scope?, backend?, model?, depends_on?}]
+    /// plus cwd. Every step must pass the dispatch gating (registered model, account guard);
+    /// otherwise the whole workflow is rejected with the reasons. Independent steps run in
+    /// parallel; a dependent step's prompt gets the results of its dependencies. Writing steps
+    /// share one workflow branch (each diff is checked with its own trust rules and committed
+    /// only when clean); a blocked or failed step skips its dependents. Nothing reaches the
+    /// working tree until the end: when every writing step ran on the Gold model the combined
+    /// patch is applied, otherwise the workflow branch, the combined patch and the per-step
+    /// results (each with its own job_id for sidekick_record_experience) are returned. Questions
+    /// of any step surface as in sidekick_dispatch (answer with sidekick_answer).
+    #[tool]
+    async fn sidekick_workflow(
+        &self,
+        Parameters(p): Parameters<WorkflowParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let snap = self.state.refresh();
+        let plan = match crate::workflow::plan(self, &snap, p).await {
+            Ok(v) => v,
+            Err(msg) => return tool_error_with(&snap, msg),
+        };
+        let phase: SharedPhase = Arc::new(std::sync::Mutex::new(RunPhase::primary()));
+        let session = self.state.broker.open(&plan.id, &self.state.shutdown, phase, plan.total_timeout());
+        with_phase(&session.phase, |p| p.started = Some(Instant::now()));
+        let (server, job_snap, job_session) = (self.clone(), snap.clone(), session.clone());
+        tokio::spawn(async move {
+            let (text, is_error) = crate::workflow::run(server, job_snap, plan, job_session.clone()).await;
+            job_session.send(JobEvent::Done { text, is_error });
+        });
+        self.wait_event(&session, &ctx).await
+    }
 }
 
+#[derive(Clone)]
 pub(crate) struct Prepared {
     pub backend: Backend,
     pub dreq: DispatchRequest,

@@ -19,6 +19,7 @@ pub mod server;
 pub mod sync;
 pub mod token;
 pub mod trust;
+pub mod workflow;
 
 /// Name used for the binary, the MCP server registration and the keyring service.
 pub const APP_NAME: &str = "agent-sidekick";
