@@ -221,6 +221,36 @@ impl DataStore {
         self.append(e)
     }
 
+    pub fn record_verdict(&self, job_id: &str, outcome: Outcome, conclusion: Option<String>, visibility: Visibility) -> Result<(String, bool)> {
+        if !matches!(outcome, Outcome::Accepted | Outcome::Rejected) {
+            bail!("a verdict on a job is accepted or rejected");
+        }
+        let base = {
+            let log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mine: Vec<&Event> = log.events().iter().filter(|e| e.job_id.as_deref() == Some(job_id)).collect();
+            if mine.iter().any(|e| e.outcome == Outcome::Blocked) {
+                bail!("job {job_id} was blocked; blocked jobs get no verdict");
+            }
+            if mine.iter().any(|e| matches!(e.outcome, Outcome::Accepted | Outcome::Rejected)) {
+                bail!("job {job_id} already has a verdict");
+            }
+            mine.into_iter().find(|e| matches!(e.outcome, Outcome::Note | Outcome::Aborted)).cloned()
+        };
+        let base = base.ok_or_else(|| anyhow!("unknown job_id {job_id} in the local log of this session"))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut e = Event::new(&base.model_id, base.dimension, base.scope.clone(), outcome, now);
+        e.machine_id = self.machine_id.clone();
+        e.user_id = self.user_id.clone();
+        e.repo = base.repo.clone();
+        e.job_id = base.job_id.clone();
+        e.steps = base.steps;
+        e.duration_s = base.duration_s;
+        e.review_s = Some(((now - base.ts_ms).max(0) as f64) / 1000.0);
+        e.conclusion = conclusion;
+        e.visibility = visibility;
+        self.append(e)
+    }
+
     pub fn sync(&self) -> Result<String> {
         let _g = self.lock();
         let pulled = match self.pull_locked() {
@@ -244,7 +274,7 @@ impl DataStore {
         let push = if ahead == 0 && !self.pending() {
             "nothing to push"
         } else if self.push_locked() {
-            "pushed"
+            "pushed (private summary/conclusion stay local)"
         } else {
             "push pending (offline or rejected)"
         };

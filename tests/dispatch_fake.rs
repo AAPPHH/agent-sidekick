@@ -172,7 +172,11 @@ async fn write_code_clean_diff_returns_branch_and_patch() {
     assert!(r.patch_path.as_ref().unwrap().exists());
     assert!(!e.repo.join("src/b.rs").exists());
     assert!(branches(&e.repo).contains("sidekick/j4"));
-    assert!(e.log.events().is_empty());
+    assert_eq!(e.log.events().len(), 1);
+    let note = &e.log.events()[0];
+    assert_eq!(note.outcome, Outcome::Note);
+    assert_eq!((note.job_id.as_deref(), note.repo.as_deref(), note.model_id.as_str()), (Some("j4"), Some("repo"), key("m-c").model_id().as_str()));
+    assert!(note.duration_s.is_some() && note.ts_ms > 0);
 }
 
 #[tokio::test]
@@ -223,7 +227,8 @@ async fn gold_applies_directly_and_only_warns() {
     assert!(r.violations.is_empty());
     assert_eq!(std::fs::read_to_string(e.repo.join("src/lib.rs")).unwrap(), "fn a() { let decided_by = 1; }\n");
     assert!(branches(&e.repo).is_empty());
-    assert!(e.log.events().is_empty());
+    assert_eq!(e.log.events().len(), 1);
+    assert_eq!(e.log.events()[0].outcome, Outcome::Note);
 }
 
 #[tokio::test]

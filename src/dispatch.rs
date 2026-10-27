@@ -544,11 +544,10 @@ impl Dispatcher {
             wt.remove(result.branch.is_none());
             return Err(e);
         }
-        let event = matches!(result.status, Status::Blocked | Status::Aborted).then(|| {
-            result.event_id = Some(event.event_id.clone());
-            event
-        });
-        Ok((result, event))
+        event.ts_ms = now_ms();
+        event.repo = event.repo.or_else(|| req.repo.file_name().map(|n| n.to_string_lossy().into_owned()));
+        result.event_id = Some(event.event_id.clone());
+        Ok((result, Some(event)))
     }
 }
 

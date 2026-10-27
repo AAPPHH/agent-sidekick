@@ -125,13 +125,18 @@ pub struct RecordParams {
     pub model_id: Option<String>,
     pub backend: Option<String>,
     pub model: Option<String>,
-    /// search | inventory | write-tests | write-code | decisions.
-    pub dimension: String,
-    /// accepted | rejected | aborted | note | seed. `blocked` is written by the sidekick only.
-    /// seed sets the trust value directly: only for search and inventory, needs `seed_value`.
+    /// search | inventory | write-tests | write-code | decisions. Required without `job_id`.
+    pub dimension: Option<String>,
+    /// With `job_id`: accepted | rejected. Otherwise accepted | rejected | aborted | note | seed.
+    /// `blocked` is written by the sidekick only. seed sets the trust value directly: only for
+    /// search and inventory, needs `seed_value`.
     pub outcome: String,
     /// global (default) | repo:<name> | module:<repo>/<path>.
     pub scope: Option<String>,
+    /// The verdict path: id of a job returned by sidekick_dispatch (or sidekick_run on a
+    /// registered backend). Model, dimension, scope, repo, steps and duration are taken from
+    /// that job's logged event and review_s is measured; only outcome (accepted | rejected),
+    /// conclusion and visibility are yours. One verdict per job, none for blocked jobs.
     pub job_id: Option<String>,
     pub steps: Option<i64>,
     pub duration_s: Option<f64>,
@@ -1041,6 +1046,14 @@ fn redact_with(secrets: &[Secrets], text: &str) -> String {
     out
 }
 
+fn push_note(id: &str, pushed: bool, visibility: Visibility) -> String {
+    let sent = match visibility {
+        Visibility::Private => "pushed (Zahlen; summary/conclusion lokal)",
+        Visibility::Shared => "pushed (Zahlen und Texte)",
+    };
+    format!("recorded event {id}; {}", if pushed { sent } else { "not pushed (offline, rejected or data_name not set); sidekick_sync retries" })
+}
+
 fn format_dispatch(r: &DispatchResult) -> String {
     let mut s = format!(
         "status: {:?}\nmodel_id: {}\nwrite_right: {}\nwrite_tools_withheld: {}\nsperre: {}\nduration_s: {:.1}\nexit_code: {:?}\nlog: {}\n",
@@ -1451,14 +1464,32 @@ impl SidekickServer {
             Ok(s) => s,
             Err(e) => return tool_error(e),
         };
+        if let Some(job_id) = p.job_id.clone().filter(|j| !j.trim().is_empty()) {
+            let verdict = (|| -> anyhow::Result<(Outcome, Visibility)> {
+                Ok((Outcome::parse(&p.outcome)?, p.visibility.as_deref().map(Visibility::parse).transpose()?.unwrap_or(Visibility::Private)))
+            })();
+            let (outcome, visibility) = match verdict {
+                Ok(v) => v,
+                Err(e) => return tool_error(format!("{e:#}")),
+            };
+            let conclusion = p.conclusion;
+            return match blocking(move || store.record_verdict(job_id.trim(), outcome, conclusion, visibility).map_err(|e| format!("{e:#}"))).await {
+                Ok(Ok((id, pushed))) => Ok(text_result(push_note(&id, pushed, visibility), false)),
+                Ok(Err(e)) | Err(e) => tool_error(e),
+            };
+        }
         let (model_id, _) = match Self::model_id_for(&snap, p.model_id, p.backend.as_deref(), p.model.as_deref()) {
             Ok(v) => v,
             Err(e) => return tool_error_with(&snap, e),
         };
+        let visibility = match p.visibility.as_deref().map(Visibility::parse).transpose() {
+            Ok(v) => v.unwrap_or(Visibility::Private),
+            Err(e) => return tool_error(format!("{e:#}")),
+        };
         let input = (|| -> anyhow::Result<ExperienceInput> {
             Ok(ExperienceInput {
                 model_id,
-                dimension: Dimension::parse(&p.dimension)?,
+                dimension: Dimension::parse(p.dimension.as_deref().ok_or_else(|| anyhow::anyhow!("dimension is required without job_id"))?)?,
                 scope: p.scope.as_deref().map(Scope::parse).transpose()?.unwrap_or(Scope::Global),
                 outcome: Outcome::parse(&p.outcome)?,
                 job_id: p.job_id,
@@ -1468,7 +1499,7 @@ impl SidekickServer {
                 seed_value: p.seed_value,
                 summary: p.summary,
                 conclusion: p.conclusion,
-                visibility: p.visibility.as_deref().map(Visibility::parse).transpose()?.unwrap_or(Visibility::Private),
+                visibility,
             })
         })();
         let input = match input {
@@ -1476,10 +1507,7 @@ impl SidekickServer {
             Err(e) => return tool_error(format!("{e:#}")),
         };
         match blocking(move || store.record(input).map_err(|e| format!("{e:#}"))).await {
-            Ok(Ok((id, pushed))) => Ok(text_result(
-                format!("recorded event {id}; {}", if pushed { "pushed" } else { "not pushed (offline, rejected or data_name not set); sidekick_sync retries" }),
-                false,
-            )),
+            Ok(Ok((id, pushed))) => Ok(text_result(push_note(&id, pushed, visibility), false)),
             Ok(Err(e)) | Err(e) => tool_error(e),
         }
     }
