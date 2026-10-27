@@ -78,10 +78,10 @@ fn row(b: &Backend, model: &str, cost: &str, max_steps: i64, context_tokens: Opt
 fn models() -> Vec<ModelRow> {
     vec![
         row(&dgx(), QWEN, "shared-dgx", 80, Some(262_144), 64_000),
-        row(&claude(), "claude-sonnet-5-5", "quota", 100, Some(200_000), 150_000),
-        row(&claude(), "claude-opus-5-5", "quota", 100, Some(200_000), 150_000),
-        row(&kiconnect(), "openai-gpt-oss-120b", "quota", 40, Some(131_072), 64_000),
-        row(&kiconnect(), "qwen-qwen3-8-27b", "quota", 40, Some(131_072), 64_000),
+        row(&claude(), "claude-sonnet-5-5", "quota", 100, Some(1_000_000), 150_000),
+        row(&claude(), "claude-opus-5-5", "quota", 100, Some(1_000_000), 150_000),
+        row(&kiconnect(), "openai-gpt-oss-120b", "free", 40, Some(131_072), 64_000),
+        row(&kiconnect(), "qwen-qwen3-8-27b", "free", 40, Some(131_072), 64_000),
         row(&groq(), "openai/gpt-oss-120b", "free", 20, Some(131_072), 16_000),
         row(&groq(), "qwen/qwen3.8-27b", "free", 20, Some(131_072), 16_000),
         row(&groq(), "openai/gpt-oss-20b", "free", 20, Some(131_072), 16_000),
@@ -187,6 +187,18 @@ fn generated_start_data_matches_dispatch_identity() {
     assert!(!sb.write_right_code && !sb.decisions_right);
     assert!(data.steckbrief(&expected[2], &Scope::Global, None, now).unwrap().gold);
     assert!(!data.steckbrief(&expected[1], &Scope::Global, None, now).unwrap().gold);
+}
+
+#[test]
+fn generated_registry_context_and_cost_match_cli_and_config() {
+    let (_dir, root) = generated();
+    for m in DataDir::new(root).models().unwrap() {
+        match m.key.model.as_str() {
+            "claude-sonnet-5-5" | "claude-opus-5-5" | "claude-haiku-5-5" => assert_eq!(m.context_tokens, Some(1_000_000)),
+            "openai-gpt-oss-120b" | "qwen-qwen3-8-27b" => assert_eq!(m.cost, "free"),
+            _ => {}
+        }
+    }
 }
 
 #[test]
