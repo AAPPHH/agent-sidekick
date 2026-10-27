@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -141,6 +141,54 @@ pub struct ModelRow {
     pub added_by: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Profile {
+    pub strengths: Option<String>,
+    pub weaknesses: Option<String>,
+    pub task_scope: Option<String>,
+    pub dims_prior: Option<String>,
+    pub benchmarks: Option<String>,
+    pub sources: Option<String>,
+    pub profile_as_of: Option<String>,
+}
+
+impl Profile {
+    pub const COLUMNS: [&'static str; 7] = ["strengths", "weaknesses", "task_scope", "dims_prior", "benchmarks", "sources", "profile_as_of"];
+
+    pub fn fields(&self) -> [&Option<String>; 7] {
+        [&self.strengths, &self.weaknesses, &self.task_scope, &self.dims_prior, &self.benchmarks, &self.sources, &self.profile_as_of]
+    }
+
+    fn read(r: &Row) -> Self {
+        let [strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of] = Self::COLUMNS.map(|c| r.str(c));
+        Self { strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of }
+    }
+
+    pub fn render(&self) -> String {
+        let rows = [
+            ("Stärken", &self.strengths),
+            ("Schwächen", &self.weaknesses),
+            ("Umfang", &self.task_scope),
+            ("Einschätzung je Dimension (abgeleitet aus öffentlichen Daten, nicht gemessen)", &self.dims_prior),
+            ("Benchmarks", &self.benchmarks),
+            ("Quellen", &self.sources),
+        ];
+        if rows.iter().all(|(_, v)| v.is_none()) {
+            return String::new();
+        }
+        let mut out = format!(
+            "Profil (öffentliche Daten, Stand {}; kein Einfluss auf Vertrauen)\n",
+            self.profile_as_of.as_deref().unwrap_or("unbekannt")
+        );
+        for (label, value) in rows {
+            if let Some(v) = value {
+                out.push_str(&format!("- {label}: {v}\n"));
+            }
+        }
+        out
+    }
+}
+
 impl ModelRow {
     pub fn model_id(&self) -> String {
         self.key.model_id()
@@ -162,10 +210,21 @@ impl ModelRow {
             ("sperre", DataType::Utf8, false),
             ("added_at", ts_type(), false),
             ("added_by", DataType::Utf8, false),
+            ("strengths", DataType::Utf8, true),
+            ("weaknesses", DataType::Utf8, true),
+            ("task_scope", DataType::Utf8, true),
+            ("dims_prior", DataType::Utf8, true),
+            ("benchmarks", DataType::Utf8, true),
+            ("sources", DataType::Utf8, true),
+            ("profile_as_of", DataType::Utf8, true),
         ])
     }
 
     pub fn to_batch(models: &[ModelRow]) -> Result<RecordBatch> {
+        Self::to_batch_with(models, &HashMap::new())
+    }
+
+    pub fn to_batch_with(models: &[ModelRow], profiles: &HashMap<String, Profile>) -> Result<RecordBatch> {
         let s = |f: fn(&ModelRow) -> String| strs(models.iter().map(|m| Some(f(m))));
         let i = |f: fn(&ModelRow) -> Option<i64>| -> ArrayRef { Arc::new(Int64Array::from(models.iter().map(f).collect::<Vec<_>>())) };
         let cols = vec![
@@ -184,11 +243,24 @@ impl ModelRow {
             ts_array(models.iter().map(|m| m.added_at).collect()),
             s(|m| m.added_by.clone()),
         ];
-        Ok(RecordBatch::try_new(Self::schema(), cols)?)
+        let empty = Profile::default();
+        let profile_cols = (0..Profile::COLUMNS.len()).map(|i| {
+            strs(models.iter().map(|m| profiles.get(&m.model_id()).unwrap_or(&empty).fields()[i].clone()))
+        });
+        Ok(RecordBatch::try_new(Self::schema(), cols.into_iter().chain(profile_cols).collect())?)
     }
 
     pub fn write_all(path: &Path, models: &[ModelRow]) -> Result<()> {
-        write_batch(path, &Self::to_batch(models)?)
+        Self::write_all_with(path, models, &HashMap::new())
+    }
+
+    pub fn write_all_with(path: &Path, models: &[ModelRow], profiles: &HashMap<String, Profile>) -> Result<()> {
+        write_batch(path, &Self::to_batch_with(models, profiles)?)
+    }
+
+    pub fn read_profiles(path: &Path) -> Result<HashMap<String, Profile>> {
+        let batches = read_batches(path)?;
+        rows(&batches).map(|r| Ok((r.req("model_id")?, Profile::read(&r)))).collect()
     }
 
     pub fn read_all(path: &Path) -> Result<Vec<ModelRow>> {
@@ -500,6 +572,14 @@ impl DataDir {
             .ok_or_else(|| anyhow!("no registry row for model_id `{model_id}`"))
     }
 
+    pub fn profiles(&self) -> Result<HashMap<String, Profile>> {
+        if self.models_path().exists() {
+            ModelRow::read_profiles(&self.models_path())
+        } else {
+            Ok(HashMap::new())
+        }
+    }
+
     pub fn protected(&self) -> Result<Vec<ProtectedRow>> {
         if self.protected_path().exists() {
             ProtectedRow::read_all(&self.protected_path())
@@ -556,13 +636,13 @@ impl DataDir {
 
     pub fn steckbrief(&self, model_id: &str, scope: &Scope, local_root: Option<&Path>, now_ms: i64) -> Result<Steckbrief> {
         let model = self.model(model_id)?;
-        Ok(Steckbrief::build(&model, &self.events(local_root)?, scope, now_ms))
+        Ok(Steckbrief::build(&model, &self.events(local_root)?, scope, now_ms).with_profile(self.profiles()?.remove(model_id)))
     }
 
     pub async fn query(&self, local_root: Option<&Path>, sql: &str) -> Result<String> {
         let ctx = SessionContext::new();
         let tables = [
-            ("models", ModelRow::to_batch(&self.models()?)?),
+            ("models", ModelRow::to_batch_with(&self.models()?, &self.profiles()?)?),
             ("protected", ProtectedRow::to_batch(&self.protected()?)?),
             ("experiences", events_to_batch(&self.events(local_root)?)?),
         ];
@@ -607,6 +687,7 @@ pub struct Steckbrief {
     pub review_s: f64,
     pub conclusions: Vec<Conclusion>,
     pub reset_at: Option<i64>,
+    pub profile: Option<Profile>,
 }
 
 fn utc(ts_ms: i64) -> String {
@@ -658,7 +739,13 @@ impl Steckbrief {
             review_s: own.iter().filter_map(|e| e.review_s).sum(),
             conclusions,
             reset_at: standing.book.reset_at(),
+            profile: None,
         }
+    }
+
+    pub fn with_profile(mut self, profile: Option<Profile>) -> Self {
+        self.profile = profile;
+        self
     }
 
     pub fn render(&self) -> String {
@@ -683,6 +770,9 @@ impl Steckbrief {
             num(self.model.context_budget_tokens),
             num(self.model.context_tokens),
         );
+        if let Some(p) = &self.profile {
+            out.push_str(&p.render());
+        }
         for r in &self.rows {
             let c = &r.counters;
             out.push_str(&format!(
@@ -885,5 +975,62 @@ mod tests {
         assert!(dd.query(None, "select value from protected where kind = 'removed_term'").await.unwrap().contains("assert"));
         assert!(dd.query(None, "create table x as select 1").await.is_err());
         assert!(dd.query(None, "copy (select 1) to '/tmp/x.csv'").await.is_err());
+    }
+
+    fn profile() -> Profile {
+        Profile {
+            strengths: Some("stark".into()),
+            weaknesses: Some("schwach".into()),
+            task_scope: Some("klein".into()),
+            dims_prior: Some("search=mittel;decisions=schwach".into()),
+            benchmarks: Some("X 1 (src, 2026-01-01, vendor)".into()),
+            sources: Some("https://a ; https://b".into()),
+            profile_as_of: Some("2026-10-27".into()),
+        }
+    }
+
+    #[test]
+    fn profile_columns_roundtrip_and_old_files_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("models.parquet");
+        let id = qwen_row().model_id();
+        ModelRow::write_all_with(&p, &[qwen_row()], &HashMap::from([(id.clone(), profile())])).unwrap();
+        assert_eq!(ModelRow::read_all(&p).unwrap(), vec![qwen_row()]);
+        assert_eq!(ModelRow::read_profiles(&p).unwrap()[&id], profile());
+        let full = ModelRow::to_batch(&[qwen_row()]).unwrap();
+        let old_cols = ModelRow::schema().fields().len() - Profile::COLUMNS.len();
+        let old = full.project(&(0..old_cols).collect::<Vec<_>>()).unwrap();
+        let q = dir.path().join("old.parquet");
+        write_batch(&q, &old).unwrap();
+        assert_eq!(ModelRow::read_all(&q).unwrap(), vec![qwen_row()]);
+        assert_eq!(ModelRow::read_profiles(&q).unwrap()[&id], Profile::default());
+    }
+
+    #[test]
+    fn profile_renders_after_the_fixed_part_and_never_moves_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = qwen_row();
+        let id = row.model_id();
+        let mut blocked = ev(&id, Dimension::WriteCode, "global", Outcome::Blocked, 2);
+        blocked.block_reason = Some("x".into());
+        let mut accepted = ev(&id, Dimension::Search, "global", Outcome::Accepted, 3);
+        accepted.conclusion = Some("ok".into());
+        write_events(&dir.path().join("experiences/a/s.parquet"), &[blocked, accepted]).unwrap();
+        ModelRow::write_all(&dir.path().join("models.parquet"), &[row.clone()]).unwrap();
+        let dd = DataDir::new(dir.path());
+        let plain = dd.steckbrief(&id, &Scope::Global, None, NOW).unwrap();
+        assert!(!plain.render().contains("Profil"));
+        ModelRow::write_all_with(&dir.path().join("models.parquet"), &[row], &HashMap::from([(id.clone(), profile())])).unwrap();
+        let with = dd.steckbrief(&id, &Scope::Global, None, NOW).unwrap();
+        let values = |sb: &Steckbrief| sb.rows.iter().map(|r| (r.dimension, r.scope.clone(), r.trust.to_bits(), r.pruefanteil.to_bits())).collect::<Vec<_>>();
+        assert_eq!(values(&plain), values(&with));
+        assert_eq!((plain.write_right_code, plain.decisions_right), (with.write_right_code, with.decisions_right));
+        let text = with.render();
+        let (fixed, rest) = text.split_once("Profil (öffentliche Daten, Stand 2026-10-27; kein Einfluss auf Vertrauen)\n").unwrap();
+        assert!(fixed.contains("Kosten:") && !fixed.contains("search @"), "{text}");
+        assert!(rest.contains("- Stärken: stark") && rest.contains("- Schwächen: schwach") && rest.contains("- Umfang: klein"));
+        assert!(rest.contains("- Einschätzung je Dimension (abgeleitet aus öffentlichen Daten, nicht gemessen): search=mittel"));
+        assert!(rest.contains("- Benchmarks: X 1") && rest.contains("- Quellen: https://a ; https://b"));
+        assert_eq!(text.replace(&with.profile.as_ref().unwrap().render(), ""), plain.render());
     }
 }

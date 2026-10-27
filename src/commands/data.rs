@@ -244,7 +244,9 @@ impl Validator<'_> {
 fn check_schema(path: &Path, expected: SchemaRef) -> Result<()> {
     let found = read_schema(path)?;
     let sig = |s: &SchemaRef| s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
-    if sig(&found) != sig(&expected) {
+    let (found_sig, expected_sig) = (sig(&found), sig(&expected));
+    let appended_nullable = expected.fields().iter().skip(found_sig.len()).all(|f| f.is_nullable());
+    if found_sig.len() > expected_sig.len() || expected_sig[..found_sig.len()] != found_sig[..] || !appended_nullable {
         return Err(anyhow!("schema does not match the expected columns"));
     }
     Ok(())
