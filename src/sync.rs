@@ -54,6 +54,18 @@ fn read_or_create(path: &Path, make: impl FnOnce() -> String) -> Result<String> 
     Ok(v)
 }
 
+pub fn remote_url(repo: &str) -> String {
+    let slug = repo.split_once('/').is_some_and(|(o, n)| {
+        let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        ok(o) && ok(n)
+    });
+    if slug && !Path::new(repo).exists() {
+        format!("https://github.com/{repo}.git")
+    } else {
+        repo.to_string()
+    }
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
@@ -63,13 +75,14 @@ impl DataStore {
         base.join("checkout").join(".git").exists()
     }
 
-    pub fn open(base: &Path, remote: &str, name: Option<&str>) -> Result<Self> {
+    pub fn open(base: &Path, repo: &str, name: Option<&str>) -> Result<Self> {
         let name_ok = name.filter(|n| valid_name(n));
         if let Some(n) = name {
             if name_ok.is_none() {
                 bail!("invalid data_name `{n}`");
             }
         }
+        let remote = &remote_url(repo);
         let checkout = base.join("checkout");
         let local_root = base.join("local");
         fs::create_dir_all(&checkout)?;
@@ -77,7 +90,6 @@ impl DataStore {
         if !checkout.join(".git").exists() {
             git(&checkout, &["init", "-q", "-b", BRANCH])?;
             git(&checkout, &["remote", "add", REMOTE, remote])?;
-            git(&checkout, &["sparse-checkout", "set", "--no-cone", "/data/"])?;
         } else if git(&checkout, &["remote", "get-url", REMOTE]).map(|u| u.trim() != remote).unwrap_or(true) {
             git(&checkout, &["remote", "set-url", REMOTE, remote]).or_else(|_| git(&checkout, &["remote", "add", REMOTE, remote]))?;
         }
@@ -87,7 +99,7 @@ impl DataStore {
         let machine_id = read_or_create(&base.join("machine_id"), || uuid::Uuid::new_v4().to_string())?;
         let user_id = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".into());
         let own = name_ok.unwrap_or("local");
-        let data = DataDir::new(checkout.join("data"));
+        let data = DataDir::new(checkout.clone());
         let log = SessionLog::open(&data.root, &local_root, own, &uuid::Uuid::new_v4().to_string())?.with_secret(secret.into_bytes());
         Ok(Self {
             base: base.to_path_buf(),
@@ -116,7 +128,7 @@ impl DataStore {
     }
 
     fn own_prefix(&self) -> PathBuf {
-        Path::new("data").join("experiences").join(&self.name)
+        Path::new("experiences").join(&self.name)
     }
 
     pub fn pull(&self) -> Result<()> {
