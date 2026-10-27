@@ -134,7 +134,7 @@ fn reset_files_carry_schema_version_2_and_both_versions_read() {
     let plain = dir.path().join("plain.parquet");
     let with_reset = dir.path().join("reset.parquet");
     let note = Event::new("0123456789abcdef", Dimension::Search, Scope::Global, Outcome::Note, 1);
-    write_events(&plain, &[note.clone()]).unwrap();
+    write_events(&plain, std::slice::from_ref(&note)).unwrap();
     write_events(&with_reset, &[note, reset_event("a")]).unwrap();
     let version = |p: &Path| {
         let f = std::fs::File::open(p).unwrap();

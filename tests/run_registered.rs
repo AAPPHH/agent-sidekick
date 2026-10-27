@@ -102,7 +102,7 @@ fn unregistered_fallback_still_runs_plain() {
 
 #[test]
 fn unreadable_data_store_fails_closed() {
-    let (d, mut s, repo) = fixture(true);
+    let (d, s, repo) = fixture(true);
     drop(s);
     let checkout = d.path().join("data/checkout");
     std::fs::remove_dir_all(&checkout).unwrap();
@@ -119,7 +119,7 @@ fn unreadable_data_store_fails_closed() {
 
 #[test]
 fn missing_checkout_is_created_and_the_registry_applies() {
-    let (d, mut s, repo) = fixture(true);
+    let (d, s, repo) = fixture(true);
     drop(s);
     std::fs::remove_dir_all(d.path().join("data/checkout")).unwrap();
     let cfg = d.path().join("cfg");
@@ -133,7 +133,7 @@ fn missing_checkout_is_created_and_the_registry_applies() {
 
 #[test]
 fn unregistered_model_on_a_backend_with_registered_models_is_rejected() {
-    let (d, mut s, repo) = fixture(true);
+    let (d, s, repo) = fixture(true);
     drop(s);
     let checkout = d.path().join("data/checkout");
     let row = ModelRow {

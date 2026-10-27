@@ -1207,7 +1207,7 @@ mod tests {
         let mut accepted = ev(&id, Dimension::Search, "global", Outcome::Accepted, 3);
         accepted.conclusion = Some("ok".into());
         write_events(&dir.path().join("experiences/a/s.parquet"), &[blocked, accepted]).unwrap();
-        ModelRow::write_all(&dir.path().join("models.parquet"), &[row.clone()]).unwrap();
+        ModelRow::write_all(&dir.path().join("models.parquet"), std::slice::from_ref(&row)).unwrap();
         let dd = DataDir::new(dir.path());
         let plain = dd.steckbrief(&id, &Scope::Global, None, NOW).unwrap();
         assert!(!plain.render().contains("Profil"));
