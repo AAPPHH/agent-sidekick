@@ -221,3 +221,23 @@ fn owners_may_change_root_files_but_not_foreign_prefixes() {
     let v = violations(&root, &base, "owen");
     assert!(v.iter().any(|m| m.starts_with("experiences/bob/") && m.contains("outside the prefixes")), "{v:?}");
 }
+
+#[test]
+fn validate_accepts_the_questions_column_and_files_without_it() {
+    use agent_sidekick::data::events_to_batch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::metadata::KeyValue;
+    let (_d, root, base) = repo();
+    let mut with = event("a", Outcome::Accepted, Dimension::Search);
+    with.questions = Some(2);
+    write_events(&root.join("experiences/alice/new.parquet"), &[with]).unwrap();
+    let batch = events_to_batch(&[event("b", Outcome::Accepted, Dimension::Search)]).unwrap();
+    let old = batch.project(&(0..batch.num_columns() - 1).collect::<Vec<_>>()).unwrap();
+    let props = WriterProperties::builder().set_key_value_metadata(Some(vec![KeyValue::new("schema_version".to_string(), "1".to_string())])).build();
+    let mut w = ArrowWriter::try_new(std::fs::File::create(root.join("experiences/alice/old.parquet")).unwrap(), old.schema(), Some(props)).unwrap();
+    w.write(&old).unwrap();
+    w.close().unwrap();
+    commit(&root, "x");
+    assert!(violations(&root, &base, "alice").is_empty());
+}

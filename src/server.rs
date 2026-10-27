@@ -200,6 +200,8 @@ pub struct AnswerParams {
     pub job_id: String,
     /// Your answer; the blocked worker receives it as the result of ask_orchestrator.
     pub answer: String,
+    /// The question_id from the `question` result. Without it the answer goes to the currently open question; with it only to that question.
+    pub question_id: Option<u64>,
 }
 
 pub use crate::workflow::WorkflowParams;
@@ -1672,11 +1674,15 @@ impl SidekickServer {
             Err(msg) => return tool_error_with(&snap, msg),
         };
         let phase: SharedPhase = Arc::new(std::sync::Mutex::new(RunPhase::primary()));
-        let session = self.state.broker.open(&prep.dreq.job_id, &self.state.shutdown, phase, prep.dreq.timeout);
+        let job_id = prep.dreq.job_id.clone();
+        let session = match self.state.broker.open(&job_id, std::slice::from_ref(&job_id), &self.state.shutdown, phase, prep.dreq.timeout) {
+            Ok(s) => s,
+            Err(msg) => return tool_error_with(&snap, msg),
+        };
         let (server, job_snap, job_session) = (self.clone(), snap.clone(), session.clone());
-        tokio::spawn(async move {
-            let report = server.execute_job(job_snap, prep, job_session.clone(), JobExtras::default()).await;
-            job_session.send(JobEvent::Done { text: report.text, is_error: report.is_error });
+        self.spawn_job(&session, async move {
+            let report = server.execute_job(job_snap, prep, job_session, JobExtras::default()).await;
+            (report.text, report.is_error)
         });
         self.wait_event(&session, &ctx).await
     }
@@ -1684,19 +1690,25 @@ impl SidekickServer {
     /// Answer a question a delegated worker asked (status `question` of sidekick_dispatch,
     /// sidekick_run, sidekick_workflow or an earlier sidekick_answer). The answer is delivered to
     /// the blocked worker; the call then waits for the job's next event (another question or the
-    /// final result) and returns it in the same format as sidekick_dispatch.
+    /// final result) and returns it in the same format as sidekick_dispatch. Pass the
+    /// question_id of the question: an answer for an expired question is never delivered to a
+    /// later one.
     #[tool]
     async fn sidekick_answer(
         &self,
         Parameters(p): Parameters<AnswerParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        match self.state.broker.answer(p.job_id.trim(), p.answer) {
+        match self.state.broker.answer(p.job_id.trim(), p.question_id, p.answer) {
             Answered::Unknown => tool_error(format!("no running job `{}` with a question (finished, cancelled or unknown)", p.job_id.trim())),
             Answered::Delivered(session) => self.wait_event(&session, &ctx).await,
+            Answered::OtherQuestionOpen { open_id, text } => Ok(text_result(
+                redact_all(&format!("note: question {} is not open, your answer was not delivered\nstatus: question\nquestion_id: {open_id}\nquestion: {text}\nanswer it with sidekick_answer(job_id, answer, question_id={open_id})", p.question_id.map_or_else(String::new, |q| q.to_string()))),
+                false,
+            )),
             Answered::NoOpenQuestion(session) => {
                 let r = self.wait_event(&session, &ctx).await?;
-                let note = "note: the worker has no open question (already answered, or it got no answer in time); your answer was not delivered\n";
+                let note = "note: the worker has no open question with this id (already answered, or it got no answer in time); your answer was not delivered\n";
                 Ok(text_result(format!("{note}{}", text_of(&r)), r.is_error.unwrap_or(false)))
             }
         }
@@ -1708,8 +1720,8 @@ impl SidekickServer {
     /// parallel; a dependent step's prompt gets the results of its dependencies. Writing steps
     /// share one workflow branch (each diff is checked with its own trust rules and committed
     /// only when clean); a blocked or failed step skips its dependents. Nothing reaches the
-    /// working tree until the end: when every writing step ran on the Gold model the combined
-    /// patch is applied, otherwise the workflow branch, the combined patch and the per-step
+    /// working tree until the end: when every step ran on the verified Gold model and none produced
+    /// warnings the combined patch is applied, otherwise the workflow branch, the combined patch and the per-step
     /// results (each with its own job_id for sidekick_record_experience) are returned. Questions
     /// of any step surface as in sidekick_dispatch (answer with sidekick_answer).
     #[tool]
@@ -1724,13 +1736,13 @@ impl SidekickServer {
             Err(msg) => return tool_error_with(&snap, msg),
         };
         let phase: SharedPhase = Arc::new(std::sync::Mutex::new(RunPhase::primary()));
-        let session = self.state.broker.open(&plan.id, &self.state.shutdown, phase, plan.total_timeout());
+        let session = match self.state.broker.open(&plan.id, &plan.job_ids(), &self.state.shutdown, phase, plan.total_timeout()) {
+            Ok(s) => s,
+            Err(msg) => return tool_error_with(&snap, msg),
+        };
         with_phase(&session.phase, |p| p.started = Some(Instant::now()));
         let (server, job_snap, job_session) = (self.clone(), snap.clone(), session.clone());
-        tokio::spawn(async move {
-            let (text, is_error) = crate::workflow::run(server, job_snap, plan, job_session.clone()).await;
-            job_session.send(JobEvent::Done { text, is_error });
-        });
+        self.spawn_job(&session, crate::workflow::run(server, job_snap, plan, job_session));
         self.wait_event(&session, &ctx).await
     }
 }
@@ -1755,12 +1767,12 @@ pub(crate) struct JobReport {
     pub result: Option<DispatchResult>,
 }
 
-fn format_question(job_id: &str, step: Option<&str>, workflow: &str, text: &str) -> String {
-    let mut s = format!("status: question\njob_id: {job_id}\n");
+fn format_question(job_id: &str, question_id: u64, step: Option<&str>, workflow: &str, text: &str) -> String {
+    let mut s = format!("status: question\njob_id: {job_id}\nquestion_id: {question_id}\n");
     if let Some(step) = step {
         let _ = writeln!(s, "workflow: {workflow}\nstep: {step}");
     }
-    let _ = write!(s, "question: {text}\nanswer with sidekick_answer(job_id, answer); the call returns the job's next event");
+    let _ = write!(s, "question: {text}\nanswer with sidekick_answer(job_id, answer, question_id); the call returns the job's next event");
     s
 }
 
@@ -1772,6 +1784,16 @@ type LocateResult = Result<Result<Located, LocateError>, String>;
 type TokenResults = Result<Vec<(SecretId, Result<(Token, TokenSource), TokenError>)>, String>;
 
 impl SidekickServer {
+    pub(crate) fn check_free(&self, repo: &Path, work_dir: &Path, id: &str) -> Result<(), String> {
+        if self.state.broker.taken(id) {
+            return Err(format!("`{id}` is already running"));
+        }
+        match dispatch::name_taken(repo, work_dir, id) {
+            Some(why) => Err(format!("`{id}` rejected: {why}")),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) async fn prepare_dispatch(&self, snap: &Snapshot, p: &DispatchParams) -> Result<Prepared, String> {
         let backends = snap.backends.as_ref().map_err(|e| config_invalid_message(e))?;
         let store = self.store(snap).await?;
@@ -1796,12 +1818,18 @@ impl SidekickServer {
         if let Some(secs) = self.state.cooldown(&backend.name) {
             return Err(format!("backend {} is rate limited, retry in {secs}s; choose another backend", backend.name));
         }
+        let job_id = match p.job_id.as_deref() {
+            Some(j) if dispatch::valid_id(j, dispatch::JOB_ID_MAX) => j.to_string(),
+            Some(j) => return Err(format!("job_id `{j}` must be 1-{} letters, digits, `-` or `_`", dispatch::JOB_ID_MAX)),
+            None => format!("j-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+        };
+        self.check_free(&req.cwd, &store.base.join("work"), &job_id)?;
         let dreq = DispatchRequest {
             prompt: req.prompt.clone(),
             repo: req.cwd.clone(),
             dimension,
             scope,
-            job_id: p.job_id.clone().unwrap_or_else(|| format!("j-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])),
+            job_id,
             model: req.model.clone(),
             max_turns: req.max_turns,
             timeout: req.timeout,
@@ -1822,6 +1850,9 @@ impl SidekickServer {
         if cancel.is_cancelled() {
             return fail(CANCELLED_QUEUED_MSG.into());
         }
+        with_phase(&session.phase, |p| {
+            p.started.get_or_insert_with(Instant::now);
+        });
         let counters = st.backend_counters(&backend.name);
         let _running = CountGuard::all([&st.counters.running, &counters.running]);
         let logs_dir = match crate::paths::logs_dir() {
@@ -1838,17 +1869,18 @@ impl SidekickServer {
             launcher: dispatch::real_launcher(snap.config.claude_path.clone(), snap.config.pass_env.clone()),
         };
         let pause = Arc::new(runner::Pause::default());
-        st.broker.attach(&dreq.job_id, &session.id);
         let ask_job = AskJob::new(&dreq.job_id, extras.step.clone(), session.clone(), st.broker.clone(), pause.clone());
-        let ask_server = AskServer::start(&dispatcher.work_dir.join("ask"), ask_job.clone())
-            .map_err(|e| tracing::warn!(job = %dreq.job_id, "ask_orchestrator unavailable: {e:#}"))
-            .ok();
-        let wire = ask_server.as_ref().and_then(|s| {
-            let exe = std::env::current_exe().map_err(|e| tracing::warn!("ask_orchestrator unavailable: {e}")).ok()?;
-            Some(AskWire { exe, job_id: dreq.job_id.clone(), endpoint: s.endpoint.clone() })
-        });
+        let ask_server = match AskServer::start(&dispatcher.work_dir.join("ask"), ask_job.clone()) {
+            Ok(s) => s,
+            Err(e) => return fail(format!("ask_orchestrator cannot be wired for job {}: {e:#}", dreq.job_id)),
+        };
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => return fail(format!("ask_orchestrator cannot be wired for job {}: {e}", dreq.job_id)),
+        };
+        let wire = Some(AskWire { exe, job_id: dreq.job_id.clone(), endpoint: ask_server.endpoint.clone() });
         tracing::info!(backend = %backend.name, job = %dreq.job_id, "sidekick_dispatch started");
-        let run_extras = RunExtras { ask: wire, base: extras.base, hold_gold: extras.hold_gold, pause: Some(pause) };
+        let run_extras = RunExtras { ask: wire, base: extras.base, hold_gold: extras.hold_gold, pause: Some(pause), unanswered: Some(ask_job.unanswered.clone()) };
         let outcome = dispatcher.run_with(&backend, &dreq, cancel.clone(), run_extras).await;
         drop(ask_server);
         drop(global_permit);
@@ -1862,26 +1894,35 @@ impl SidekickServer {
         if !asked.is_empty() {
             let _ = write!(text, "\nquestions asked: {}", asked.len());
         }
-        if let Some(event) = event {
-            let extra = ask::question_events(&event, &asked);
-            let mut all = vec![event];
-            all.extend(extra);
-            for e in all {
-                let store = store.clone();
-                match blocking(move || store.append(e).map_err(|e| format!("{e:#}"))).await {
-                    Ok(Ok((_, pushed))) => {
-                        if !pushed && !text.contains("not pushed yet") {
-                            text.push_str("\nnote: event stored locally, not pushed yet (sidekick_sync retries)");
-                        }
+        if let Some(mut event) = event {
+            event.questions = (!asked.is_empty()).then_some(asked.len() as i64);
+            let store = store.clone();
+            match blocking(move || store.append(event).map_err(|e| format!("{e:#}"))).await {
+                Ok(Ok((_, pushed))) => {
+                    if !pushed {
+                        text.push_str("\nnote: event stored locally, not pushed yet (sidekick_sync retries)");
                     }
-                    Ok(Err(e)) | Err(e) => {
-                        let _ = write!(text, "\nwarning: event could not be recorded: {e}");
-                    }
+                }
+                Ok(Err(e)) | Err(e) => {
+                    let _ = write!(text, "\nwarning: event could not be recorded: {e}");
                 }
             }
         }
         let is_error = matches!(result.status, dispatch::Status::Blocked | dispatch::Status::Failed);
         JobReport { text: redact_all(&text), is_error, result: Some(result) }
+    }
+
+    fn spawn_job(&self, session: &Arc<Session>, job: impl std::future::Future<Output = (String, bool)> + Send + 'static) {
+        let (session, broker) = (session.clone(), self.state.broker.clone());
+        tokio::spawn(async move {
+            let (text, is_error) = tokio::spawn(job).await.unwrap_or_else(|e| (format!("the job task failed: {e}"), true));
+            session.send(JobEvent::Done { text, is_error });
+            tokio::select! {
+                _ = tokio::time::sleep(ask::result_grace()) => {}
+                _ = session.cancel.cancelled() => {}
+            }
+            broker.close(&session);
+        });
     }
 
     async fn wait_event(&self, session: &Arc<Session>, ctx: &RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
@@ -1892,16 +1933,16 @@ impl SidekickServer {
             e = session.next() => e,
             _ = ctx.ct.cancelled() => {
                 session.cancel.cancel();
-                self.state.broker.close(&session.id);
+                self.state.broker.close(session);
                 drop(ticker);
                 return tool_error(CANCELLED_LINE);
             }
         };
         drop(ticker);
         match event {
-            Some(JobEvent::Question { job_id, step, text }) => Ok(text_result(redact_all(&format_question(&job_id, step.as_deref(), &session.id, &text)), false)),
+            Some(JobEvent::Question { job_id, step, question_id, text }) => Ok(text_result(redact_all(&format_question(&job_id, question_id, step.as_deref(), &session.id, &text)), false)),
             Some(JobEvent::Done { text, is_error }) => {
-                self.state.broker.close(&session.id);
+                self.state.broker.close(session);
                 Ok(text_result(text, is_error))
             }
             None => tool_error("the job ended without a result"),

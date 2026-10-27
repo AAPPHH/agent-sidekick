@@ -380,6 +380,7 @@ pub fn experience_schema() -> SchemaRef {
         ("conclusion", DataType::Utf8, true),
         ("visibility", DataType::Utf8, false),
         (VERSION_KEY, DataType::Int32, false),
+        ("questions", DataType::Int64, true),
     ])
 }
 
@@ -415,6 +416,7 @@ pub fn events_to_batch(events: &[Event]) -> Result<RecordBatch> {
         o(|e| e.conclusion.clone()),
         s(|e| e.visibility.as_str().into()),
         Arc::new(Int32Array::from(vec![events_version(events); events.len()])),
+        Arc::new(Int64Array::from(events.iter().map(|e| e.questions).collect::<Vec<_>>())),
     ];
     Ok(RecordBatch::try_new(experience_schema(), cols)?)
 }
@@ -448,6 +450,7 @@ pub fn read_events(path: &Path) -> Result<Vec<Event>> {
                 summary: r.str("summary"),
                 conclusion: r.str("conclusion"),
                 visibility: Visibility::parse(&r.req("visibility")?)?,
+                questions: r.i64("questions"),
             })
         })
         .collect()
@@ -1317,10 +1320,32 @@ mod tests {
         let gold = ModelRow { key: ModelKey::new("anthropic", "claude-opus-5-5", "x", "-", "claude-code"), ..qwen_row() };
         assert!(!Steckbrief::build(&gold, &[], &Scope::Global, NOW).render_short(None).contains("Rückfragen"));
         let mut note = ev(&qwen.model_id(), Dimension::Search, "global", Outcome::Note, 1);
-        note.summary = Some("questions: 3".into());
-        let sb = Steckbrief::build(&qwen, &[note], &Scope::Global, NOW);
+        note.questions = Some(3);
+        let sb = Steckbrief::build(&qwen, &[note.clone()], &Scope::Global, NOW);
         assert_eq!(sb.questions, 3);
         assert!(sb.render().contains("Rückfragen der Worker: 3"));
+        let accepted = ev(&qwen.model_id(), Dimension::Search, "global", Outcome::Accepted, 0);
+        let sb_cell = Steckbrief::build(&qwen, &[accepted, note.clone()], &Scope::Global, NOW);
+        assert_eq!(sb_cell.rows.iter().map(|r| r.counters.note).sum::<u32>(), 1);
+        let reset = ev(&qwen.model_id(), Dimension::Search, "global", Outcome::Reset, 2);
+        assert_eq!(Steckbrief::build(&qwen, &[note, reset], &Scope::Global, NOW).questions, 0);
+    }
+
+    #[test]
+    fn question_count_roundtrips_and_files_without_the_column_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = ev("m", Dimension::Search, "global", Outcome::Note, 1);
+        e.questions = Some(2);
+        let p = dir.path().join("e.parquet");
+        write_events(&p, &[e.clone(), ev("m", Dimension::Search, "global", Outcome::Note, 2)]).unwrap();
+        let back = read_events(&p).unwrap();
+        assert_eq!((back[0].questions, back[1].questions), (Some(2), None));
+        let full = events_to_batch(&[e.clone()]).unwrap();
+        let old = full.project(&(0..full.num_columns() - 1).collect::<Vec<_>>()).unwrap();
+        let q = dir.path().join("old.parquet");
+        write_batch(&q, &old, SCHEMA_VERSION).unwrap();
+        let back = read_events(&q).unwrap();
+        assert_eq!((back.len(), back[0].questions), (1, None));
     }
 
     #[test]

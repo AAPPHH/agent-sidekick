@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use agent_sidekick::backends::{Backend, BackendKind, Cost};
 use agent_sidekick::data::{write_events, DataDir, ModelRow, SessionLog};
-use agent_sidekick::dispatch::{sha256_hex, DispatchRequest, Dispatcher, Identity, Status};
+use agent_sidekick::dispatch::{sha256_hex, DispatchRequest, Dispatcher, Identity, RunExtras, Status};
 use agent_sidekick::redact::Secrets;
 use agent_sidekick::runner::claude_launch;
 use agent_sidekick::trust::{Dimension, Event, ModelKey, Outcome, Scope, Sperre};
@@ -553,4 +553,50 @@ async fn blocked_events_carry_a_mechanical_lesson_as_conclusion() {
     let mut e = env("m-l3", true, 0, "printf 'fn b() {}\\n' > src/b.rs\n");
     run(&mut e, "m-l3", Dimension::WriteCode, "jl3").await;
     assert_eq!(e.log.events()[0].conclusion.as_deref(), Some("ohne Schreibrecht nur Vorschlag verlangen"));
+}
+
+#[tokio::test]
+async fn gold_with_an_unanswered_question_is_returned_as_branch_and_not_applied() {
+    let e = env("claude-opus-5-5", true, 0, &format!("printf 'fn a() {{ let decided_by = 1; }}\\n' > src/lib.rs\n{}", reports("claude-opus-5-5-20261001")));
+    let req = request(&e, Dimension::WriteCode, "unans");
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let extras = RunExtras { unanswered: Some(flag), ..Default::default() };
+    let (r, _) = e.dispatcher.run_with(&backend("claude-opus-5-5"), &req, tokio_util::sync::CancellationToken::new(), extras).await.unwrap();
+    assert_eq!(r.status, Status::Completed);
+    assert!(!r.applied && r.branch.as_deref() == Some("sidekick/unans") && r.gold);
+    assert!(r.warnings.iter().any(|w| w.contains("went unanswered")), "{:?}", r.warnings);
+    assert_eq!(std::fs::read_to_string(e.repo.join("src/lib.rs")).unwrap(), SRC);
+}
+
+#[tokio::test]
+async fn a_step_branch_is_one_commit_on_its_base_and_the_answer_is_the_final_text() {
+    let e = env("claude-opus-5-5", true, 0, &format!("echo x > one.txt; git add -A; git -c user.name=w -c user.email=w@w commit -q -m own; echo y > two.txt\n{}", reports("claude-opus-5-5-20261001")));
+    let mut req = request(&e, Dimension::WriteCode, "squash");
+    req.job_id = "squash".into();
+    let extras = RunExtras { hold_gold: true, ..Default::default() };
+    let (r, _) = e.dispatcher.run_with(&backend("claude-opus-5-5"), &req, tokio_util::sync::CancellationToken::new(), extras).await.unwrap();
+    let count = Command::new("git").arg("-C").arg(&e.repo).args(["rev-list", "--count", "HEAD..sidekick/squash"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    assert!(!r.answer.is_empty() && !r.answer.contains("\"type\""), "{}", r.answer);
+    let files = Command::new("git").arg("-C").arg(&e.repo).args(["show", "--name-only", "--format=", "sidekick/squash"]).output().unwrap();
+    let files = String::from_utf8_lossy(&files.stdout).into_owned();
+    assert!(files.contains("one.txt") && files.contains("two.txt"), "{files}");
+}
+
+#[test]
+fn ids_share_one_rule_and_taken_names_are_found() {
+    use agent_sidekick::dispatch::{name_taken, valid_id};
+    for ok in ["a", "j-1_x", &"a".repeat(40)] {
+        assert!(valid_id(ok, 40), "{ok}");
+    }
+    for bad in ["", "../x", "/abs/x", "a b", ".h", "a.b", "a/b", "a\\b", &"a".repeat(41)] {
+        assert!(!valid_id(bad, 40), "{bad}");
+    }
+    let e = env("m-t", true, 0, "");
+    let work = e.dir.path().join("work");
+    assert!(name_taken(&e.repo, &work, "fresh").is_none());
+    sh(&e.repo, &["branch", "sidekick/old"]);
+    assert!(name_taken(&e.repo, &work, "old").unwrap().contains("branch"));
+    std::fs::create_dir_all(work.join("worktrees/wt")).unwrap();
+    assert!(name_taken(&e.repo, &work, "wt").unwrap().contains("worktree"));
 }

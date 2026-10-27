@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use rmcp::{
@@ -22,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::harness::HarnessKind;
 use crate::runner::{Launch, Pause};
 use crate::server::SharedPhase;
-use crate::trust::{Event, Outcome, Visibility};
+use crate::trust::{Event, Outcome};
 
 pub const ASK_SERVER: &str = "sidekick_ask";
 pub const ASK_TOOL: &str = "ask_orchestrator";
@@ -30,17 +31,26 @@ pub const CLAUDE_TOOL_NAME: &str = "mcp__sidekick_ask__ask_orchestrator";
 pub const OPENCODE_TOOL_NAME: &str = "sidekick_ask_ask_orchestrator";
 pub const ASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub const ENV_ASK_TIMEOUT: &str = "AGENT_SIDEKICK_ASK_TIMEOUT_S";
+pub const ENV_RESULT_GRACE: &str = "AGENT_SIDEKICK_RESULT_GRACE_S";
 pub const NO_ANSWER: &str = "Keine Antwort vom Orchestrator: nichts entscheiden, aktuellen Stand abliefern und offene Punkte nennen.";
 pub const ASK_PROMPT_LINE: &str = "You have the MCP tool ask_orchestrator(question): use it instead of guessing when a decision is open.";
-pub const QUESTIONS_PREFIX: &str = "questions: ";
+pub const MAX_PAUSED: Duration = Duration::from_secs(60 * 60);
 pub const ENV_ASK_JOB: &str = "AGENT_SIDEKICK_ASK_JOB";
 pub const ENV_ASK_SOCKET: &str = "AGENT_SIDEKICK_ASK_SOCKET";
 pub const ENV_ASK_EXE: &str = "AGENT_SIDEKICK_ASK_EXE";
 const TOOL_TIMEOUT_MARGIN: Duration = Duration::from_secs(5 * 60);
 const BRIDGE_PROGRESS: Duration = Duration::from_secs(20);
 
+fn clamp_timeout(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0).map_or(ASK_TIMEOUT, Duration::from_secs).min(MAX_PAUSED)
+}
+
 pub fn ask_timeout() -> Duration {
-    std::env::var(ENV_ASK_TIMEOUT).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0).map_or(ASK_TIMEOUT, Duration::from_secs)
+    clamp_timeout(std::env::var(ENV_ASK_TIMEOUT).ok().as_deref())
+}
+
+pub fn result_grace() -> Duration {
+    std::env::var(ENV_RESULT_GRACE).ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(ASK_TIMEOUT, Duration::from_secs).min(MAX_PAUSED)
 }
 
 #[derive(Clone, Debug)]
@@ -133,18 +143,31 @@ mod transport {
     pub type Stream = tokio::net::UnixStream;
     pub struct Listener(tokio::net::UnixListener, PathBuf);
 
-    pub fn bind(dir: &Path, job_id: &str) -> Result<(Listener, String, String)> {
-        use std::os::unix::fs::PermissionsExt;
+    const SOCKET_PATH_MAX: usize = 100;
+
+    pub fn bind(dir: &Path) -> Result<(Listener, String, String)> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         std::fs::create_dir_all(dir)?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        let path = dir.join(format!("{job_id}.sock"));
-        if path.as_os_str().len() > 100 {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let mut job_dir = dir.join(&id[..16]);
+        if job_dir.join("s").as_os_str().len() > SOCKET_PATH_MAX {
+            job_dir = std::env::temp_dir().join(format!("sk-{}", &id[..16]));
+        }
+        let path = job_dir.join("s");
+        if path.as_os_str().len() > SOCKET_PATH_MAX {
             bail!("ask socket path too long: {}", path.display());
         }
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok((Listener(listener, path.clone()), path.to_string_lossy().into_owned(), String::new()))
+        std::fs::DirBuilder::new().mode(0o700).create(&job_dir)?;
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(l) => Listener(l, job_dir.clone()),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&job_dir);
+                return Err(e.into());
+            }
+        };
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        Ok((listener, format!("{}#{token}", path.to_string_lossy()), token))
     }
 
     impl Listener {
@@ -155,12 +178,13 @@ mod transport {
 
     impl Drop for Listener {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.1);
+            let _ = std::fs::remove_dir_all(&self.1);
         }
     }
 
     pub async fn connect(endpoint: &str) -> std::io::Result<(Stream, String)> {
-        Ok((tokio::net::UnixStream::connect(endpoint).await?, String::new()))
+        let (path, token) = endpoint.rsplit_once('#').unwrap_or((endpoint, ""));
+        Ok((tokio::net::UnixStream::connect(path).await?, token.to_string()))
     }
 }
 
@@ -170,7 +194,7 @@ mod transport {
     pub type Stream = tokio::net::TcpStream;
     pub struct Listener(tokio::net::TcpListener);
 
-    pub fn bind(_dir: &Path, _job_id: &str) -> Result<(Listener, String, String)> {
+    pub fn bind(_dir: &Path) -> Result<(Listener, String, String)> {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         std_listener.set_nonblocking(true)?;
         let port = std_listener.local_addr()?.port();
@@ -192,7 +216,7 @@ mod transport {
 
 #[derive(Debug)]
 pub enum JobEvent {
-    Question { job_id: String, step: Option<String>, text: String },
+    Question { job_id: String, step: Option<String>, question_id: u64, text: String },
     Done { text: String, is_error: bool },
 }
 
@@ -220,7 +244,7 @@ impl Session {
 struct BrokerState {
     sessions: HashMap<String, Arc<Session>>,
     job_session: HashMap<String, String>,
-    pending: HashMap<String, Vec<(u64, oneshot::Sender<String>)>>,
+    pending: HashMap<String, (u64, String, oneshot::Sender<String>)>,
     next: u64,
 }
 
@@ -232,6 +256,7 @@ pub struct Broker {
 pub enum Answered {
     Delivered(Arc<Session>),
     NoOpenQuestion(Arc<Session>),
+    OtherQuestionOpen { open_id: u64, text: String },
     Unknown,
 }
 
@@ -240,19 +265,31 @@ impl Broker {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(crate) fn open(&self, id: &str, shutdown: &CancellationToken, phase: SharedPhase, timeout: Duration) -> Arc<Session> {
+    pub fn taken(&self, id: &str) -> bool {
+        let st = self.st();
+        st.sessions.contains_key(id) || st.job_session.contains_key(id)
+    }
+
+    pub(crate) fn open(&self, id: &str, job_ids: &[String], shutdown: &CancellationToken, phase: SharedPhase, timeout: Duration) -> Result<Arc<Session>, String> {
+        let mut st = self.st();
+        if let Some(busy) = std::iter::once(id).chain(job_ids.iter().map(String::as_str)).find(|i| st.sessions.contains_key(*i) || st.job_session.contains_key(*i)) {
+            return Err(format!("`{busy}` is already running; job_id and workflow_id must be unique"));
+        }
         let (tx, rx) = mpsc::unbounded_channel();
         let session = Arc::new(Session { id: id.to_string(), timeout, cancel: shutdown.child_token(), phase, tx, rx: tokio::sync::Mutex::new(rx) });
-        self.st().sessions.insert(id.to_string(), session.clone());
-        session
+        st.sessions.insert(id.to_string(), session.clone());
+        for j in job_ids {
+            st.job_session.insert(j.clone(), id.to_string());
+        }
+        Ok(session)
     }
 
-    pub fn attach(&self, job_id: &str, session_id: &str) {
-        self.st().job_session.insert(job_id.to_string(), session_id.to_string());
-    }
-
-    pub fn close(&self, session_id: &str) {
+    pub fn close(&self, session: &Arc<Session>) {
+        let session_id = session.id.as_str();
         let mut st = self.st();
+        if !st.sessions.get(session_id).is_some_and(|s| Arc::ptr_eq(s, session)) {
+            return;
+        }
         st.sessions.remove(session_id);
         let jobs: Vec<String> = st.job_session.iter().filter(|(_, s)| *s == session_id).map(|(j, _)| j.clone()).collect();
         for j in jobs {
@@ -266,31 +303,34 @@ impl Broker {
         st.job_session.get(job_id).and_then(|s| st.sessions.get(s)).cloned()
     }
 
-    pub fn answer(&self, job_id: &str, text: String) -> Answered {
+    pub fn answer(&self, job_id: &str, question_id: Option<u64>, answer: String) -> Answered {
         let Some(session) = self.session_of(job_id) else { return Answered::Unknown };
         let mut st = self.st();
-        let queue = st.pending.entry(job_id.to_string()).or_default();
-        while !queue.is_empty() {
-            let (_, tx) = queue.remove(0);
-            if tx.send(text.clone()).is_ok() {
-                return Answered::Delivered(session);
-            }
+        let Some((open_id, text, _)) = st.pending.get(job_id) else { return Answered::NoOpenQuestion(session) };
+        if question_id.is_some_and(|w| w != *open_id) {
+            return Answered::OtherQuestionOpen { open_id: *open_id, text: text.clone() };
         }
-        Answered::NoOpenQuestion(session)
+        let (_, _, tx) = st.pending.remove(job_id).expect("checked");
+        if tx.send(answer).is_ok() {
+            Answered::Delivered(session)
+        } else {
+            Answered::NoOpenQuestion(session)
+        }
     }
 
-    fn add_pending(&self, job_id: &str) -> (u64, oneshot::Receiver<String>) {
+    fn add_pending(&self, job_id: &str, question: &str) -> (u64, oneshot::Receiver<String>) {
         let (tx, rx) = oneshot::channel();
         let mut st = self.st();
         st.next += 1;
         let id = st.next;
-        st.pending.entry(job_id.to_string()).or_default().push((id, tx));
+        st.pending.insert(job_id.to_string(), (id, question.to_string(), tx));
         (id, rx)
     }
 
     fn drop_pending(&self, job_id: &str, id: u64) {
-        if let Some(q) = self.st().pending.get_mut(job_id) {
-            q.retain(|(i, _)| *i != id);
+        let mut st = self.st();
+        if st.pending.get(job_id).is_some_and(|(i, ..)| *i == id) {
+            st.pending.remove(job_id);
         }
     }
 }
@@ -302,28 +342,80 @@ pub struct AskJob {
     pub broker: Arc<Broker>,
     pub pause: Arc<Pause>,
     pub timeout: Duration,
+    pub budget: Duration,
     pub questions: Mutex<Vec<String>>,
+    pub unanswered: Arc<AtomicBool>,
+    used: Mutex<Duration>,
+    turn: tokio::sync::Mutex<()>,
+}
+
+struct OpenQuestion<'a> {
+    job: &'a AskJob,
+    id: u64,
+    since: Instant,
+    answered: bool,
+}
+
+impl Drop for OpenQuestion<'_> {
+    fn drop(&mut self) {
+        self.job.broker.drop_pending(&self.job.job_id, self.id);
+        *self.job.used.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += self.since.elapsed();
+        if !self.answered {
+            self.job.unanswered.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl AskJob {
     pub fn new(job_id: &str, step: Option<String>, session: Arc<Session>, broker: Arc<Broker>, pause: Arc<Pause>) -> Arc<Self> {
-        Arc::new(Self { job_id: job_id.into(), step, session, broker, pause, timeout: ask_timeout(), questions: Mutex::default() })
+        Self::with_limits(job_id, step, session, broker, pause, ask_timeout(), MAX_PAUSED)
+    }
+
+    pub fn with_limits(job_id: &str, step: Option<String>, session: Arc<Session>, broker: Arc<Broker>, pause: Arc<Pause>, timeout: Duration, budget: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            job_id: job_id.into(),
+            step,
+            session,
+            broker,
+            pause,
+            timeout,
+            budget,
+            questions: Mutex::default(),
+            unanswered: Arc::default(),
+            used: Mutex::default(),
+            turn: tokio::sync::Mutex::new(()),
+        })
     }
 
     pub fn asked(&self) -> Vec<String> {
         self.questions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
+    fn give_up(&self) -> String {
+        self.unanswered.store(true, Ordering::SeqCst);
+        NO_ANSWER.to_string()
+    }
+
     pub async fn ask(&self, question: String) -> String {
+        let _turn = tokio::select! {
+            t = self.turn.lock() => t,
+            _ = self.session.cancel.cancelled() => return self.give_up(),
+        };
+        let left = self.budget.saturating_sub(*self.used.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let limit = self.timeout.min(left);
+        if limit.is_zero() || self.session.cancel.is_cancelled() {
+            return self.give_up();
+        }
         self.questions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(question.clone());
-        let (id, rx) = self.broker.add_pending(&self.job_id);
+        let (id, rx) = self.broker.add_pending(&self.job_id, &question);
+        let mut open = OpenQuestion { job: self, id, since: Instant::now(), answered: false };
         let _hold = self.pause.hold();
-        self.session.send(JobEvent::Question { job_id: self.job_id.clone(), step: self.step.clone(), text: question });
+        self.session.send(JobEvent::Question { job_id: self.job_id.clone(), step: self.step.clone(), question_id: id, text: question });
         let answer = tokio::select! {
-            a = tokio::time::timeout(self.timeout, rx) => a.ok().and_then(Result::ok),
+            a = tokio::time::timeout(limit, rx) => a.ok().and_then(Result::ok),
             _ = self.session.cancel.cancelled() => None,
         };
-        self.broker.drop_pending(&self.job_id, id);
+        open.answered = answer.is_some();
         answer.unwrap_or_else(|| NO_ANSWER.to_string())
     }
 }
@@ -368,7 +460,7 @@ async fn handle(stream: transport::Stream, job: Arc<AskJob>, token: String) {
 
 impl AskServer {
     pub fn start(dir: &Path, job: Arc<AskJob>) -> Result<Self> {
-        let (listener, endpoint, token) = transport::bind(dir, &job.job_id)?;
+        let (listener, endpoint, token) = transport::bind(dir)?;
         Ok(Self { endpoint, handle: tokio::spawn(accept_loop(listener, job, token)) })
     }
 }
@@ -379,29 +471,10 @@ async fn accept_loop(listener: transport::Listener, job: Arc<AskJob>, token: Str
     }
 }
 
-pub fn question_events(base: &Event, questions: &[String]) -> Vec<Event> {
-    if questions.is_empty() {
-        return Vec::new();
-    }
-    let note = |summary: String, visibility: Visibility| {
-        let mut e = Event::new(&base.model_id, base.dimension, base.scope.clone(), Outcome::Note, base.ts_ms);
-        e.machine_id = base.machine_id.clone();
-        e.user_id = base.user_id.clone();
-        e.job_id = base.job_id.clone();
-        e.summary = Some(summary);
-        e.visibility = visibility;
-        e
-    };
-    let texts: Vec<String> = questions.iter().enumerate().map(|(i, q)| format!("{}. {q}", i + 1)).collect();
-    vec![note(format!("{QUESTIONS_PREFIX}{}", questions.len()), Visibility::Shared), note(format!("questions:\n{}", texts.join("\n")), Visibility::Private)]
-}
-
 pub fn count_questions(events: &[Event], model_id: &str) -> u32 {
-    events
-        .iter()
-        .filter(|e| e.model_id == model_id && e.outcome == Outcome::Note)
-        .filter_map(|e| e.summary.as_deref()?.strip_prefix(QUESTIONS_PREFIX)?.trim().parse::<u32>().ok())
-        .sum()
+    let own = crate::trust::dedup_sorted(events.iter().filter(|e| e.model_id == model_id).cloned());
+    let from = own.iter().rposition(|e| e.outcome == Outcome::Reset).map_or(0, |i| i + 1);
+    own[from..].iter().filter_map(|e| e.questions).map(|q| q.max(0) as u32).sum()
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -542,42 +615,151 @@ mod tests {
     }
 
     #[test]
-    fn questions_become_a_shared_count_and_a_private_text_note() {
-        let mut base = Event::new("m1", crate::trust::Dimension::Search, crate::trust::Scope::Global, Outcome::Note, 5);
-        base.job_id = Some("j".into());
-        assert!(question_events(&base, &[]).is_empty());
-        let events = question_events(&base, &["a?".into(), "b?".into()]);
-        assert_eq!(events.len(), 2);
-        assert_eq!((events[0].summary.as_deref(), events[0].visibility), (Some("questions: 2"), Visibility::Shared));
-        assert_eq!(events[1].visibility, Visibility::Private);
-        assert!(events[1].summary.as_deref().unwrap().contains("2. b?"));
-        let shared: Vec<Event> = events.iter().map(crate::data::strip_private).collect();
-        assert_eq!(count_questions(&shared, "m1"), 2);
-        assert_eq!(count_questions(&shared, "other"), 0);
-        assert!(events.iter().all(|e| e.outcome == Outcome::Note && e.conclusion.is_none()));
+    fn question_counts_ride_on_the_job_event_and_stop_at_a_reset() {
+        let ev = |outcome, ts, q| {
+            let mut e = Event::new("m1", crate::trust::Dimension::Search, crate::trust::Scope::Global, outcome, ts);
+            e.questions = q;
+            e
+        };
+        let events = vec![ev(Outcome::Note, 1, Some(2)), ev(Outcome::Note, 2, Some(1)), ev(Outcome::Note, 3, None)];
+        assert_eq!(count_questions(&events, "m1"), 3);
+        assert_eq!(count_questions(&events, "other"), 0);
+        let mut after = events.clone();
+        after.extend([ev(Outcome::Reset, 10, None), ev(Outcome::Note, 11, Some(4))]);
+        assert_eq!(count_questions(&after, "m1"), 4);
     }
 
     fn job(timeout: Duration) -> (Arc<Broker>, Arc<Session>, Arc<AskJob>) {
+        job_with(timeout, MAX_PAUSED)
+    }
+
+    fn job_with(timeout: Duration, budget: Duration) -> (Arc<Broker>, Arc<Session>, Arc<AskJob>) {
         let broker = Arc::new(Broker::default());
         let phase: SharedPhase = Arc::new(Mutex::new(RunPhase::primary()));
-        let session = broker.open("s1", &CancellationToken::new(), phase, Duration::from_secs(1));
-        broker.attach("j1", "s1");
-        let job = Arc::new(AskJob { job_id: "j1".into(), step: None, session: session.clone(), broker: broker.clone(), pause: Arc::default(), timeout, questions: Mutex::default() });
+        let session = broker.open("s1", &["j1".to_string()], &CancellationToken::new(), phase, Duration::from_secs(1)).unwrap();
+        let job = AskJob::with_limits("j1", None, session.clone(), broker.clone(), Arc::default(), timeout, budget);
         (broker, session, job)
+    }
+
+    async fn next_question(session: &Session) -> (u64, String) {
+        let Some(JobEvent::Question { question_id, text, .. }) = session.next().await else { panic!("no question") };
+        (question_id, text)
     }
 
     #[tokio::test]
     async fn answer_reaches_the_blocked_worker_and_pauses_the_job_timeout() {
         let (broker, session, job) = job(Duration::from_secs(30));
         let asking = { let job = job.clone(); tokio::spawn(async move { job.ask("which?".into()).await }) };
-        let Some(JobEvent::Question { job_id, text, .. }) = session.next().await else { panic!("no question") };
-        assert_eq!((job_id.as_str(), text.as_str()), ("j1", "which?"));
+        let (id, text) = next_question(&session).await;
+        assert_eq!(text, "which?");
         assert!(job.pause.paused_total() < Duration::from_secs(5));
-        assert!(matches!(broker.answer("j1", "this".into()), Answered::Delivered(_)));
+        assert!(matches!(broker.answer("j1", Some(id), "this".into()), Answered::Delivered(_)));
         assert_eq!(asking.await.unwrap(), "this");
-        assert!(matches!(broker.answer("j1", "again".into()), Answered::NoOpenQuestion(_)));
-        assert!(matches!(broker.answer("nope", "x".into()), Answered::Unknown));
+        assert!(matches!(broker.answer("j1", None, "again".into()), Answered::NoOpenQuestion(_)));
+        assert!(matches!(broker.answer("nope", None, "x".into()), Answered::Unknown));
         assert_eq!(job.asked(), ["which?"]);
+        assert!(!job.unanswered.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_late_answer_for_an_expired_question_never_reaches_the_next_one() {
+        let (broker, session, job) = job(Duration::from_millis(100));
+        assert_eq!(job.ask("q1".into()).await, NO_ANSWER);
+        let (q1, _) = next_question(&session).await;
+        assert!(job.unanswered.load(Ordering::SeqCst));
+        let long = AskJob::with_limits("j1", None, session.clone(), broker.clone(), Arc::default(), Duration::from_secs(30), MAX_PAUSED);
+        let asking = { let long = long.clone(); tokio::spawn(async move { long.ask("q2".into()).await }) };
+        let (q2, _) = next_question(&session).await;
+        assert_ne!(q1, q2);
+        assert!(matches!(broker.answer("j1", Some(q1), "for q1".into()), Answered::OtherQuestionOpen { open_id, ref text } if open_id == q2 && text == "q2"));
+        assert!(!asking.is_finished());
+        assert!(matches!(broker.answer("j1", Some(q2), "for q2".into()), Answered::Delivered(_)));
+        assert_eq!(asking.await.unwrap(), "for q2");
+    }
+
+    #[tokio::test]
+    async fn concurrent_asks_are_serialized_to_one_open_question() {
+        let (broker, session, job) = job(Duration::from_secs(30));
+        let spawn = |q: &'static str| { let job = job.clone(); tokio::spawn(async move { job.ask(q.into()).await }) };
+        let (a, b) = (spawn("first"), spawn("second"));
+        let (id1, t1) = next_question(&session).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(tokio::time::timeout(Duration::from_millis(100), session.next()).await.is_err());
+        assert!(matches!(broker.answer("j1", Some(id1), format!("re {t1}")), Answered::Delivered(_)));
+        let (id2, t2) = next_question(&session).await;
+        assert_ne!(t1, t2);
+        assert!(matches!(broker.answer("j1", Some(id2), "ok".into()), Answered::Delivered(_)));
+        let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+        assert!(ra.starts_with("re ") != rb.starts_with("re "));
+    }
+
+    #[tokio::test]
+    async fn total_paused_time_per_job_is_capped() {
+        let (_broker, session, job) = job_with(Duration::from_millis(150), Duration::from_millis(200));
+        assert_eq!(job.ask("a".into()).await, NO_ANSWER);
+        assert_eq!(job.ask("b".into()).await, NO_ANSWER);
+        assert_eq!(job.ask("c".into()).await, NO_ANSWER);
+        let mut seen = 0;
+        while tokio::time::timeout(Duration::from_millis(50), session.next()).await.is_ok() {
+            seen += 1;
+        }
+        assert_eq!(seen, 2);
+        assert_eq!(job.asked().len(), 2);
+    }
+
+    #[test]
+    fn the_ask_timeout_override_is_clamped() {
+        assert_eq!(clamp_timeout(Some("999999")), MAX_PAUSED);
+        assert_eq!(clamp_timeout(Some("5")), Duration::from_secs(5));
+        assert_eq!((clamp_timeout(Some("0")), clamp_timeout(None)), (ASK_TIMEOUT, ASK_TIMEOUT));
+    }
+
+    #[test]
+    fn a_running_id_cannot_be_opened_again_and_a_stale_close_is_ignored() {
+        let broker = Broker::default();
+        let open = |id: &str, jobs: &[&str]| broker.open(id, &jobs.iter().map(|j| j.to_string()).collect::<Vec<_>>(), &CancellationToken::new(), Arc::new(Mutex::new(RunPhase::primary())), Duration::from_secs(1));
+        let first = open("wf", &["wf-a", "wf-b"]).unwrap();
+        assert!(open("wf", &[]).is_err());
+        assert!(open("wf-a", &["wf-a"]).is_err());
+        assert!(open("other", &["wf-b"]).is_err());
+        assert!(broker.taken("wf-a") && broker.taken("wf"));
+        broker.close(&first);
+        assert!(!broker.taken("wf") && !broker.taken("wf-a"));
+        let second = open("wf", &["wf-a"]).unwrap();
+        broker.close(&first);
+        assert!(broker.taken("wf"));
+        broker.close(&second);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_socket_lives_in_a_private_dir_with_a_token_and_a_wrong_token_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (_broker, session, job) = job(Duration::from_millis(300));
+        let server = AskServer::start(&dir.path().join("ask"), job).unwrap();
+        let (path, token) = server.endpoint.rsplit_once('#').unwrap();
+        assert!(!token.is_empty() && !path.contains("j1"));
+        assert_eq!(std::fs::metadata(Path::new(path).parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        let (mut bad, _) = transport::connect(&server.endpoint).await.unwrap();
+        bad.write_all(format!("{}\n", json!({"token": "nope", "question": "x"})).as_bytes()).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(200), session.next()).await.is_err());
+        let sock_dir = Path::new(path).parent().unwrap().to_path_buf();
+        drop(server);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!sock_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_long_base_dir_falls_back_to_a_short_temp_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("a".repeat(60)).join("b".repeat(60));
+        let (_broker, _session, job) = job(Duration::from_millis(300));
+        let server = AskServer::start(&long, job).unwrap();
+        let path = server.endpoint.rsplit_once('#').unwrap().0.to_string();
+        assert!(path.len() <= 100 && Path::new(&path).exists(), "{path}");
+        drop(server);
     }
 
     #[tokio::test]

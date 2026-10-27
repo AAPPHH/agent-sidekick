@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -386,6 +387,8 @@ pub struct DispatchResult {
     pub reason: Option<String>,
     pub proposal_mode: bool,
     pub gold: bool,
+    pub gold_model: bool,
+    pub answer: String,
     pub evidence_hash: Option<String>,
     pub event_id: Option<String>,
     pub exit_code: Option<i32>,
@@ -400,6 +403,7 @@ pub struct RunExtras {
     pub base: Option<String>,
     pub hold_gold: bool,
     pub pause: Option<Arc<Pause>>,
+    pub unanswered: Option<Arc<AtomicBool>>,
 }
 
 pub type Launcher = Box<dyn Fn(&Backend, &RunRequest) -> Result<Launch, String> + Send + Sync>;
@@ -423,6 +427,22 @@ pub fn real_launcher(claude_path: Option<PathBuf>, pass_env: Vec<String>) -> Lau
     })
 }
 
+pub const ID_MAX: usize = 40;
+pub const JOB_ID_MAX: usize = 2 * ID_MAX + 1;
+
+pub fn valid_id(s: &str, max: usize) -> bool {
+    !s.is_empty() && s.len() <= max && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub fn name_taken(repo: &Path, work_dir: &Path, id: &str) -> Option<String> {
+    let branch = format!("refs/heads/{BRANCH_PREFIX}{id}");
+    let exists = Command::new("git").arg("-C").arg(repo).args(["show-ref", "--verify", "--quiet", &branch]).status().is_ok_and(|s| s.success());
+    if exists {
+        return Some(format!("branch {BRANCH_PREFIX}{id} already exists"));
+    }
+    work_dir.join("worktrees").join(id).exists().then(|| format!("worktree for `{id}` already exists"))
+}
+
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git").env("GIT_TERMINAL_PROMPT", "0").arg("-C").arg(dir).args(args).output().context("running git")?;
     if !out.status.success() {
@@ -440,7 +460,7 @@ struct Worktree {
 
 impl Worktree {
     fn create(repo: &Path, work_dir: &Path, job_id: &str, from: Option<&str>) -> Result<Self> {
-        if job_id.is_empty() || job_id.contains(['/', '\\', ' ']) || job_id.starts_with('.') {
+        if !valid_id(job_id, JOB_ID_MAX) {
             bail!("invalid job_id `{job_id}`");
         }
         let start = from.unwrap_or("HEAD");
@@ -473,7 +493,15 @@ impl Worktree {
     fn commit(&self, message: &str) -> Result<()> {
         let mut args: Vec<&str> = GIT_IDENT.to_vec();
         args.extend(["commit", "-q", "-m", message]);
+        git(&self.path, &["reset", "-q", "--soft", &self.base])?;
         git(&self.path, &args).map(|_| ())
+    }
+}
+
+fn final_answer(backend: &Backend, report_text: Option<&str>, raw: &str) -> String {
+    match report_text {
+        Some(t) => t.to_string(),
+        None => backend.harness().normalize_output(raw).map_or_else(|| raw.to_string(), |n| n.text),
     }
 }
 
@@ -580,6 +608,8 @@ impl Dispatcher {
             reason: None,
             proposal_mode: proposal,
             gold: false,
+            gold_model: false,
+            answer: String::new(),
             evidence_hash: None,
             event_id: None,
             exit_code: outcome.exit_code,
@@ -592,6 +622,7 @@ impl Dispatcher {
         if let Some(r) = &report {
             result.tail = runner::truncate_tail(&r.text, runner::TAIL_CHARS);
         }
+        result.answer = final_answer(backend, report.as_ref().map(|r| r.text.as_str()), &raw);
         let model_verified = match &expected {
             None => true,
             Some(exp) => match report.as_ref().and_then(|r| r.models.first()) {
@@ -609,6 +640,8 @@ impl Dispatcher {
         if !model_verified && standing.apply_without_review() {
             result.warnings.push("gold not applied without a verified model: result returned as branch/patch".into());
         }
+        let gold_model = standing.apply_without_review() && matches!(backend.kind, BackendKind::ClaudeOauth { .. }) && model_verified;
+        result.gold_model = gold_model;
         let mut event = Event::new(&model_id, req.dimension, req.scope.clone(), Outcome::Note, now_ms());
         event.machine_id = self.machine_id.clone();
         event.user_id = self.user_id.clone();
@@ -628,11 +661,7 @@ impl Dispatcher {
             let mut files = wt.files()?;
             let mut proposed = false;
             if proposal && files.is_empty() {
-                let text = match &report {
-                    Some(r) => r.text.clone(),
-                    None => backend.harness().normalize_output(&raw).map_or(raw.clone(), |n| n.text),
-                };
-                let applied = extract_patch(&text).and_then(|patch| {
+                let applied = extract_patch(&result.answer).and_then(|patch| {
                     let proposal_path = self.work_dir.join("patches").join(format!("{}.proposal", req.job_id));
                     std::fs::create_dir_all(proposal_path.parent().unwrap()).map_err(|e| e.to_string())?;
                     std::fs::write(&proposal_path, patch).map_err(|e| e.to_string())?;
@@ -684,7 +713,7 @@ impl Dispatcher {
             }
             let checker = DiffChecker { protected: &protected, dimension: req.dimension, limits: Limits::for_scope(&req.scope), scope: &req.scope };
             let check = checker.check(&files, &wt.diff("-U0")?);
-            let gold = standing.apply_without_review() && matches!(backend.kind, BackendKind::ClaudeOauth { .. }) && model_verified;
+            let gold = gold_model;
             if !check.violations.is_empty() && (!gold || aborted) {
                 let reason = check.violations.join("; ");
                 result.status = Status::Blocked;
@@ -710,7 +739,11 @@ impl Dispatcher {
             let patch_path = patches.join(format!("{}.patch", req.job_id));
             std::fs::write(&patch_path, &patch)?;
             result.gold = gold;
-            if gold && !extras.hold_gold {
+            let unanswered = extras.unanswered.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+            if gold && unanswered {
+                result.warnings.push("gold not applied: a question of the worker went unanswered, result returned as branch/patch".into());
+            }
+            if gold && !extras.hold_gold && !unanswered {
                 match git(&req.repo, &["apply", "--whitespace=nowarn", &patch_path.to_string_lossy()]) {
                     Ok(_) => {
                         result.applied = true;
@@ -744,6 +777,23 @@ impl Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_final_answer_is_the_text_not_the_json_event_stream_for_opencode() {
+        let cfg: crate::config::Config = toml::from_str("[backends.dgx]\nharness = \"opencode\"\nprovider = \"ollama\"\nbase_url = \"http://127.0.0.1:1\"\nmodel = \"m\"\ndescription = \"d\"\ndefault = true\n").unwrap();
+        let defaults = crate::backends::ResolveDefaults { home: None, legacy_agent_config_dir: None, config_dir: Some(std::env::temp_dir().join("sk-final-answer-cfg")) };
+        let backends = crate::backends::resolve_with(&cfg, &defaults).unwrap();
+        let backend = backends.get("dgx").unwrap();
+        let raw = [
+            r#"{"type":"step_start","sessionID":"s1","part":{"type":"step-start"}}"#,
+            r#"{"type":"text","sessionID":"s1","part":{"type":"text","text":"the inventory: a.rs, b.rs"}}"#,
+            r#"{"type":"step_finish","sessionID":"s1","part":{"reason":"stop","tokens":{"input":1,"output":1},"cost":0.0}}"#,
+        ]
+        .join("\n");
+        let answer = final_answer(backend, None, &raw);
+        assert!(answer.starts_with("the inventory: a.rs, b.rs") && !answer.contains("\"type\""), "{answer}");
+        assert_eq!(final_answer(backend, Some("report"), &raw), "report");
+    }
 
     #[test]
     fn globs() {

@@ -855,3 +855,10 @@ Findings: with 100 turns no run hit the turn limit (0.4.0: 2 of 4 with 20). The 
 - Registry limits reach the launch through `dispatch::with_registry_limits` (backend clone). Plain `sidekick_run` has no registry row and uses the backend keys `context_tokens` / `max_output_tokens` or the defaults. openrouter models keep OpenCode's own limits unless these keys or a registry budget are set.
 - Not controllable: compaction is reactive (triggers when the previous response's reported usage reaches context minus output), so one step can exceed the budget by about one step's growth; it needs the server to report `usage`. `max_lines` and `max_bytes` apply to OpenCode's built-in tools (bash, read, grep, ...), not to MCP tool results. `steps` is a soft cap (the model is told to stop, tools are not cut off); the runner timeout is the hard limit.
 - Regression test: `tests/opencode_limits.rs` (real opencode binary against a fake OpenAI server; skips when opencode is missing). 30 tool steps with 400-line outputs, budget 40000: without limits up to 397015 estimated tokens per request, largest tool message 51688 bytes, max_tokens 32000; with limits 33148, 10208 bytes, max_tokens 8192, compaction seen.
+
+## Questions and workflows (0.9.0)
+
+- Not verified: the codex ask wiring (`-c mcp_servers.sidekick_ask.*`) is untested because codex is not installed here; Windows (loopback TCP transport, short socket path logic) is untested.
+- A worker waiting for an answer keeps its concurrency slot and both permits; on the DGX (`max_concurrent` 1) a waiting worker therefore blocks every other job of that backend until it is answered or the ask timeout (clamped to 60 minutes per job in total) runs out.
+- Question texts are no longer stored (only the count on the job event); the earlier private text event was dropped to keep the note counter honest.
+- Workflow review fixes: step branches are squashed to one commit, direct Gold apply needs every step Gold with a verified model and no warnings, dependency output is fenced as data, ids are validated and uniqueness-checked, sockets use random dirs plus tokens, answers are bound to `question_id`.

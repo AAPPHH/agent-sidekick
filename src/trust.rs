@@ -277,6 +277,7 @@ pub struct Event {
     pub summary: Option<String>,
     pub conclusion: Option<String>,
     pub visibility: Visibility,
+    pub questions: Option<i64>,
 }
 
 impl Event {
@@ -301,6 +302,7 @@ impl Event {
             summary: None,
             conclusion: None,
             visibility: Visibility::Shared,
+            questions: None,
         }
     }
 }

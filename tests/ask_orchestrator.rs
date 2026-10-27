@@ -24,6 +24,7 @@ case "$1" in
   echo "WORKER-GOT: $(cat "$out/ans")"
   echo "PROMPT: $1"
   ;;
+*SLEEPME*) sleep 4; echo slept ;;
 *) echo plain ;;
 esac
 "#;
@@ -104,9 +105,11 @@ fn question_blocks_the_worker_and_the_answer_resumes_it() {
     let model_id = field(&text, "model_id").to_string();
     let brief = text_of(&s.call_tool("sidekick_steckbrief", json!({"model_id": model_id, "detail": true})));
     assert!(brief.contains("Rückfragen der Worker: 1"), "{brief}");
-    let sql = "select summary, visibility from experiences where summary like 'questions%' order by visibility";
-    let rows = text_of(&s.call_tool("sidekick_query", json!({"sql": sql})));
-    assert!(rows.contains("questions: 1") && rows.contains("1. Which database?"), "{rows}");
+    let rows = text_of(&s.call_tool("sidekick_query", json!({"sql": "select questions, outcome from experiences where questions is not null"})));
+    assert!(rows.contains('1') && rows.contains("note"), "{rows}");
+    let extra = text_of(&s.call_tool("sidekick_query", json!({"sql": "select count(*) as n from experiences where summary like 'questions%'"})));
+    assert!(extra.contains('0'), "{extra}");
+    assert!(!brief.contains("note 3") && !brief.contains("note +3"), "{brief}");
     let short = text_of(&s.call_tool("sidekick_steckbrief", json!({"model_id": model_id})));
     assert!(short.contains("Rückfragen erwünscht"), "{short}");
 }
@@ -130,4 +133,69 @@ fn answer_for_an_unknown_job_is_an_error() {
     let (_d, mut s, _repo, _cfg) = fixture();
     let res = s.call_tool("sidekick_answer", json!({"job_id": "nope", "answer": "x"}));
     assert_eq!(res["isError"], json!(true), "{res}");
+}
+
+fn ask(s: &mut Server, repo: &Path, extra: serde_json::Value) -> serde_json::Value {
+    let mut args = json!({"prompt": "ASKME please", "cwd": repo.to_string_lossy(), "dimension": "search", "timeout_s": 3});
+    args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    s.call_tool_within("sidekick_dispatch", args, Duration::from_secs(30))
+}
+
+#[test]
+fn a_second_dispatch_with_a_running_job_id_is_rejected_and_the_first_job_still_works() {
+    let (_d, mut s, repo, _cfg) = fixture();
+    let first = text_of(&ask(&mut s, &repo, json!({"job_id": "dup"})));
+    assert_eq!(field(&first, "status"), "question", "{first}");
+    let second = ask(&mut s, &repo, json!({"job_id": "dup"}));
+    assert_eq!(second["isError"], json!(true), "{second}");
+    assert!(text_of(&second).contains("already running"), "{second}");
+    let done = text_of(&s.call_tool_within("sidekick_answer", json!({"job_id": "dup", "answer": "Postgres", "question_id": field(&first, "question_id").parse::<u64>().unwrap()}), Duration::from_secs(30)));
+    assert!(done.contains("WORKER-GOT:") && done.contains("Postgres"), "{done}");
+}
+
+#[test]
+fn job_ids_are_validated_before_any_socket_is_created() {
+    let (d, mut s, repo, _cfg) = fixture();
+    let victim = d.path().join("victim.sock");
+    std::fs::write(&victim, "x").unwrap();
+    for bad in [d.path().join("victim").to_string_lossy().to_string(), "../../x".to_string(), "a b".to_string(), ".hidden".to_string(), "x".repeat(90)] {
+        let res = ask(&mut s, &repo, json!({"job_id": bad}));
+        assert_eq!(res["isError"], json!(true), "{bad}: {res}");
+        assert!(text_of(&res).contains("job_id"), "{res}");
+    }
+    assert!(victim.exists());
+}
+
+#[test]
+fn an_answer_for_another_question_is_not_delivered_and_names_the_open_one() {
+    let (_d, mut s, repo, _cfg) = fixture();
+    let first = text_of(&ask(&mut s, &repo, json!({"job_id": "stale"})));
+    let qid: u64 = field(&first, "question_id").parse().unwrap();
+    let wrong = s.call_tool_within("sidekick_answer", json!({"job_id": "stale", "answer": "x", "question_id": qid + 100}), Duration::from_secs(10));
+    let text = text_of(&wrong);
+    assert!(text.contains("not delivered") && text.contains(&format!("question_id: {qid}")) && text.contains("Which database?"), "{text}");
+    let done = text_of(&s.call_tool_within("sidekick_answer", json!({"job_id": "stale", "answer": "Right", "question_id": qid}), Duration::from_secs(30)));
+    assert!(done.contains("Right") && !done.contains("\"x\""), "{done}");
+}
+
+#[test]
+fn a_finished_job_nobody_collects_is_dropped_from_the_broker() {
+    let (_d, mut s, repo, _cfg) = fixture_with(&[("AGENT_SIDEKICK_ASK_TIMEOUT_S", "1"), ("AGENT_SIDEKICK_RESULT_GRACE_S", "1")]);
+    let first = text_of(&ask(&mut s, &repo, json!({"job_id": "leak"})));
+    assert_eq!(field(&first, "status"), "question", "{first}");
+    std::thread::sleep(Duration::from_secs(6));
+    let res = s.call_tool("sidekick_answer", json!({"job_id": "leak", "answer": "late"}));
+    assert_eq!(res["isError"], json!(true), "{res}");
+    let again = ask(&mut s, &repo, json!({"job_id": "leak"}));
+    assert!(text_of(&again).contains("status: question"), "{again}");
+}
+
+#[test]
+fn dispatch_progress_reports_running_once_the_job_has_a_slot() {
+    let (_d, mut s, repo, _cfg) = fixture_with(&[("AGENT_SIDEKICK_PROGRESS_INTERVAL_S", "1")]);
+    let args = json!({"prompt": "SLEEPME", "cwd": repo.to_string_lossy(), "dimension": "search", "timeout_s": 30});
+    let id = s.send_request("tools/call", json!({"name": "sidekick_dispatch", "arguments": args, "_meta": {"progressToken": "p1"}}));
+    let (_res, notes) = s.wait_response(id, Duration::from_secs(30));
+    let messages: Vec<String> = notes.iter().filter_map(|n| n["params"]["message"].as_str().map(String::from)).collect();
+    assert!(!messages.is_empty() && messages.iter().all(|m| !m.contains("queued")) && messages.iter().any(|m| m.contains("running for")), "{messages:?}");
 }
