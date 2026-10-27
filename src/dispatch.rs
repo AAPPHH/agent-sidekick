@@ -120,6 +120,18 @@ pub fn withhold_writes(backend: &Backend) -> Backend {
     b
 }
 
+pub fn glob_match_path(pattern: &str, path: &str) -> bool {
+    let mut end = 0;
+    for seg in path.split('/') {
+        end += seg.len();
+        if glob_match(pattern, &path[..end]) {
+            return true;
+        }
+        end += 1;
+    }
+    false
+}
+
 pub fn glob_match(pattern: &str, path: &str) -> bool {
     fn go(p: &[u8], s: &[u8]) -> bool {
         match p.first() {
@@ -172,10 +184,10 @@ impl DiffChecker<'_> {
                 out.violations.push(format!("path {f} outside module path {m}"));
             }
             if self.dimension == Dimension::WriteTests {
-                if !TEST_GLOBS.iter().any(|g| glob_match(g, f)) {
+                if !TEST_GLOBS.iter().any(|g| glob_match_path(g, f)) {
                     out.violations.push(format!("write-tests touches non-test path {f}"));
                 }
-            } else if let Some(g) = self.globs().find(|g| glob_match(g, f)) {
+            } else if let Some(g) = self.globs().find(|g| glob_match_path(g, f)) {
                 out.violations.push(format!("protected path {f} (matches {g})"));
             }
         }
@@ -337,7 +349,7 @@ impl Worktree {
 
     fn diff(&self, unified: &str) -> Result<String> {
         git(&self.path, &["add", "-A"])?;
-        git(&self.path, &["diff", "--cached", "--binary", "--no-color", "--no-renames", unified, &self.base])
+        git(&self.path, &["-c", "core.quotepath=false", "diff", "--cached", "--binary", "--no-color", "--no-renames", unified, &self.base])
     }
 
     fn files(&self) -> Result<Vec<String>> {
@@ -448,14 +460,13 @@ impl Dispatcher {
         let finished = (|| -> Result<()> {
             let aborted = outcome.timed_out || outcome.cancelled || outcome.output.to_lowercase().contains(MAX_TURNS_MARKER);
             let files = wt.files()?;
-            if aborted {
-                result.status = Status::Aborted;
-                event.outcome = Outcome::Aborted;
-                wt.remove(true);
-                return Ok(());
-            }
             if files.is_empty() {
-                result.status = Status::NoChange;
+                if aborted {
+                    result.status = Status::Aborted;
+                    event.outcome = Outcome::Aborted;
+                } else {
+                    result.status = Status::NoChange;
+                }
                 wt.remove(true);
                 return Ok(());
             }
@@ -476,7 +487,7 @@ impl Dispatcher {
             let checker = DiffChecker { protected: &protected, dimension: req.dimension, limits: Limits::for_scope(&req.scope), scope: &req.scope };
             let check = checker.check(&files, &wt.diff("-U0")?);
             let gold = standing.apply_without_review() && matches!(backend.kind, BackendKind::ClaudeOauth { .. });
-            if !check.violations.is_empty() && !gold {
+            if !check.violations.is_empty() && (!gold || aborted) {
                 let reason = check.violations.join("; ");
                 result.status = Status::Blocked;
                 result.evidence_hash = Some(sha256_hex(patch.as_bytes()));
@@ -485,6 +496,12 @@ impl Dispatcher {
                 event.evidence_hash = result.evidence_hash.clone();
                 result.block_reason = Some(reason);
                 result.violations = check.violations;
+                wt.remove(true);
+                return Ok(());
+            }
+            if aborted {
+                result.status = Status::Aborted;
+                event.outcome = Outcome::Aborted;
                 wt.remove(true);
                 return Ok(());
             }
@@ -533,6 +550,8 @@ mod tests {
         assert!(glob_match("**/validate*", "validate.rs"));
         assert!(glob_match("**/validate*", "src/x/validate_input.rs"));
         assert!(!glob_match("**/validate*", "src/revalidate.rs"));
+        assert!(glob_match_path("**/validate*", "src/validate/mod.rs"));
+        assert!(!glob_match_path("**/validate*", "src/revalidate/mod.rs"));
         assert!(glob_match("src/*.rs", "src/a.rs"));
         assert!(!glob_match("src/*.rs", "src/a/b.rs"));
     }

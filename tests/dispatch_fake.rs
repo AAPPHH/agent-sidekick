@@ -299,3 +299,37 @@ async fn gold_key_on_foreign_endpoint_never_applies() {
     assert!(!e.repo.join("src/b.rs").exists());
     assert_eq!(r.branch.as_deref(), Some("sidekick/j15"));
 }
+
+#[tokio::test]
+async fn max_turns_abort_cannot_launder_a_violation() {
+    let mut e = env("m-i", true, 40, "printf 'x\\n' > tests/new.rs\necho 'Error: Reached max turns (5)'\nexit 1\n");
+    let r = run(&mut e, "m-i", Dimension::WriteCode, "j16").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.violations.iter().any(|v| v.contains("protected path tests/new.rs")));
+    assert_eq!(e.log.events()[0].outcome, Outcome::Blocked);
+
+    let mut e = env("m-j", true, 0, "printf 'fn b() {}\\n' > src/b.rs\necho 'Reached max turns'\nexit 1\n");
+    let r = run(&mut e, "m-j", Dimension::WriteCode, "j17").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.diff_discarded);
+}
+
+#[tokio::test]
+async fn protected_glob_matches_ancestor_directories() {
+    let mut e = env("m-k", true, 40, "mkdir -p src/validate\nprintf 'fn v() {}\\n' > src/validate/mod.rs\n");
+    let r = run(&mut e, "m-k", Dimension::WriteCode, "j18").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.violations.iter().any(|v| v.contains("protected path src/validate/mod.rs")));
+}
+
+#[tokio::test]
+async fn term_moved_between_non_ascii_files_is_a_removal() {
+    let mut e = env("m-l", true, 40, "printf 'fn a() {}\\n' > src/\u{e4}.rs\nprintf 'fn a() { assert!(x); assert!(y); }\\n' > src/\u{f6}.rs\n");
+    std::fs::write(e.repo.join("src/\u{e4}.rs"), SRC).unwrap();
+    std::fs::write(e.repo.join("src/\u{f6}.rs"), SRC).unwrap();
+    sh(&e.repo, &["add", "-A"]);
+    sh(&e.repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "umlauts"]);
+    let r = run(&mut e, "m-l", Dimension::WriteCode, "j19").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.violations.iter().any(|v| v.contains("removed protected term `assert` in src/\u{e4}.rs")), "{:?}", r.violations);
+}
