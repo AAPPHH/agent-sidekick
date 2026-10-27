@@ -44,6 +44,14 @@ pub fn is_primary_oauth_name(name: &str) -> bool {
     name == IMPLICIT_BACKEND || name == OLD_IMPLICIT_BACKEND
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpencodeLimits {
+    pub context_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
+    pub tool_output_lines: Option<u32>,
+    pub context_budget_tokens: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendType {
@@ -359,6 +367,10 @@ pub struct RawBackend {
     /// the request (OpenCode's `headerTimeout`; unset: OpenCode's default of 300 s).
     pub request_timeout_s: Option<u64>,
     pub model_options: Option<serde_json::Map<String, serde_json::Value>>,
+    /// opencode: context window of the models in tokens (OpenCode `limit.context`).
+    pub context_tokens: Option<u32>,
+    /// opencode: maximum output tokens per response (OpenCode `limit.output`, sent as max_tokens).
+    pub max_output_tokens: Option<u32>,
     /// codex (api-key with `base_url`): the provider's wire API. Only `responses` exists
     /// (Codex 0.163 dropped chat completions); any other value is a config error.
     pub wire_api: Option<String>,
@@ -431,6 +443,7 @@ pub enum BackendKind {
         /// expiry); `None`: OpenCode's default.
         request_timeout_s: Option<u64>,
         model_options: serde_json::Map<String, serde_json::Value>,
+        limits: OpencodeLimits,
         /// Per-backend isolation directory `<config-dir>/opencode/<name>`.
         base_dir: PathBuf,
     },

@@ -28,7 +28,9 @@ use super::{
 };
 use crate::backends::launch::{child_env, eq_name, set_var, PROVIDER_KEY_ENV};
 use crate::backends::reach::{ProbeResponse, PROBE_TIMEOUT};
-use crate::backends::{Backend, BackendKind, Credential, OpencodeProvider, Reachability};
+use crate::backends::{
+    Backend, BackendKind, Credential, OpencodeLimits, OpencodeProvider, Reachability,
+};
 use crate::redact::Secrets;
 use crate::runner::Launch;
 use crate::token::{SecretId, Token, TokenError};
@@ -45,6 +47,9 @@ macOS, Linux:          curl -fsSL https://opencode.ai/install | bash
 
 /// Provider id in the generated config for openai-compatible and ollama backends.
 pub const PROVIDER_ID: &str = "sidekick";
+pub const DEFAULT_CONTEXT_TOKENS: u32 = 128_000;
+pub const DEFAULT_OUTPUT_TOKENS: u32 = 8_192;
+const DEFAULT_TOOL_OUTPUT_BYTES: u32 = 51_200;
 /// Session title passed with `--title` (skips OpenCode's extra title-generation request).
 pub const SESSION_TITLE: &str = "agent-sidekick";
 /// OpenRouter's model list (public, no key), for the reachability probe.
@@ -241,6 +246,7 @@ pub fn render_config(backend: &Backend) -> Result<Value, String> {
         read_only,
         request_timeout_s,
         model_options,
+        limits,
         ..
     } = &backend.kind
     else {
@@ -270,6 +276,7 @@ pub fn render_config(backend: &Backend) -> Result<Value, String> {
                 let mut entry = Map::new();
                 entry.insert("name".to_owned(), json!(m));
                 entry.insert("tool_call".to_owned(), json!(true));
+                entry.insert("limit".to_owned(), limit_value(limits));
                 entry.extend(model_options.clone());
                 model_map.insert((*m).to_owned(), Value::Object(entry));
             }
@@ -286,7 +293,13 @@ pub fn render_config(backend: &Backend) -> Result<Value, String> {
         OpencodeProvider::Openrouter => {
             let mut model_map = Map::new();
             for m in &models {
-                model_map.insert((*m).to_owned(), json!({}));
+                let entry = if limits.context_tokens.is_some() || limits.max_output_tokens.is_some()
+                {
+                    json!({"limit": limit_value(limits)})
+                } else {
+                    json!({})
+                };
+                model_map.insert((*m).to_owned(), entry);
             }
             json!({
                 "options": provider_options(json!({"apiKey": key_ref}), *request_timeout_s),
@@ -322,11 +335,62 @@ fn provider_options(mut options: Value, request_timeout_s: Option<u64>) -> Value
     options
 }
 
+pub fn effective_context(limits: &OpencodeLimits) -> u32 {
+    [limits.context_budget_tokens, limits.context_tokens]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(DEFAULT_CONTEXT_TOKENS)
+}
+
+pub fn effective_output(limits: &OpencodeLimits) -> u32 {
+    limits
+        .max_output_tokens
+        .unwrap_or(DEFAULT_OUTPUT_TOKENS)
+        .min(effective_context(limits) / 4)
+        .max(1)
+}
+
+fn limit_value(limits: &OpencodeLimits) -> Value {
+    json!({"context": effective_context(limits), "output": effective_output(limits)})
+}
+
 /// Per-run config layer (`OPENCODE_CONFIG_CONTENT`): `max_turns` as the build agent's step
-/// limit. A soft cap: OpenCode asks the model to stop, it does not cut tools off; the
-/// runner's timeout is the hard limit.
-pub fn run_config(max_turns: u32) -> Value {
-    json!({"agent": {"build": {"steps": max_turns}}})
+/// limit (a soft cap: OpenCode asks the model to stop, it does not cut tools off; the
+/// runner's timeout is the hard limit), the model's token limits (OpenCode compacts the
+/// session once the reported usage reaches `context - output` and sends `output` as
+/// max_tokens), pruning of old tool outputs and the tool output caps.
+pub fn run_config(backend: &Backend, model: &str, max_turns: u32) -> Value {
+    let BackendKind::OpenCode {
+        provider, limits, ..
+    } = &backend.kind
+    else {
+        return json!({"agent": {"build": {"steps": max_turns}}});
+    };
+    let custom = *provider != OpencodeProvider::Openrouter;
+    let explicit = limits
+        .context_budget_tokens
+        .or(limits.context_tokens)
+        .is_some()
+        || limits.max_output_tokens.is_some();
+    let mut tool_output = Map::new();
+    if let Some(lines) = limits.tool_output_lines {
+        tool_output.insert("max_lines".to_owned(), json!(lines));
+    }
+    if custom || explicit {
+        let bytes = (effective_context(limits) / 4).min(DEFAULT_TOOL_OUTPUT_BYTES);
+        tool_output.insert("max_bytes".to_owned(), json!(bytes));
+    }
+    let mut config = json!({
+        "agent": {"build": {"steps": max_turns}},
+        "compaction": {"auto": true, "prune": true},
+        "tool_output": tool_output
+    });
+    if custom || explicit {
+        config["provider"] =
+            json!({provider_id(*provider): {"models": {model: {"limit": limit_value(limits)}}}});
+    }
+    config
 }
 
 /// Where opencode is looked for, in order:
@@ -686,7 +750,7 @@ impl Harness for OpencodeHarness {
         set_var(
             &mut env,
             "OPENCODE_CONFIG_CONTENT",
-            run_config(req.max_turns).to_string(),
+            run_config(backend, &model, req.max_turns).to_string(),
         );
         if let Some(bash) = &inherited_git_bash {
             set_var(&mut env, "OPENCODE_GIT_BASH_PATH", bash.as_os_str());
@@ -717,6 +781,14 @@ impl Harness for OpencodeHarness {
             "max_turns: {} as agent.build.steps (soft cap; timeout_s is the hard limit)",
             req.max_turns
         ));
+        if let BackendKind::OpenCode { limits, .. } = &backend.kind {
+            header.push(format!(
+                "limits: context {} tokens, max output {} tokens, compaction and pruning on, tool output max_lines {}",
+                effective_context(limits),
+                effective_output(limits),
+                limits.tool_output_lines.map_or_else(|| "(OpenCode default)".to_owned(), |l| l.to_string())
+            ));
+        }
         if *read_only {
             header.push("read_only: edit, bash and webfetch denied".to_owned());
         }

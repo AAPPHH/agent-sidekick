@@ -35,7 +35,7 @@ pub enum Command {
     Uninstall(commands::uninstall::UninstallArgs),
     /// Check for a newer release and print the command that installs it.
     Update,
-    /// Validate or aggregate the data repository (used by its workflows) (used by its workflows).
+    /// Validate or aggregate the data repository (used by its workflows).
     Data(commands::data::DataArgs),
 }
 

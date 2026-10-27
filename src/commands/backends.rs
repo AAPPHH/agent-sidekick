@@ -410,6 +410,7 @@ pub fn describe(backend: &Backend) -> Vec<String> {
             read_only,
             request_timeout_s,
             model_options,
+            limits,
             base_dir,
         } => {
             lines.push(format!("provider:    {provider}"));
@@ -425,6 +426,11 @@ pub fn describe(backend: &Backend) -> Vec<String> {
                 Some(t) => format!("request_timeout_s: {t}"),
                 None => "request_timeout_s: (OpenCode default, 300)".to_owned(),
             });
+            lines.push(format!(
+                "limits:      context {} tokens, max output {} tokens",
+                crate::harness::opencode::effective_context(limits),
+                crate::harness::opencode::effective_output(limits)
+            ));
             if !model_options.is_empty() {
                 lines.push(format!(
                     "model_options: {}",
@@ -671,6 +677,7 @@ pub(crate) mod tests {
                 read_only: false,
                 request_timeout_s: None,
                 model_options: serde_json::Map::new(),
+                limits: Default::default(),
                 base_dir: abs("cfg").join("opencode").join(name),
             },
             is_default,

@@ -99,6 +99,10 @@ fn shared_rule(path: &str) -> bool {
     SHARED_RULES.contains(&path) || SHARED_RULE_GLOBS.iter().any(|g| glob_match(g, path))
 }
 
+fn root_path(path: &str) -> bool {
+    !path.starts_with("experiences/") && !path.starts_with("aggregate/")
+}
+
 fn prefix_of(path: &str) -> Option<&str> {
     path.strip_prefix("experiences/")?.split_once('/').map(|(p, _)| p)
 }
@@ -121,9 +125,10 @@ impl Validator<'_> {
         let mut foreign: Option<Vec<(String, String)>> = None;
         let mut out = Vec::new();
         for path in &changed {
-            if shared_rule(path) {
+            if root_path(path) {
                 if !is_owner {
-                    out.push((path.clone(), format!("shared rule file, only the owners may change it (pusher `{}`)", self.pusher)));
+                    let m = if shared_rule(path) { format!("shared rule file, only the owners may change it (pusher `{}`)", self.pusher) } else { self.outside(&prefixes) };
+                    out.push((path.clone(), m));
                 }
             } else if let Some(v) = self.path_violation(path, &prefixes) {
                 out.push((path.clone(), v));
@@ -194,8 +199,12 @@ impl Validator<'_> {
         if prefixes.iter().any(|p| path.starts_with(p.as_str()) && !path[p.len()..].is_empty()) {
             return None;
         }
+        Some(self.outside(prefixes))
+    }
+
+    fn outside(&self, prefixes: &[String]) -> String {
         let owned = if prefixes.is_empty() { "no prefix".to_string() } else { prefixes.join(", ") };
-        Some(format!("outside the prefixes of `{}` ({owned})", self.pusher))
+        format!("outside the prefixes of `{}` ({owned})", self.pusher)
     }
 
     fn content_violations(&self, rel: &str, full: &Path) -> Vec<String> {
@@ -215,7 +224,7 @@ impl Validator<'_> {
         } else if name.starts_with("experiences/") || name.starts_with("aggregate/") {
             check_schema(full, experience_schema()).and_then(|_| event_violations(full))
         } else {
-            Ok(vec!["unknown parquet location".to_string()])
+            Ok(Vec::new())
         };
         match result {
             Ok(v) => out.extend(v),

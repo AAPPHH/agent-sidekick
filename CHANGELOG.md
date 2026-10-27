@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-27
+
+### Fixed
+
+- OpenCode context and limits: the generated config declared custom models without a token limit, so OpenCode never compacted and sent the whole history, including all tool outputs, on every step (more than 1M tokens per step to a 256k model). The models now get `limit.context` and `limit.output` (sent as max_tokens), compaction with pruning of old tool outputs is enabled and tool outputs are capped. New backend keys `context_tokens` and `max_output_tokens`; dispatched jobs use the registry's `context_budget_tokens`, `tool_output_lines` and `max_steps`, and OpenCode no longer reports them as unsupported.
+- Data repository: owners may change every file at the repository root and `.github/**`, not only the rule files; other prefixes and `aggregate/` stay forbidden for everyone.
+- Help text of `agent-sidekick data` no longer repeats "(used by its workflows)".
+
+### Changed
+
+- Start data: the registry has no Codex-via-KI:connect row any more; the Qwen3-Coder-Next row has `context_tokens` 262144.
+
 ## [0.7.0] - 2026-10-27
 
 ### Added
