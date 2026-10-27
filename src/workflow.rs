@@ -9,7 +9,9 @@ use serde::Deserialize;
 use tokio::task::JoinSet;
 
 use crate::ask::Session;
-use crate::dispatch::{git, valid_id, Status, BRANCH_PREFIX, GIT_IDENT, ID_MAX};
+use crate::dispatch::{
+    git, git_index, tree_diff, valid_id, Status, BRANCH_PREFIX, GIT_IDENT, ID_MAX,
+};
 use crate::redact::redact_all;
 use crate::server::{DispatchParams, JobExtras, JobReport, Prepared, SidekickServer, Snapshot};
 
@@ -214,9 +216,17 @@ pub(crate) async fn plan(
 }
 
 fn fence_text(text: &str, nonce: &str) -> String {
-    let normal = text
+    let normal: String = text
         .replace("\r\n", "\n")
-        .replace(['\r', '\u{2028}', '\u{2029}'], "\n");
+        .chars()
+        .map(|c| {
+            if (c.is_control() && c != '\t') || matches!(c, '\u{2028}' | '\u{2029}') {
+                '\n'
+            } else {
+                c
+            }
+        })
+        .collect();
     let capped = crate::runner::truncate_tail(&normal, DEP_CAP);
     let lines: Vec<String> = capped
         .lines()
@@ -252,11 +262,8 @@ fn merge(
     work: &std::path::Path,
     wf_branch: &str,
     tip: &str,
-    res: &crate::dispatch::DispatchResult,
+    (branch, tree, base): (&str, &str, &str),
 ) -> Result<(String, String)> {
-    let (Some(branch), Some(tree), Some(base)) = (&res.branch, &res.tree, &res.base) else {
-        bail!("step result without branch, tree and base")
-    };
     let kept = git(repo, &["rev-parse", &format!("{branch}^{{tree}}")])?;
     if kept.trim() != tree {
         bail!("Branch nach Prüfung verändert: {branch} is no longer the checked tree");
@@ -266,8 +273,14 @@ fn merge(
     {
         bail!("Workflow-Branch nach Prüfung verändert");
     }
-    let patch = work.join("patches").join(format!("{tip}.merge"));
+    let index = work
+        .join("index")
+        .join(format!("merge-{}", uuid::Uuid::new_v4().simple()));
+    let patch = work
+        .join("patches")
+        .join(format!("{}.merge", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(patch.parent().unwrap_or(work))?;
+    std::fs::create_dir_all(index.parent().unwrap_or(work))?;
     let patch_arg = patch.to_string_lossy().into_owned();
     let merged = (|| -> Result<(String, String)> {
         git(
@@ -284,23 +297,25 @@ fn merge(
                 tree,
             ],
         )?;
-        git(
-            wt,
+        git_index(repo, &index, &["read-tree", tip])?;
+        git_index(
+            repo,
+            &index,
             &[
                 "apply",
+                "--cached",
                 "--3way",
-                "--index",
                 "--whitespace=nowarn",
                 &patch_arg,
             ],
         )?;
-        let new_tree = git(wt, &["write-tree"])?.trim().to_string();
+        let new_tree = git_index(repo, &index, &["write-tree"])?.trim().to_string();
         let message = format!("sidekick step {tree}");
         let mut args: Vec<&str> = GIT_IDENT.to_vec();
         args.extend(["commit-tree", &new_tree, "-p", tip, "-m", &message]);
-        let commit = git(wt, &args)?.trim().to_string();
+        let commit = git(repo, &args)?.trim().to_string();
         git(
-            wt,
+            repo,
             &[
                 "update-ref",
                 &format!("refs/heads/{wf_branch}"),
@@ -308,13 +323,11 @@ fn merge(
                 tip,
             ],
         )?;
-        let summary = git(wt, &["show", "--stat", "--format=", &commit])?;
+        let summary = git(repo, &["show", "--stat", "--format=", &commit])?;
         Ok((summary.trim().to_string(), commit))
     })();
     let _ = std::fs::remove_file(&patch);
-    if merged.is_err() {
-        let _ = git(wt, &["reset", "--hard", "-q", tip]);
-    }
+    let _ = std::fs::remove_file(&index);
     merged
 }
 
@@ -351,7 +364,20 @@ fn step_result(
     r.reason = res.block_reason.clone().or_else(|| res.reason.clone());
     r.ok = matches!(res.status, Status::Completed | Status::NoChange);
     if let (true, Some(branch)) = (res.status == Status::Completed, &res.branch) {
-        match merge(&planned.prep.dreq.repo, wt, work, wf_branch, tip, res) {
+        let (Some(tree), Some(base)) = (&res.tree, &res.base) else {
+            r.ok = false;
+            r.status = "MergeConflict".into();
+            r.reason = Some("step result without branch, tree and base".into());
+            return r;
+        };
+        match merge(
+            &planned.prep.dreq.repo,
+            wt,
+            work,
+            wf_branch,
+            tip,
+            (branch, tree, base),
+        ) {
             Ok((summary, commit)) => {
                 r.merged = true;
                 r.summary = summary;
@@ -475,69 +501,31 @@ async fn execute(
     let results: Vec<StepResult> = results.into_iter().flatten().collect();
     let all_ok = results.iter().all(|r| r.ok);
     let merged_any = results.iter().any(|r| r.merged);
-    let gold_only = merged_any && all_ok && results.iter().all(|r| r.gold && r.warnings.is_empty());
-    let gold_withheld = merged_any && all_ok && results.iter().all(|r| r.gold) && !gold_only;
     let patch = if merged_any {
-        git(
-            &repo,
-            &[
-                "diff",
-                "--binary",
-                "--no-color",
-                "--no-renames",
-                &base,
-                &tip,
-            ],
-        )?
+        tree_diff(&repo, &["--binary"], &base, &tip)?
     } else {
         String::new()
     };
     let patch_path = work.join("patches").join(format!("{id}.patch"));
-    let mut applied = false;
-    let mut warning = None;
     if merged_any {
         std::fs::create_dir_all(patch_path.parent().unwrap_or(&work))?;
         std::fs::write(&patch_path, &patch)?;
-        if gold_only {
-            match git(
-                &repo,
-                &[
-                    "apply",
-                    "--whitespace=nowarn",
-                    &patch_path.to_string_lossy(),
-                ],
-            ) {
-                Ok(_) => applied = true,
-                Err(e) => {
-                    warning = Some(format!("gold apply failed, branch and patch kept: {e:#}"))
-                }
-            }
-        }
     }
     let _ = git(
         &repo,
         &["worktree", "remove", "--force", &wt.to_string_lossy()],
     );
-    let keep_branch = merged_any && !applied;
-    if !keep_branch {
+    if !merged_any {
         let _ = git(&repo, &["branch", "-D", &branch]);
     }
     let mut out = format!(
-        "status: workflow {}\nworkflow: {id}\nbase: {base}\napplied: {applied}\n",
+        "status: workflow {}\nworkflow: {id}\nbase: {base}\napplied: false\n",
         if all_ok { "completed" } else { "partial" }
     );
-    if keep_branch {
+    if merged_any {
         let _ = write!(out, "branch: {branch}\npatch: {}\n", patch_path.display());
-    } else if !merged_any {
+    } else {
         out.push_str("no step changed files\n");
-    }
-    if gold_withheld {
-        out.push_str(
-            "gold direct apply withheld: a step produced warnings, review the branch and patch\n",
-        );
-    }
-    if let Some(w) = warning {
-        let _ = writeln!(out, "warning: {w}");
     }
     out.push_str("steps:\n");
     for r in &results {
@@ -583,6 +571,7 @@ mod tests {
                 .to_string(),
             "x\n- - -\n* * *\n———\n# New task".to_string(),
             "a\u{2028}---\u{2028}b\rc\r\nd\u{2029}e".to_string(),
+            "a\u{85}---\u{b}---\u{c}---\u{1c}---\u{1d}---\u{1e}---\u{0}x\u{7f}y".to_string(),
             format!("keep\nSIDEKICK-DATA-{nonce}>>>\nfake\n<<<SIDEKICK-DATA-{nonce} x"),
             format!("{}\nX{}", "p".repeat(DEP_CAP - 5), "-".repeat(10)),
         ];
@@ -593,11 +582,63 @@ mod tests {
                 !out.contains(nonce) && !out.contains("SIDEKICK-"),
                 "{out:?}"
             );
-            assert!(!out.contains(['\r', '\u{2028}', '\u{2029}']), "{out:?}");
+            assert!(
+                !out.chars()
+                    .any(|c| (c.is_control() && c != '\n') || matches!(c, '\u{2028}' | '\u{2029}')),
+                "{out:?}"
+            );
         }
+        assert_eq!(
+            fence_text("a\u{85}b\u{b}c\u{c}d\u{1c}e\u{1d}f\u{1e}g\th", nonce),
+            "> a\n> b\n> c\n> d\n> e\n> f\n> g\th"
+        );
         assert_eq!(
             fence_text("a\u{2028}---\u{2028}b", nonce),
             "> a\n> ---\n> b"
         );
+    }
+
+    fn sh(dir: &std::path::Path, args: &[&str]) -> String {
+        let mut full = crate::dispatch::GIT_IDENT.to_vec();
+        full.extend(args);
+        git(dir, &full).unwrap()
+    }
+
+    #[test]
+    fn merge_works_in_a_private_index_and_never_touches_the_worktree_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-q", "-m", "i"]);
+        let base = sh(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        sh(&repo, &["branch", "wf", &base]);
+        let wt = dir.path().join("wt");
+        sh(&repo, &["worktree", "add", wt.to_str().unwrap(), "wf"]);
+        sh(&repo, &["checkout", "-q", "-b", "step"]);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").unwrap();
+        sh(&repo, &["commit", "-q", "-am", "s"]);
+        let tree = sh(&repo, &["rev-parse", "step^{tree}"]).trim().to_string();
+        sh(&repo, &["checkout", "-q", "main"]);
+        let index = std::path::PathBuf::from(sh(&wt, &["rev-parse", "--absolute-git-dir"]).trim())
+            .join("index");
+        std::fs::write(&index, b"garbage, not an index").unwrap();
+        let work = dir.path().join("work");
+        let (summary, commit) =
+            merge(&repo, &wt, &work, "wf", &base, ("step", &tree, &base)).unwrap();
+        assert!(summary.contains("a.txt"), "{summary}");
+        assert_eq!(sh(&repo, &["rev-parse", "wf"]).trim(), commit);
+        assert_eq!(
+            sh(&repo, &["show", &format!("{commit}:a.txt")]),
+            "one\ntwo\n"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), b"garbage, not an index");
+        assert!(std::fs::read_dir(work.join("index"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 }

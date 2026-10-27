@@ -97,6 +97,44 @@ case "$last" in
   git branch evil
   echo "doc" > docs.txt
   ;;
+*GOLD-USER*)
+  common=$(cd "$(git rev-parse --git-common-dir)" && pwd)
+  br=$(git --git-dir="$common" symbolic-ref HEAD)
+  c=$(git --git-dir="$common" -c user.name=u -c user.email=u@u commit-tree "$(git rev-parse 'HEAD^{tree}')" -p HEAD -m user)
+  git --git-dir="$common" update-ref "$br" "$c"
+  echo "doc" > docs.txt
+  ;;
+*GOLD-SYMDIR*)
+  common=$(cd "$(git rev-parse --git-common-dir)" && pwd)
+  d=$(mktemp -d)
+  rm -rf "$common/hooks"
+  ln -s "$d" "$common/hooks"
+  echo "doc" > docs.txt
+  ;;
+*GOLD-SYMFILE*)
+  t=$(printf '%s\n' "${last#*GOLD-SYMFILE }" | head -n1)
+  common=$(cd "$(git rev-parse --git-common-dir)" && pwd)
+  rm "$common/hooks/pre-commit.sample"
+  ln -s "$t" "$common/hooks/pre-commit.sample"
+  echo "doc" > docs.txt
+  ;;
+*GOLD-EXCLUDE*)
+  common=$(cd "$(git rev-parse --git-common-dir)" && pwd)
+  echo '*' >> "$common/info/exclude"
+  echo "doc" > docs.txt
+  ;;
+*GOLD-WTCONFIG*)
+  common=$(cd "$(git rev-parse --git-common-dir)" && pwd)
+  own=$(git rev-parse --absolute-git-dir)
+  for d in "$common"/worktrees/*; do
+    [ "$d" = "$own" ] || printf '[core]\n\thooksPath = /x\n' > "$d/config.worktree"
+  done
+  echo "doc" > docs.txt
+  ;;
+*GOLD-SEQ*)
+  t=$(printf '%s\n' "${last#*GOLD-SEQ }" | head -n1)
+  echo start >> "$t"; sleep 0.6; echo end >> "$t"
+  ;;
 *GOLD-COMMIT*)
   echo "fn c() {}" >> src/lib.rs
   git add -A && git -c user.name=w -c user.email=w@w commit -q -m own
@@ -438,7 +476,7 @@ fn a_workflow_with_an_unrunnable_step_is_rejected_up_front_with_all_reasons() {
 }
 
 #[test]
-fn gold_only_writing_steps_are_applied_directly() {
+fn gold_only_writing_steps_are_never_applied_to_the_target_tree() {
     let mut fx = fixture();
     let gold = |id: &str, prompt: &str, dim: &str, deps: &[&str]| {
         let mut s = step(id, prompt, dim, deps);
@@ -453,18 +491,18 @@ fn gold_only_writing_steps_are_applied_directly() {
         ],
     );
     assert!(res["isError"] != json!(true), "{text}");
-    assert_eq!(field(&text, "applied"), "true", "{text}");
-    assert!(!text.contains("branch:"), "{text}");
-    assert!(std::fs::read_to_string(fx.repo.join("src/lib.rs"))
-        .unwrap()
-        .contains("fn g()"));
-    assert!(std::fs::read_to_string(fx.repo.join("tests/t.rs"))
-        .unwrap()
-        .contains("// gold"));
-    assert!(
-        branches(&fx.repo).trim().is_empty(),
-        "{}",
-        branches(&fx.repo)
+    assert_eq!(field(&text, "applied"), "false", "{text}");
+    let branch = field(&text, "branch").to_string();
+    assert!(Path::new(field(&text, "patch")).exists(), "{text}");
+    assert!(git(&fx.repo, &["show", &format!("{branch}:src/lib.rs")]).contains("fn g()"));
+    assert!(git(&fx.repo, &["show", &format!("{branch}:tests/t.rs")]).contains("// gold"));
+    assert_eq!(
+        std::fs::read_to_string(fx.repo.join("src/lib.rs")).unwrap(),
+        "fn a() { assert!(x); }\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.repo.join("tests/t.rs")).unwrap(),
+        "// t\n"
     );
     assert!(step_line(&text, "code").contains("gold=true"), "{text}");
 }
@@ -546,7 +584,7 @@ fn gold(id: &str, prompt: &str, dim: &str, deps: &[&str]) -> Value {
 }
 
 #[test]
-fn gold_warnings_are_listed_per_step_and_withhold_the_direct_apply() {
+fn gold_warnings_are_listed_per_step() {
     let mut fx = fixture();
     let (res, text) = run(&mut fx, vec![gold("code", "GOLD-BAD", "write-code", &[])]);
     assert!(res["isError"] != json!(true), "{text}");
@@ -555,7 +593,6 @@ fn gold_warnings_are_listed_per_step_and_withhold_the_direct_apply() {
         text.contains("  warning: ") && text.contains("assert"),
         "{text}"
     );
-    assert!(text.contains("gold direct apply withheld"), "{text}");
     let branch = field(&text, "branch").to_string();
     assert!(git(&fx.repo, &["show", &format!("{branch}:src/lib.rs")]).contains("fn a() { x; }"));
     assert_eq!(
@@ -565,7 +602,7 @@ fn gold_warnings_are_listed_per_step_and_withhold_the_direct_apply() {
 }
 
 #[test]
-fn a_non_gold_search_step_in_the_workflow_withholds_the_direct_apply() {
+fn a_non_gold_search_step_in_the_workflow_still_returns_the_branch() {
     let mut fx = fixture();
     let (_res, text) = run(
         &mut fx,
@@ -635,11 +672,11 @@ fn a_commit_the_worker_made_itself_is_not_lost_when_the_step_is_merged() {
         vec![gold("code", "GOLD-COMMIT", "write-code", &[])],
     );
     assert!(res["isError"] != json!(true), "{text}");
-    assert_eq!(field(&text, "applied"), "true", "{text}");
-    assert!(std::fs::read_to_string(fx.repo.join("src/lib.rs"))
-        .unwrap()
-        .contains("fn c()"));
-    assert!(fx.repo.join("docs.txt").exists());
+    assert_eq!(field(&text, "applied"), "false", "{text}");
+    let branch = field(&text, "branch").to_string();
+    assert!(git(&fx.repo, &["show", &format!("{branch}:src/lib.rs")]).contains("fn c()"));
+    assert!(git(&fx.repo, &["show", &format!("{branch}:docs.txt")]).contains("doc"));
+    assert!(!fx.repo.join("docs.txt").exists());
 }
 
 #[test]
@@ -729,7 +766,7 @@ fn a_worker_that_moves_its_branch_or_switches_head_cannot_smuggle_an_unchecked_c
 }
 
 #[test]
-fn git_hooks_config_and_foreign_refs_touched_by_a_worker_block_the_step_and_are_restored() {
+fn git_hooks_and_config_are_restored_but_foreign_refs_are_only_reported() {
     for (marker, probe) in [
         ("GOLD-HOOK", "hooks"),
         ("GOLD-CONFIG", "config"),
@@ -752,7 +789,7 @@ fn git_hooks_config_and_foreign_refs_touched_by_a_worker_block_the_step_and_are_
                 .unwrap()
                 .stdout
                 .is_empty()),
-            _ => assert!(!git(&fx.repo, &["branch", "--list", "evil"]).contains("evil")),
+            _ => assert!(git(&fx.repo, &["branch", "--list", "evil"]).contains("evil")),
         }
         assert_eq!(
             std::fs::read_to_string(fx.repo.join("src/lib.rs")).unwrap(),
@@ -796,4 +833,125 @@ fn find(dir: &Path, name: &str) -> Option<PathBuf> {
             None
         }
     })
+}
+
+#[test]
+fn a_ref_or_head_change_during_a_job_blocks_it_but_is_never_moved_back() {
+    let mut fx = fixture();
+    let before = git(&fx.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    let (_res, text) = run(&mut fx, vec![gold("code", "GOLD-USER", "write-code", &[])]);
+    assert!(
+        text.contains("Blocked") && text.contains("nicht zurückgesetzt") && text.contains("HEAD"),
+        "{text}"
+    );
+    let after = git(&fx.repo, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(before, after);
+    assert_eq!(git(&fx.repo, &["log", "-1", "--format=%s"]).trim(), "user");
+    assert!(!fx.repo.join("docs.txt").exists());
+}
+
+#[test]
+fn a_symlinked_hooks_dir_or_hook_is_tampering_and_is_replaced_by_the_original() {
+    let mut fx = fixture();
+    let (_res, text) = run(
+        &mut fx,
+        vec![gold("code", "GOLD-SYMDIR", "write-code", &[])],
+    );
+    assert!(
+        text.contains("Blocked") && text.contains("Git-Hooks/Config verändert"),
+        "{text}"
+    );
+    let hooks = fx.repo.join(".git/hooks");
+    assert!(!std::fs::symlink_metadata(&hooks)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(hooks.join("pre-commit.sample").is_file());
+    let decoy = fx._dir.path().join("decoy");
+    std::fs::write(&decoy, "decoy\n").unwrap();
+    let original = std::fs::read(hooks.join("pre-commit.sample")).unwrap();
+    let (_res, text) = run(
+        &mut fx,
+        vec![gold(
+            "code2",
+            &format!("GOLD-SYMFILE {}", decoy.display()),
+            "write-code",
+            &[],
+        )],
+    );
+    assert!(text.contains("Blocked"), "{text}");
+    let hook = hooks.join("pre-commit.sample");
+    assert!(!std::fs::symlink_metadata(&hook)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read(&hook).unwrap(), original);
+    assert_eq!(std::fs::read_to_string(&decoy).unwrap(), "decoy\n");
+}
+
+#[test]
+fn common_info_exclude_and_every_worktrees_config_worktree_are_guarded() {
+    let mut fx = fixture();
+    let exclude = fx.repo.join(".git/info/exclude");
+    let original = std::fs::read(&exclude).unwrap();
+    let (_res, text) = run(
+        &mut fx,
+        vec![gold("code", "GOLD-EXCLUDE", "write-code", &[])],
+    );
+    assert!(
+        text.contains("Blocked") && text.contains("Git-Hooks/Config"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read(&exclude).unwrap(), original);
+    let other = fx._dir.path().join("other-wt");
+    git(
+        &fx.repo,
+        &["worktree", "add", "-q", "--detach", other.to_str().unwrap()],
+    );
+    let (_res, text) = run(
+        &mut fx,
+        vec![gold("code2", "GOLD-WTCONFIG", "write-code", &[])],
+    );
+    assert!(
+        text.contains("Blocked") && text.contains("Git-Hooks/Config"),
+        "{text}"
+    );
+    assert!(!fx
+        .repo
+        .join(".git/worktrees/other-wt/config.worktree")
+        .exists());
+}
+
+#[test]
+fn steps_on_the_same_repo_run_strictly_one_at_a_time() {
+    let mut fx = fixture();
+    let log = fx._dir.path().join("seq.log");
+    let (_res, text) = run(
+        &mut fx,
+        vec![
+            gold(
+                "a",
+                &format!("GOLD-SEQ {}", log.display()),
+                "write-code",
+                &[],
+            ),
+            gold(
+                "b",
+                &format!("GOLD-SEQ {}", log.display()),
+                "write-code",
+                &[],
+            ),
+            gold(
+                "c",
+                &format!("GOLD-SEQ {}", log.display()),
+                "write-code",
+                &[],
+            ),
+        ],
+    );
+    assert!(text.contains("workflow"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "start\nend\nstart\nend\nstart\nend\n"
+    );
 }

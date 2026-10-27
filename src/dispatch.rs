@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -571,8 +571,24 @@ fn no_hooks() -> &'static Path {
     })
 }
 
-fn run_git(mut cmd: Command, args: &[&str]) -> Result<String> {
+fn empty_config() -> &'static Path {
+    static FILE: OnceLock<PathBuf> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let file = std::env::temp_dir().join(format!(
+            "sidekick-gitconfig-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::write(&file, "");
+        file
+    })
+}
+
+fn run_git(mut cmd: Command, args: &[&str], isolate: bool) -> Result<String> {
     let _helper = runner::helper_guard();
+    if isolate {
+        cmd.env("GIT_CONFIG_GLOBAL", empty_config())
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+    }
     let out = cmd
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-c")
@@ -595,7 +611,34 @@ fn run_git(mut cmd: Command, args: &[&str]) -> Result<String> {
 pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir);
-    run_git(cmd, args)
+    run_git(cmd, args, true)
+}
+
+pub(crate) fn git_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).env("GIT_INDEX_FILE", index);
+    run_git(cmd, args, true)
+}
+
+pub(crate) fn git_user_config(dir: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir);
+    run_git(cmd, args, false)
+}
+
+pub(crate) fn tree_diff(repo: &Path, extra: &[&str], from: &str, to: &str) -> Result<String> {
+    let mut args = vec![
+        "-c",
+        "core.quotepath=false",
+        "diff",
+        "--no-color",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+    ];
+    args.extend(extra);
+    args.extend([from, to]);
+    git(repo, &args)
 }
 
 fn file_mode(meta: &std::fs::Metadata) -> u32 {
@@ -621,22 +664,43 @@ fn set_file_mode(path: &Path, mode: u32) {
     let _ = (path, mode);
 }
 
-fn scan_files(path: &Path, out: &mut BTreeMap<PathBuf, (Vec<u8>, u32)>) {
+#[derive(Clone, PartialEq)]
+enum Entry {
+    File(Vec<u8>, u32),
+    Link(PathBuf),
+}
+
+fn scan_files(path: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     };
-    if meta.is_dir() {
+    if meta.file_type().is_symlink() {
+        if let Ok(target) = std::fs::read_link(path) {
+            out.insert(path.to_path_buf(), Entry::Link(target));
+        }
+    } else if meta.is_dir() {
         for e in std::fs::read_dir(path).into_iter().flatten().flatten() {
             scan_files(&e.path(), out);
         }
     } else if let Ok(bytes) = std::fs::read(path) {
-        out.insert(path.to_path_buf(), (bytes, file_mode(&meta)));
+        out.insert(path.to_path_buf(), Entry::File(bytes, file_mode(&meta)));
     }
+}
+
+fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+fn make_link(target: &Path, path: &Path) {
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(target, path);
+    #[cfg(not(unix))]
+    let _ = (target, path);
 }
 
 struct Watch {
     paths: Vec<PathBuf>,
-    files: BTreeMap<PathBuf, (Vec<u8>, u32)>,
+    files: BTreeMap<PathBuf, Entry>,
 }
 
 impl Watch {
@@ -649,10 +713,26 @@ impl Watch {
         w
     }
 
-    fn scan(&self) -> BTreeMap<PathBuf, (Vec<u8>, u32)> {
+    fn scan(&self) -> BTreeMap<PathBuf, Entry> {
         let mut out = BTreeMap::new();
         self.paths.iter().for_each(|p| scan_files(p, &mut out));
         out
+    }
+
+    fn clear_links(&self, path: &Path) {
+        for root in self.paths.iter().filter(|r| path.starts_with(r)) {
+            let mut cur = root.clone();
+            let rest = path.strip_prefix(root).unwrap_or(Path::new(""));
+            for part in std::iter::once(None).chain(rest.components().map(Some)) {
+                if let Some(c) = part {
+                    cur.push(c);
+                }
+                if is_link(&cur) && !matches!(self.files.get(&cur), Some(Entry::Link(_))) {
+                    let _ = std::fs::remove_file(&cur);
+                    break;
+                }
+            }
+        }
     }
 
     fn restore(&self) -> bool {
@@ -663,12 +743,21 @@ impl Watch {
         for p in now.keys().filter(|p| !self.files.contains_key(*p)) {
             let _ = std::fs::remove_file(p);
         }
-        for (p, (bytes, mode)) in self.files.iter().filter(|(p, v)| now.get(*p) != Some(v)) {
+        for (p, entry) in self.files.iter().filter(|(p, v)| now.get(*p) != Some(v)) {
+            self.clear_links(p);
+            if is_link(p) || p.is_file() {
+                let _ = std::fs::remove_file(p);
+            }
             if let Some(dir) = p.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(p, bytes);
-            set_file_mode(p, *mode);
+            match entry {
+                Entry::File(bytes, mode) => {
+                    let _ = std::fs::write(p, bytes);
+                    set_file_mode(p, *mode);
+                }
+                Entry::Link(target) => make_link(target, p),
+            }
         }
         true
     }
@@ -710,14 +799,24 @@ fn exe_print() -> Option<(PathBuf, String)> {
 impl Guard {
     fn capture(repo: &Path, admin: &Path, own: Vec<PathBuf>) -> Result<Self> {
         let common = admin_common(admin);
-        let git = Watch::new(vec![
+        let mut paths = vec![
             common.join("hooks"),
             common.join("config"),
+            common.join("config.worktree"),
             common.join("info/attributes"),
+            common.join("info/exclude"),
             admin.join("config.worktree"),
             admin.join("info/attributes"),
             admin.join("hooks"),
-        ]);
+        ];
+        paths.extend(
+            std::fs::read_dir(common.join("worktrees"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path().join("config.worktree")),
+        );
+        let git = Watch::new(paths);
         let mut guard = Self {
             repo: repo.to_path_buf(),
             git,
@@ -756,9 +855,9 @@ impl Guard {
     }
 
     fn check_and_restore(&self) -> Option<String> {
-        let mut found = Vec::new();
+        let mut found: Vec<String> = Vec::new();
         if self.git.restore() {
-            found.push("Git-Hooks/Config verändert");
+            found.push("Git-Hooks/Config verändert".into());
         }
         let own_changed = self.own.restore();
         let exe_changed = self
@@ -766,31 +865,46 @@ impl Guard {
             .as_ref()
             .is_some_and(|(p, h)| fingerprint(p).as_ref() != Some(h));
         if own_changed || exe_changed {
-            found.push("Sidekick-Dateien verändert");
+            found.push("Sidekick-Dateien verändert".into());
         }
         let refs = self.read_refs().unwrap_or_default();
         let head = self.read_head().unwrap_or_default();
-        if refs != self.refs || head != self.head {
-            found.push("Refs außerhalb des Job-Branches verändert");
-            for (r, o) in self.refs.iter().filter(|(r, o)| refs.get(*r) != Some(*o)) {
-                let _ = git(&self.repo, &["update-ref", r, o]);
-            }
-            for r in refs.keys().filter(|r| !self.refs.contains_key(*r)) {
-                let _ = git(&self.repo, &["update-ref", "-d", r]);
-            }
+        let moved: std::collections::BTreeSet<&str> = self
+            .refs
+            .keys()
+            .chain(refs.keys())
+            .filter(|r| self.refs.get(*r) != refs.get(*r))
+            .map(String::as_str)
+            .collect();
+        if !moved.is_empty() || head != self.head {
+            let mut what: Vec<&str> = moved.into_iter().collect();
             if head != self.head {
-                let _ = if self.head.0.is_empty() {
-                    git(
-                        &self.repo,
-                        &["update-ref", "--no-deref", "HEAD", &self.head.1],
-                    )
-                } else {
-                    git(&self.repo, &["symbolic-ref", "HEAD", &self.head.0])
-                };
+                what.push("HEAD");
             }
+            found.push(format!(
+                "Refs außerhalb des Job-Branches verändert, nicht zurückgesetzt: {}",
+                what.join(", ")
+            ));
         }
         (!found.is_empty()).then(|| format!("Ausbruchsversuch: {}", found.join(", ")))
     }
+}
+
+fn repo_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let key = git(repo, &["rev-parse", "--git-common-dir"])
+        .ok()
+        .map(|d| repo.join(d.trim()))
+        .and_then(|d| d.canonicalize().ok())
+        .unwrap_or_else(|| repo.to_path_buf());
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_default()
+        .clone()
 }
 
 fn admin_common(admin: &Path) -> PathBuf {
@@ -857,7 +971,7 @@ impl Worktree {
             .arg(&self.path)
             .current_dir(&self.path)
             .env("GIT_INDEX_FILE", &self.index);
-        run_git(cmd, args)
+        run_git(cmd, args, true)
     }
 
     fn snapshot(&self) -> Result<String> {
@@ -868,38 +982,11 @@ impl Worktree {
     }
 
     fn diff(&self, tree: &str, unified: &str) -> Result<String> {
-        git(
-            &self.repo,
-            &[
-                "-c",
-                "core.quotepath=false",
-                "diff",
-                "--binary",
-                "--no-color",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                unified,
-                &self.base,
-                tree,
-            ],
-        )
+        tree_diff(&self.repo, &["--binary", unified], &self.base, tree)
     }
 
     fn files(&self, tree: &str) -> Result<Vec<String>> {
-        let out = git(
-            &self.repo,
-            &[
-                "diff",
-                "--name-only",
-                "-z",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                &self.base,
-                tree,
-            ],
-        )?;
+        let out = tree_diff(&self.repo, &["--name-only", "-z"], &self.base, tree)?;
         Ok(out
             .split('\0')
             .filter(|s| !s.is_empty())
@@ -1043,6 +1130,11 @@ impl Dispatcher {
             _ => req.max_turns,
         };
         let proposal = req.dimension.is_write() && !write_right;
+        let _repo_turn = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("cancelled while waiting for another job on this repository"),
+            g = repo_lock(&req.repo).lock_owned() => g,
+        };
         let wt = Worktree::create(
             &req.repo,
             &self.work_dir,
@@ -1420,5 +1512,54 @@ mod tests {
             .check(&["src/a.rs".into()], moved)
             .violations
             .is_empty());
+    }
+
+    #[test]
+    fn sidekick_git_ignores_global_and_system_config_but_the_data_repo_helper_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("gitconfig");
+        std::fs::write(
+            &global,
+            "[alias]\n\tleak = status\n[user]\n\tname = leaky\n",
+        )
+        .unwrap();
+        std::env::set_var("GIT_CONFIG_GLOBAL", &global);
+        git(dir.path(), &["init", "-q"]).unwrap();
+        assert!(git(dir.path(), &["config", "--get", "alias.leak"]).is_err());
+        assert!(git(dir.path(), &["config", "--get", "user.name"]).is_err());
+        assert!(git_user_config(dir.path(), &["config", "--get", "alias.leak"]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_diff_never_runs_textconv_or_external_diff_drivers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let marker = dir.path().join("ran");
+        let driver = dir.path().join("driver.sh");
+        std::fs::write(
+            &driver,
+            format!("#!/bin/sh\ntouch {}\ncat \"$1\"\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |args: &[&str]| {
+            let mut full = GIT_IDENT.to_vec();
+            full.extend(args);
+            git(&repo, &full).unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&["config", "diff.x.textconv", &driver.to_string_lossy()]);
+        run(&["config", "diff.external", &driver.to_string_lossy()]);
+        std::fs::write(repo.join(".gitattributes"), "*.txt diff=x\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "1\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "a"]);
+        std::fs::write(repo.join("a.txt"), "2\n").unwrap();
+        run(&["commit", "-q", "-am", "b"]);
+        let out = tree_diff(&repo, &["--binary", "-U3"], "HEAD~1", "HEAD").unwrap();
+        assert!(out.contains("+2") && !marker.exists(), "{out}");
     }
 }

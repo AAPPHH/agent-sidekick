@@ -1797,12 +1797,11 @@ impl SidekickServer {
 
     /// Submit a workflow: steps [{id, prompt, dimension, scope?, backend?, model?, depends_on?}]
     /// plus cwd. Every step must pass the dispatch gating (registered model, account guard);
-    /// otherwise the whole workflow is rejected with the reasons. Independent steps run in
-    /// parallel; a dependent step's prompt gets the results of its dependencies. Writing steps
+    /// otherwise the whole workflow is rejected with the reasons. Steps on one repository run one
+    /// at a time; a dependent step's prompt gets the results of its dependencies. Writing steps
     /// share one workflow branch (each diff is checked with its own trust rules and committed
-    /// only when clean); a blocked or failed step skips its dependents. Nothing reaches the
-    /// working tree until the end: when every step ran on the verified Gold model and none produced
-    /// warnings the combined patch is applied, otherwise the workflow branch, the combined patch and the per-step
+    /// only when clean); a blocked or failed step skips its dependents. Nothing ever reaches the
+    /// working tree, Gold included: the workflow branch, the combined patch and the per-step
     /// results (each with its own job_id for sidekick_record_experience) are returned. Questions
     /// of any step surface as in sidekick_dispatch (answer with sidekick_answer).
     #[tool]
