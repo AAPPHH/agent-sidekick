@@ -150,7 +150,7 @@ fn unregistered_model_on_a_backend_with_registered_models_is_rejected() {
     ModelRow::write_all(&checkout.join("models.parquet"), &[row]).unwrap();
     let cfg = d.path().join("cfg");
     let mut text = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
-    text.push_str("[backends.cl]\ntype = \"claude-oauth\"\ndescription = \"t\"\n");
+    text.push_str("[backends.cl]\ntype = \"claude-oauth\"\ndescription = \"t\"\naccount = \"cl@example.com\"\n");
     std::fs::write(cfg.join("config.toml"), text).unwrap();
     let data = d.path().join("data");
     let mut s = Server::start(&cfg, &[("AGENT_SIDEKICK_DATA_DIR", data.to_str().unwrap())]);
@@ -174,4 +174,35 @@ fn concurrent_first_runs_open_the_store_once() {
         let (res, _) = s.wait_response(id, std::time::Duration::from_secs(60));
         assert!(res["isError"] != json!(true), "{res}");
     }
+}
+
+#[test]
+fn account_guard_rejects_the_callers_own_account_and_unknown_accounts() {
+    let (d, s, repo) = fixture(false);
+    drop(s);
+    let cfg = d.path().join("cfg");
+    let caller = d.path().join("caller");
+    std::fs::create_dir_all(&caller).unwrap();
+    std::fs::write(caller.join(".claude.json"), r#"{"oauthAccount":{"emailAddress":"Me@Example.com"}}"#).unwrap();
+    let mut text = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+    text.push_str("[backends.same]\ntype = \"claude-oauth\"\ndescription = \"t\"\naccount = \"me@example.COM\"\n");
+    text.push_str("[backends.gc]\ntype = \"command\"\ndescription = \"t\"\naccount = \"me@example.com\"\ncommand = [\"x\", \"{prompt}\"]\n");
+    text.push_str("[backends.noacc]\ntype = \"claude-oauth\"\ndescription = \"t\"\n");
+    text.push_str("[backends.other]\ntype = \"claude-oauth\"\ndescription = \"t\"\naccount = \"other@example.com\"\n");
+    std::fs::write(cfg.join("config.toml"), text).unwrap();
+    let data = d.path().join("data");
+    let mut s = Server::start(&cfg, &[("AGENT_SIDEKICK_DATA_DIR", data.to_str().unwrap()), ("CLAUDE_CONFIG_DIR", caller.to_str().unwrap())]);
+    s.initialize();
+    let cwd = repo.to_string_lossy().to_string();
+    let run = |s: &mut Server, args: serde_json::Value| text_of(&s.call_tool("sidekick_run", args));
+    let t = run(&mut s, json!({"prompt": "hi", "cwd": cwd, "backend": "same"}));
+    assert!(t.contains("gleiches Konto wie der Aufrufer"), "{t}");
+    let t = run(&mut s, json!({"prompt": "hi", "cwd": cwd, "backend": "noacc"}));
+    assert!(t.contains("Konto unbekannt"), "{t}");
+    let t = run(&mut s, json!({"prompt": "hi", "cwd": cwd, "backend": "other", "fallback": "gc"}));
+    assert!(t.contains("fallback: backend gc: gleiches Konto"), "{t}");
+    let t = text_of(&s.call_tool("sidekick_dispatch", json!({"prompt": "hi", "cwd": cwd, "backend": "same", "dimension": "search"})));
+    assert!(t.contains("gleiches Konto wie der Aufrufer"), "{t}");
+    let t = text_of(&s.call_tool("sidekick_backends", json!({})));
+    assert!(t.contains("other@example.com"), "{t}");
 }

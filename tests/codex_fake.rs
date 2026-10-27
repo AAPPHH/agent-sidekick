@@ -174,7 +174,7 @@ impl Fixture {
         let canned_path = self.dir.path().join(format!("canned-{exit}.jsonl"));
         std::fs::write(&canned_path, canned).unwrap();
         format!(
-            "[backends.cx]\nharness = \"codex\"\n{auth}\ndescription = \"fake codex\"\n\
+            "[backends.cx]\nharness = \"codex\"\n{auth}\ndescription = \"fake codex\"\naccount = \"codex-user@example.com\"\n\
              default = {default}\nharness_path = '{}'\n\
              [backends.cx.env]\nFAKE_CX_OUT = '{}'\nFAKE_CX_CANNED = '{}'\nFAKE_CX_EXIT = \"{exit}\"\n",
             self.fake.display(),
@@ -574,7 +574,7 @@ fn claude_falls_back_to_codex_and_the_oauth_token_stays_behind() {
         path
     };
     let config = format!(
-        "[backends.sidekick]\nharness = \"claude\"\ndescription = \"claude account\"\n\
+        "[backends.sidekick]\nharness = \"claude\"\ndescription = \"claude account\"\naccount = \"claude-user@example.com\"\n\
          default = true\nconfig_dir = '{}'\n\n{}",
         f.dir.path().join("claude-cfg").display(),
         f.cx_backend(false, "auth = \"chatgpt\"", &answer_lines(ANSWER), 0)

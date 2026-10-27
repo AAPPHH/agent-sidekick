@@ -162,6 +162,7 @@ fn implicit_backend(cfg: &Config, defaults: &ResolveDefaults) -> Result<Backend,
     Ok(Backend {
         name: IMPLICIT_BACKEND.to_owned(),
         description: IMPLICIT_DESCRIPTION.to_owned(),
+        account: None,
         cost: Cost::Quota,
         is_default: true,
         max_concurrent: None,
@@ -289,6 +290,15 @@ fn resolve_one(
             errs.push("`description` is required".to_owned());
             None
         }
+    };
+
+    let account = match raw.account.as_deref().map(str::trim) {
+        Some(a) if a.contains('@') && !a.contains(char::is_whitespace) => Some(a.to_owned()),
+        Some(_) => {
+            errs.push("`account` must be an e-mail address".to_owned());
+            None
+        }
+        None => None,
     };
 
     match raw.max_concurrent {
@@ -606,6 +616,7 @@ fn resolve_one(
     Ok(Backend {
         name: name.to_owned(),
         description,
+        account,
         cost: raw.cost.unwrap_or(match (&kind_val, kind) {
             (_, BackendType::ClaudeOauth) => Cost::Quota,
             (_, BackendType::ClaudeEndpoint) => Cost::Paid,

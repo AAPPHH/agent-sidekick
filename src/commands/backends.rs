@@ -588,6 +588,7 @@ pub(crate) mod tests {
         Backend {
             name: name.to_owned(),
             description: format!("description of {name}"),
+            account: None,
             cost: Cost::Free,
             is_default,
             max_concurrent: None,

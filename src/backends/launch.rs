@@ -665,6 +665,7 @@ mod tests {
         Backend {
             name: name.to_owned(),
             description: "test".to_owned(),
+            account: None,
             cost: Cost::Free,
             is_default: false,
             max_concurrent: None,

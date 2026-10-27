@@ -639,6 +639,7 @@ struct BackendInfo {
     #[serde(rename = "type")]
     kind: &'static str,
     description: String,
+    account: Option<String>,
     cost: &'static str,
     default: bool,
     /// Allowlist of models (`null`: claude-* accepts any model, a command backend without
@@ -1212,6 +1213,13 @@ impl SidekickServer {
         if let Err(msg) = primary.effective_model(req.model.as_deref()) {
             return tool_error_with(&snap, msg);
         }
+        let caller = backends::caller_account();
+        if let Err(msg) = primary.account_guard(caller.as_deref()) {
+            return tool_error_with(&snap, msg);
+        }
+        if let Some(Err(msg)) = fallback.map(|fb| fb.account_guard(caller.as_deref())) {
+            return tool_error_with(&snap, format!("fallback: {msg}"));
+        }
         let dimension = params.dimension.clone().filter(|d| !d.trim().is_empty());
         let dispatch_params = |backend: &Backend, model: Option<String>, dimension: String| DispatchParams {
             prompt: params.prompt.clone(),
@@ -1508,7 +1516,10 @@ impl SidekickServer {
         };
         let now = chrono::Utc::now().timestamp_millis();
         let detail = p.detail.unwrap_or(false);
-        let label = backend.as_ref().map(|b| b.name.clone());
+        let label = backend.as_ref().map(|b| match &b.account {
+            Some(a) => format!("{}, {a}", b.name),
+            None => b.name.clone(),
+        });
         let built = blocking(move || {
             store
                 .data
@@ -1678,6 +1689,9 @@ impl SidekickServer {
             Err(msg) => return tool_error_with(&snap, msg),
         };
         if let Err(msg) = backend.effective_model(req.model.as_deref()) {
+            return tool_error_with(&snap, msg);
+        }
+        if let Err(msg) = backend.account_guard(backends::caller_account().as_deref()) {
             return tool_error_with(&snap, msg);
         }
         if let Some(secs) = state.cooldown(&backend.name) {
@@ -2044,6 +2058,7 @@ impl SidekickServer {
                 name: b.name.clone(),
                 kind: b.backend_type().as_str(),
                 description: b.description.clone(),
+                account: b.account.clone(),
                 cost: b.cost.as_str(),
                 default: b.is_default,
                 models: b.models.clone(),
@@ -2888,6 +2903,7 @@ mod tests {
         Backend {
             name: name.to_owned(),
             description: format!("{name} backend"),
+            account: None,
             cost: backends::Cost::Free,
             is_default,
             max_concurrent: None,

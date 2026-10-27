@@ -323,6 +323,10 @@ pub struct RawBackend {
     #[serde(rename = "type")]
     pub kind: Option<BackendType>,
     pub description: Option<String>,
+    /// E-mail of the account the backend runs under (not a secret). Required for
+    /// account-bound backends (claude-oauth, codex with a ChatGPT login); a backend whose
+    /// account equals the caller's is never launched.
+    pub account: Option<String>,
     pub default: Option<bool>,
     pub cost: Option<Cost>,
     pub max_concurrent: Option<usize>,
@@ -386,6 +390,7 @@ pub struct RawBackend {
 pub struct Backend {
     pub name: String,
     pub description: String,
+    pub account: Option<String>,
     pub cost: Cost,
     pub is_default: bool,
     /// Per-backend concurrency limit (in addition to the global one).
@@ -465,6 +470,28 @@ pub enum BackendKind {
 }
 
 impl Backend {
+    pub fn account_bound(&self) -> bool {
+        match &self.kind {
+            BackendKind::ClaudeOauth { .. } => !self.implicit,
+            BackendKind::Codex { auth, .. } => *auth == CodexAuth::Chatgpt,
+            _ => false,
+        }
+    }
+
+    pub fn account_guard(&self, caller: Option<&str>) -> Result<(), String> {
+        match (&self.account, caller) {
+            (None, _) if self.account_bound() => Err(format!(
+                "backend {}: Konto unbekannt – `account` in config.toml setzen",
+                self.name
+            )),
+            (Some(a), Some(c)) if a.eq_ignore_ascii_case(c.trim()) => Err(format!(
+                "backend {}: gleiches Konto wie der Aufrufer ({a})",
+                self.name
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub fn backend_type(&self) -> BackendType {
         match self.kind {
             BackendKind::ClaudeOauth { .. } => BackendType::ClaudeOauth,
@@ -637,5 +664,102 @@ impl Backends {
 
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
+    }
+}
+
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in text.bytes().filter(|c| *c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+fn read_json(path: &std::path::Path) -> Option<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+fn env_dir(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+pub fn claude_account(config_dir: Option<PathBuf>) -> Option<String> {
+    let file = match config_dir {
+        Some(d) => d.join(".claude.json"),
+        None => crate::paths::home_dir().ok()?.join(".claude.json"),
+    };
+    let json = read_json(&file)?;
+    let email = json.pointer("/oauthAccount/emailAddress")?.as_str()?.trim();
+    (!email.is_empty()).then(|| email.to_owned())
+}
+
+pub fn codex_account(auth_file: &std::path::Path) -> Option<String> {
+    let json = read_json(auth_file)?;
+    let jwt = json.pointer("/tokens/id_token")?.as_str()?;
+    let payload: serde_json::Value = serde_json::from_slice(&base64url_decode(jwt.split('.').nth(1)?)?).ok()?;
+    let email = payload.get("email")?.as_str()?.trim();
+    (!email.is_empty()).then(|| email.to_owned())
+}
+
+pub fn caller_account() -> Option<String> {
+    claude_account(env_dir("CLAUDE_CONFIG_DIR")).or_else(|| {
+        let home = env_dir("CODEX_HOME").or_else(|| crate::paths::home_dir().ok().map(|h| h.join(".codex")))?;
+        codex_account(&home.join("auth.json"))
+    })
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+
+    fn oauth(account: Option<&str>) -> Backend {
+        Backend {
+            name: "b".into(),
+            description: "d".into(),
+            account: account.map(str::to_owned),
+            cost: Cost::Quota,
+            is_default: true,
+            max_concurrent: None,
+            model: None,
+            models: None,
+            env: BTreeMap::new(),
+            pass_env: Vec::new(),
+            implicit: false,
+            kind: BackendKind::ClaudeOauth { config_dir: PathBuf::from("c"), permissions: Default::default() },
+            foreign_secret_env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn guard_cases() {
+        assert!(oauth(Some("A@x.com")).account_guard(Some(" a@X.com ")).unwrap_err().contains("gleiches Konto wie der Aufrufer"));
+        assert!(oauth(None).account_guard(None).unwrap_err().contains("Konto unbekannt"));
+        assert!(oauth(Some("a@x.com")).account_guard(None).is_ok());
+        assert!(oauth(Some("a@x.com")).account_guard(Some("b@x.com")).is_ok());
+    }
+
+    #[test]
+    fn codex_email_from_id_token() {
+        let d = tempfile::tempdir().unwrap();
+        let payload = "eyJlbWFpbCI6ImNAeC5jb20ifQ";
+        let f = d.path().join("auth.json");
+        std::fs::write(&f, format!(r#"{{"tokens":{{"id_token":"h.{payload}.s"}}}}"#)).unwrap();
+        assert_eq!(codex_account(&f).as_deref(), Some("c@x.com"));
+        assert_eq!(codex_account(&d.path().join("none.json")), None);
     }
 }

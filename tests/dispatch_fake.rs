@@ -29,6 +29,7 @@ fn backend(model: &str) -> Backend {
     Backend {
         name: "fake".into(),
         description: "t".into(),
+            account: None,
         cost: Cost::Free,
         is_default: false,
         max_concurrent: None,
