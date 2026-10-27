@@ -505,7 +505,7 @@ fn clauses(text: &str) -> Vec<String> {
         }
     }
     out.push(cur);
-    out.into_iter().map(|s| s.trim().trim_end_matches([';']).to_string()).filter(|s| !s.is_empty()).collect()
+    out.into_iter().map(|s| s.trim().trim_end_matches([';', '.']).to_string()).filter(|s| !s.is_empty()).collect()
 }
 
 fn fit(items: Vec<String>, max: usize) -> Vec<String> {
