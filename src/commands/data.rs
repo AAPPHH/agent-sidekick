@@ -4,7 +4,10 @@ use std::process::{Command, ExitCode};
 use anyhow::{anyhow, Context, Result};
 use arrow::datatypes::SchemaRef;
 
-use crate::data::{experience_schema, read_events, read_schema, strip_private, write_events, DataDir, ModelRow, ProtectedRow};
+use crate::data::{
+    experience_schema, read_events, read_schema, strip_private, write_events, DataDir, ModelRow,
+    ProtectedRow,
+};
 use crate::dispatch::{git, glob_match};
 
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -45,14 +48,30 @@ pub enum DataCommand {
 
 pub fn run(args: DataArgs) -> Result<ExitCode> {
     match args.command {
-        DataCommand::Validate { base, head, pusher, root, paths_out } => {
-            let found = Validator { root: &root, pusher: &pusher }.violations(&base, &head)?;
+        DataCommand::Validate {
+            base,
+            head,
+            pusher,
+            root,
+            paths_out,
+        } => {
+            let found = Validator {
+                root: &root,
+                pusher: &pusher,
+            }
+            .violations(&base, &head)?;
             if let Some(out) = paths_out {
                 let mut paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
                 paths.dedup();
-                std::fs::write(out, paths.iter().map(|p| format!("{p}\n")).collect::<String>())?;
+                std::fs::write(
+                    out,
+                    paths.iter().map(|p| format!("{p}\n")).collect::<String>(),
+                )?;
             }
-            let violations: Vec<String> = found.into_iter().map(|(p, m)| format!("{p}: {m}")).collect();
+            let violations: Vec<String> = found
+                .into_iter()
+                .map(|(p, m)| format!("{p}: {m}"))
+                .collect();
             if violations.is_empty() {
                 return Ok(ExitCode::SUCCESS);
             }
@@ -70,7 +89,11 @@ pub fn run(args: DataArgs) -> Result<ExitCode> {
 
 pub fn aggregate(root: &Path) -> Result<usize> {
     let data = DataDir::new(root.to_path_buf());
-    let events: Vec<_> = data.experience_events()?.iter().map(strip_private).collect();
+    let events: Vec<_> = data
+        .experience_events()?
+        .iter()
+        .map(strip_private)
+        .collect();
     let path = data.aggregate_path();
     if !path.exists() || read_events(&path)? != events {
         write_events(&path, &events)?;
@@ -92,7 +115,11 @@ type Violation = (String, String);
 fn git_z(root: &Path, args: &[&str]) -> Result<Vec<String>> {
     let mut full = vec!["-c", "core.quotepath=false"];
     full.extend(args);
-    Ok(git(root, &full)?.split('\0').filter(|p| !p.is_empty()).map(String::from).collect())
+    Ok(git(root, &full)?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect())
 }
 
 fn shared_rule(path: &str) -> bool {
@@ -104,12 +131,18 @@ fn root_path(path: &str) -> bool {
 }
 
 fn prefix_of(path: &str) -> Option<&str> {
-    path.strip_prefix("experiences/")?.split_once('/').map(|(p, _)| p)
+    path.strip_prefix("experiences/")?
+        .split_once('/')
+        .map(|(p, _)| p)
 }
 
 impl Validator<'_> {
     pub fn validate(&self, base: &str, head: &str) -> Result<Vec<String>> {
-        Ok(self.violations(base, head)?.into_iter().map(|(p, m)| format!("{p}: {m}")).collect())
+        Ok(self
+            .violations(base, head)?
+            .into_iter()
+            .map(|(p, m)| format!("{p}: {m}"))
+            .collect())
     }
 
     pub fn violations(&self, base: &str, head: &str) -> Result<Vec<Violation>> {
@@ -117,9 +150,15 @@ impl Validator<'_> {
         let listing = if zero {
             git_z(self.root, &["ls-tree", "-r", "--name-only", "-z", head])?
         } else {
-            git_z(self.root, &["diff", "--name-only", "-z", "--no-renames", base, head])?
+            git_z(
+                self.root,
+                &["diff", "--name-only", "-z", "--no-renames", base, head],
+            )?
         };
-        let changed: Vec<String> = listing.into_iter().filter(|p| !zero || !p.starts_with(".github/")).collect();
+        let changed: Vec<String> = listing
+            .into_iter()
+            .filter(|p| !zero || !p.starts_with(".github/"))
+            .collect();
         let (prefixes, owners) = self.peers(base)?;
         let is_owner = owners.iter().any(|o| o.eq_ignore_ascii_case(self.pusher));
         let mut foreign: Option<Vec<(String, String)>> = None;
@@ -127,7 +166,14 @@ impl Validator<'_> {
         for path in &changed {
             if root_path(path) {
                 if !is_owner {
-                    let m = if shared_rule(path) { format!("shared rule file, only the owners may change it (pusher `{}`)", self.pusher) } else { self.outside(&prefixes) };
+                    let m = if shared_rule(path) {
+                        format!(
+                            "shared rule file, only the owners may change it (pusher `{}`)",
+                            self.pusher
+                        )
+                    } else {
+                        self.outside(&prefixes)
+                    };
                     out.push((path.clone(), m));
                 }
             } else if let Some(v) = self.path_violation(path, &prefixes) {
@@ -137,16 +183,30 @@ impl Validator<'_> {
             if !full.is_file() {
                 continue;
             }
-            out.extend(self.content_violations(path, &full).into_iter().map(|m| (path.clone(), m)));
+            out.extend(
+                self.content_violations(path, &full)
+                    .into_iter()
+                    .map(|m| (path.clone(), m)),
+            );
             if let Some(mine) = prefix_of(path).filter(|_| path.ends_with(".parquet")) {
                 if foreign.is_none() {
                     foreign = Some(self.base_event_ids(if zero { head } else { base })?);
                 }
-                let ids: Vec<&(String, String)> = foreign.iter().flatten().filter(|(_, other)| other != mine).collect();
+                let ids: Vec<&(String, String)> = foreign
+                    .iter()
+                    .flatten()
+                    .filter(|(_, other)| other != mine)
+                    .collect();
                 if let Ok(events) = read_events(&full) {
                     for e in events {
                         if let Some((_, other)) = ids.iter().find(|(id, _)| *id == e.event_id) {
-                            out.push((path.clone(), format!("event {}: event_id already exists under prefix `{other}`", e.event_id)));
+                            out.push((
+                                path.clone(),
+                                format!(
+                                    "event {}: event_id already exists under prefix `{other}`",
+                                    e.event_id
+                                ),
+                            ));
                         }
                     }
                 }
@@ -156,23 +216,46 @@ impl Validator<'_> {
     }
 
     fn reset_allowed(&self, rel: &str) -> bool {
-        let Some(prefix) = prefix_of(rel) else { return rel.starts_with("aggregate/") };
+        let Some(prefix) = prefix_of(rel) else {
+            return rel.starts_with("aggregate/");
+        };
         let text = std::fs::read_to_string(self.root.join(PEERS)).unwrap_or_default();
-        text.parse::<toml::Table>().is_ok_and(|t| crate::sync::peers_owner(&t, prefix))
+        text.parse::<toml::Table>()
+            .is_ok_and(|t| crate::sync::peers_owner(&t, prefix))
     }
 
     fn base_event_ids(&self, rev: &str) -> Result<Vec<(String, String)>> {
         let mut ids = Vec::new();
-        let files = git_z(self.root, &["ls-tree", "-r", "--name-only", "-z", rev, "--", "experiences"])?;
+        let files = git_z(
+            self.root,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "-z",
+                rev,
+                "--",
+                "experiences",
+            ],
+        )?;
         for (n, file) in files.iter().filter(|f| f.ends_with(".parquet")).enumerate() {
-            let Some(prefix) = prefix_of(file) else { continue };
-            let blob = Command::new("git").arg("-C").arg(self.root).args(["cat-file", "blob", &format!("{rev}:{file}")]).output()?;
+            let Some(prefix) = prefix_of(file) else {
+                continue;
+            };
+            let blob = Command::new("git")
+                .arg("-C")
+                .arg(self.root)
+                .args(["cat-file", "blob", &format!("{rev}:{file}")])
+                .output()?;
             if !blob.status.success() {
                 continue;
             }
             static TMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = std::env::temp_dir().join(format!("sidekick-validate-{}-{n}-{seq}.parquet", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!(
+                "sidekick-validate-{}-{n}-{seq}.parquet",
+                std::process::id()
+            ));
             std::fs::write(&tmp, &blob.stdout)?;
             let events = read_events(&tmp);
             let _ = std::fs::remove_file(&tmp);
@@ -194,25 +277,40 @@ impl Validator<'_> {
         let owners = table
             .get("owners")
             .and_then(|o| o.as_array())
-            .map(|a| a.iter().filter_map(|o| o.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| o.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let prefixes = table
             .iter()
-            .filter(|(_, owner)| owner.as_str().is_some_and(|o| o.eq_ignore_ascii_case(self.pusher)))
+            .filter(|(_, owner)| {
+                owner
+                    .as_str()
+                    .is_some_and(|o| o.eq_ignore_ascii_case(self.pusher))
+            })
             .map(|(prefix, _)| format!("experiences/{prefix}/"))
             .collect();
         Ok((prefixes, owners))
     }
 
     fn path_violation(&self, path: &str, prefixes: &[String]) -> Option<String> {
-        if prefixes.iter().any(|p| path.starts_with(p.as_str()) && !path[p.len()..].is_empty()) {
+        if prefixes
+            .iter()
+            .any(|p| path.starts_with(p.as_str()) && !path[p.len()..].is_empty())
+        {
             return None;
         }
         Some(self.outside(prefixes))
     }
 
     fn outside(&self, prefixes: &[String]) -> String {
-        let owned = if prefixes.is_empty() { "no prefix".to_string() } else { prefixes.join(", ") };
+        let owned = if prefixes.is_empty() {
+            "no prefix".to_string()
+        } else {
+            prefixes.join(", ")
+        };
         format!("outside the prefixes of `{}` ({owned})", self.pusher)
     }
 
@@ -220,16 +318,20 @@ impl Validator<'_> {
         let mut out = Vec::new();
         let size = std::fs::metadata(full).map(|m| m.len()).unwrap_or(0);
         if size > MAX_FILE_BYTES {
-            out.push(format!("{size} bytes exceeds the limit of {MAX_FILE_BYTES}"));
+            out.push(format!(
+                "{size} bytes exceeds the limit of {MAX_FILE_BYTES}"
+            ));
         }
         if full.extension().is_none_or(|e| e != "parquet") {
             return out;
         }
         let name = rel;
         let result = if name == "models.parquet" {
-            check_schema(full, ModelRow::schema()).and_then(|_| ModelRow::read_all(full).map(|_| Vec::new()))
+            check_schema(full, ModelRow::schema())
+                .and_then(|_| ModelRow::read_all(full).map(|_| Vec::new()))
         } else if name == "protected.parquet" {
-            check_schema(full, ProtectedRow::schema()).and_then(|_| ProtectedRow::read_all(full).map(|_| Vec::new()))
+            check_schema(full, ProtectedRow::schema())
+                .and_then(|_| ProtectedRow::read_all(full).map(|_| Vec::new()))
         } else if name.starts_with("experiences/") || name.starts_with("aggregate/") {
             let reset_ok = self.reset_allowed(rel);
             check_schema(full, experience_schema()).and_then(|_| event_violations(full, reset_ok))
@@ -246,10 +348,22 @@ impl Validator<'_> {
 
 fn check_schema(path: &Path, expected: SchemaRef) -> Result<()> {
     let found = read_schema(path)?;
-    let sig = |s: &SchemaRef| s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
+    let sig = |s: &SchemaRef| {
+        s.fields()
+            .iter()
+            .map(|f| (f.name().clone(), f.data_type().clone()))
+            .collect::<Vec<_>>()
+    };
     let (found_sig, expected_sig) = (sig(&found), sig(&expected));
-    let appended_nullable = expected.fields().iter().skip(found_sig.len()).all(|f| f.is_nullable());
-    if found_sig.len() > expected_sig.len() || expected_sig[..found_sig.len()] != found_sig[..] || !appended_nullable {
+    let appended_nullable = expected
+        .fields()
+        .iter()
+        .skip(found_sig.len())
+        .all(|f| f.is_nullable());
+    if found_sig.len() > expected_sig.len()
+        || expected_sig[..found_sig.len()] != found_sig[..]
+        || !appended_nullable
+    {
         return Err(anyhow!("schema does not match the expected columns"));
     }
     Ok(())
@@ -259,8 +373,12 @@ fn event_violations(path: &Path, reset_ok: bool) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for e in read_events(path)? {
         let id = &e.event_id;
-        if e.visibility == crate::trust::Visibility::Private && (e.summary.is_some() || e.conclusion.is_some()) {
-            out.push(format!("event {id}: summary/conclusion text on a private row"));
+        if e.visibility == crate::trust::Visibility::Private
+            && (e.summary.is_some() || e.conclusion.is_some())
+        {
+            out.push(format!(
+                "event {id}: summary/conclusion text on a private row"
+            ));
         }
         for (field, value) in [("user_id", &e.user_id), ("machine_id", &e.machine_id)] {
             if !is_pseudonym(value) {
@@ -268,7 +386,10 @@ fn event_violations(path: &Path, reset_ok: bool) -> Result<Vec<String>> {
             }
         }
         if e.outcome == crate::trust::Outcome::Seed && !e.dimension.seedable() {
-            out.push(format!("event {id}: seed for dimension {} (only search/inventory)", e.dimension));
+            out.push(format!(
+                "event {id}: seed for dimension {} (only search/inventory)",
+                e.dimension
+            ));
         }
         if e.outcome == crate::trust::Outcome::Reset && !reset_ok {
             out.push(format!("event {id}: reset row from a prefix whose owner is not listed in peers.toml owners"));

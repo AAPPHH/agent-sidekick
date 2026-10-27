@@ -1160,7 +1160,8 @@ impl Pause {
     }
 
     fn expired(&self, started: Instant, timeout: Duration) -> bool {
-        pause_lock(&self.state).0 == 0 && started.elapsed().saturating_sub(self.paused_total()) >= timeout
+        pause_lock(&self.state).0 == 0
+            && started.elapsed().saturating_sub(self.paused_total()) >= timeout
     }
 }
 
@@ -1323,7 +1324,9 @@ pub async fn run_launch_with(
             (None, false, true)
         }
     };
-    let duration = started.elapsed().saturating_sub(pause.as_ref().map_or(Duration::ZERO, |p| p.paused_total()));
+    let duration = started
+        .elapsed()
+        .saturating_sub(pause.as_ref().map_or(Duration::ZERO, |p| p.paused_total()));
 
     let grace = if timed_out || cancelled {
         READER_GRACE_AFTER_KILL

@@ -55,15 +55,21 @@ fn read_or_create(path: &Path, make: impl FnOnce() -> String) -> Result<String> 
 }
 
 fn add_remote(checkout: &Path, remote: &str) -> Result<()> {
-    git(checkout, &["remote", "add", REMOTE, remote]).map(|_| ()).or_else(|e| match git(checkout, &["remote", "get-url", REMOTE]) {
-        Ok(u) if u.trim() == remote => Ok(()),
-        _ => Err(e),
-    })
+    git(checkout, &["remote", "add", REMOTE, remote])
+        .map(|_| ())
+        .or_else(|e| match git(checkout, &["remote", "get-url", REMOTE]) {
+            Ok(u) if u.trim() == remote => Ok(()),
+            _ => Err(e),
+        })
 }
 
 pub fn remote_url(repo: &str) -> String {
     let slug = repo.split_once('/').is_some_and(|(o, n)| {
-        let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        let ok = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
         ok(o) && ok(n)
     });
     if slug && !Path::new(repo).exists() {
@@ -84,13 +90,21 @@ pub fn peers_check(table: &toml::Table) -> Result<()> {
 }
 
 pub fn peers_owner(table: &toml::Table, prefix: &str) -> bool {
-    let owner = table.get(prefix).filter(|_| prefix != "owners").and_then(|v| v.as_str());
+    let owner = table
+        .get(prefix)
+        .filter(|_| prefix != "owners")
+        .and_then(|v| v.as_str());
     let owners = table.get("owners").and_then(|o| o.as_array());
-    peers_check(table).is_ok() && matches!((owner, owners), (Some(o), Some(a)) if a.iter().filter_map(|x| x.as_str()).any(|x| x.eq_ignore_ascii_case(o)))
+    peers_check(table).is_ok()
+        && matches!((owner, owners), (Some(o), Some(a)) if a.iter().filter_map(|x| x.as_str()).any(|x| x.eq_ignore_ascii_case(o)))
 }
 
 fn valid_name(name: &str) -> bool {
-    !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 fn require_rejection_rule(conclusion: &Option<String>) -> Result<()> {
@@ -120,17 +134,36 @@ impl DataStore {
         if !checkout.join(".git").exists() {
             git(&checkout, &["init", "-q", "-b", BRANCH])?;
             add_remote(&checkout, remote)?;
-        } else if git(&checkout, &["remote", "get-url", REMOTE]).map(|u| u.trim() != remote).unwrap_or(true) {
-            git(&checkout, &["remote", "set-url", REMOTE, remote]).map(|_| ()).or_else(|_| add_remote(&checkout, remote))?;
+        } else if git(&checkout, &["remote", "get-url", REMOTE])
+            .map(|u| u.trim() != remote)
+            .unwrap_or(true)
+        {
+            git(&checkout, &["remote", "set-url", REMOTE, remote])
+                .map(|_| ())
+                .or_else(|_| add_remote(&checkout, remote))?;
         }
         let secret = read_or_create(&base.join("secret"), || {
-            format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            )
         })?;
-        let machine_id = read_or_create(&base.join("machine_id"), || uuid::Uuid::new_v4().to_string())?;
-        let user_id = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".into());
+        let machine_id = read_or_create(&base.join("machine_id"), || {
+            uuid::Uuid::new_v4().to_string()
+        })?;
+        let user_id = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".into());
         let own = name_ok.unwrap_or("local");
         let data = DataDir::new(checkout.clone());
-        let log = SessionLog::open(&data.root, &local_root, own, &uuid::Uuid::new_v4().to_string())?.with_secret(secret.into_bytes());
+        let log = SessionLog::open(
+            &data.root,
+            &local_root,
+            own,
+            &uuid::Uuid::new_v4().to_string(),
+        )?
+        .with_secret(secret.into_bytes());
         Ok(Self {
             base: base.to_path_buf(),
             checkout,
@@ -154,7 +187,9 @@ impl DataStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.git_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.git_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn own_prefix(&self) -> PathBuf {
@@ -167,7 +202,10 @@ impl DataStore {
     }
 
     fn pull_locked(&self) -> Result<()> {
-        let r = git(&self.checkout, &["pull", "--rebase", "--autostash", "-q", REMOTE, BRANCH]);
+        let r = git(
+            &self.checkout,
+            &["pull", "--rebase", "--autostash", "-q", REMOTE, BRANCH],
+        );
         if r.is_err() {
             let _ = git(&self.checkout, &["rebase", "--abort"]);
         }
@@ -176,7 +214,12 @@ impl DataStore {
 
     fn push_locked(&self) -> bool {
         for _ in 0..PUSH_ATTEMPTS {
-            if git(&self.checkout, &["push", "-q", REMOTE, &format!("HEAD:{BRANCH}")]).is_ok() {
+            if git(
+                &self.checkout,
+                &["push", "-q", REMOTE, &format!("HEAD:{BRANCH}")],
+            )
+            .is_ok()
+            {
                 let _ = fs::remove_file(self.pending_path());
                 return true;
             }
@@ -190,11 +233,18 @@ impl DataStore {
 
     fn commit_own(&self, rel: &Path, message: &str) -> Result<()> {
         if !rel.starts_with(self.own_prefix()) {
-            bail!("refusing to commit {} outside {}", rel.display(), self.own_prefix().display());
+            bail!(
+                "refusing to commit {} outside {}",
+                rel.display(),
+                self.own_prefix().display()
+            );
         }
         let rel = rel.to_string_lossy();
         git(&self.checkout, &["add", "--", &rel])?;
-        if git(&self.checkout, &["status", "--porcelain", "--", &rel])?.trim().is_empty() {
+        if git(&self.checkout, &["status", "--porcelain", "--", &rel])?
+            .trim()
+            .is_empty()
+        {
             return Ok(());
         }
         let mut args: Vec<&str> = GIT_IDENT.to_vec();
@@ -206,27 +256,43 @@ impl DataStore {
         self.append_checked(|_| Ok(event))
     }
 
-    fn append_checked(&self, make: impl FnOnce(&[Event]) -> Result<Event>) -> Result<(String, bool)> {
+    fn append_checked(
+        &self,
+        make: impl FnOnce(&[Event]) -> Result<Event>,
+    ) -> Result<(String, bool)> {
         let (id, shared, session) = {
-            let mut log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut log = self
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let event = make(log.events())?;
             let id = event.event_id.clone();
             log.append(event)?;
-            let session = log.shared_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let session = log
+                .shared_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
             (id, log.shared_path.clone(), session)
         };
         if !self.push_enabled {
             return Ok((id, false));
         }
         let _g = self.lock();
-        let rel = shared.strip_prefix(&self.checkout).map_err(|_| anyhow!("session file outside the checkout"))?;
+        let rel = shared
+            .strip_prefix(&self.checkout)
+            .map_err(|_| anyhow!("session file outside the checkout"))?;
         self.commit_own(rel, &format!("{COMMIT_PREFIX}{} {session} {id}", self.name))?;
         Ok((id, self.push_locked()))
     }
 
     pub fn is_owner(&self) -> bool {
-        let Ok(text) = fs::read_to_string(self.checkout.join("peers.toml")) else { return false };
-        let Ok(table) = text.parse::<toml::Table>() else { return false };
+        let Ok(text) = fs::read_to_string(self.checkout.join("peers.toml")) else {
+            return false;
+        };
+        let Ok(table) = text.parse::<toml::Table>() else {
+            return false;
+        };
         peers_owner(&table, &self.name)
     }
 
@@ -259,22 +325,40 @@ impl DataStore {
             bail!("review_s and duration_s must not be negative");
         }
         self.data.model(&input.model_id)?;
-        let scope = if input.outcome == Outcome::Reset { Scope::Global } else { input.scope };
-        let mut e = Event::new(&input.model_id, input.dimension, scope, input.outcome, chrono::Utc::now().timestamp_millis());
+        let scope = if input.outcome == Outcome::Reset {
+            Scope::Global
+        } else {
+            input.scope
+        };
+        let mut e = Event::new(
+            &input.model_id,
+            input.dimension,
+            scope,
+            input.outcome,
+            chrono::Utc::now().timestamp_millis(),
+        );
         e.machine_id = self.machine_id.clone();
         e.user_id = self.user_id.clone();
         e.job_id = input.job_id;
         e.steps = input.steps;
         e.duration_s = input.duration_s;
         e.review_s = input.review_s;
-        e.seed_value = (input.outcome == Outcome::Seed).then_some(input.seed_value).flatten();
+        e.seed_value = (input.outcome == Outcome::Seed)
+            .then_some(input.seed_value)
+            .flatten();
         e.summary = input.summary;
         e.conclusion = input.conclusion;
         e.visibility = input.visibility;
         self.append(e)
     }
 
-    pub fn record_verdict(&self, job_id: &str, outcome: Outcome, conclusion: Option<String>, visibility: Visibility) -> Result<(String, bool)> {
+    pub fn record_verdict(
+        &self,
+        job_id: &str,
+        outcome: Outcome,
+        conclusion: Option<String>,
+        visibility: Visibility,
+    ) -> Result<(String, bool)> {
         if !matches!(outcome, Outcome::Accepted | Outcome::Rejected) {
             bail!("a verdict on a job is accepted or rejected");
         }
@@ -323,13 +407,21 @@ impl DataStore {
             return Ok(format!("{pulled}; push disabled (data_name not set)"));
         }
         let own = self.own_prefix();
-        let dirty = !git(&self.checkout, &["status", "--porcelain", "--", &own.to_string_lossy()])?.trim().is_empty();
+        let dirty = !git(
+            &self.checkout,
+            &["status", "--porcelain", "--", &own.to_string_lossy()],
+        )?
+        .trim()
+        .is_empty();
         if dirty {
             self.commit_own(&own, &format!("{COMMIT_PREFIX}{} sync", self.name))?;
         }
         let remote_ref = format!("{REMOTE}/{BRANCH}");
         let has_head = git(&self.checkout, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok();
-        let ahead = match git(&self.checkout, &["rev-list", "--count", &format!("{remote_ref}..HEAD")]) {
+        let ahead = match git(
+            &self.checkout,
+            &["rev-list", "--count", &format!("{remote_ref}..HEAD")],
+        ) {
             Ok(n) => n.trim().parse::<usize>().unwrap_or(0),
             Err(_) => usize::from(has_head),
         };

@@ -23,17 +23,17 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::ask::{self, Answered, AskJob, AskServer, AskWire, JobEvent, Session};
 use crate::backends::reach::PROBE_TIMEOUT;
 use crate::backends::{self, Backend, BackendType, Backends, Credential};
-use crate::ask::{self, AskJob, AskServer, AskWire, Answered, JobEvent, Session};
-use crate::dispatch::{self, DispatchRequest, DispatchResult, Dispatcher, Identity, RunExtras};
-use crate::sync::{DataStore, ExperienceInput};
-use crate::trust::{Dimension, Outcome, Scope, Visibility};
 use crate::config::{Config, MAX_TIMEOUT_S, MAX_TURNS_LIMIT};
+use crate::dispatch::{self, DispatchRequest, DispatchResult, Dispatcher, Identity, RunExtras};
 use crate::locate::{self, LocateError, Located};
 use crate::redact::{redact_all, Secrets};
 use crate::runner::{self, RunError, RunOutcome, RunRequest, TAIL_CHARS};
+use crate::sync::{DataStore, ExperienceInput};
 use crate::token::{self, SecretId, Token, TokenError, TokenSource};
+use crate::trust::{Dimension, Outcome, Scope, Visibility};
 
 /// Server instructions. Codex uses (at least) the first 512 characters for tool selection, so
 /// the tools and the long run time come first (tested in tests/mcp_handshake.rs).
@@ -1079,7 +1079,14 @@ fn push_note(id: &str, pushed: bool, visibility: Visibility) -> String {
         Visibility::Private => "pushed (Zahlen; summary/conclusion lokal)",
         Visibility::Shared => "pushed (Zahlen und Texte)",
     };
-    format!("recorded event {id}; {}", if pushed { sent } else { "not pushed (offline, rejected or data_name not set); sidekick_sync retries" })
+    format!(
+        "recorded event {id}; {}",
+        if pushed {
+            sent
+        } else {
+            "not pushed (offline, rejected or data_name not set); sidekick_sync retries"
+        }
+    )
 }
 
 fn format_dispatch(r: &DispatchResult) -> String {
@@ -1094,7 +1101,11 @@ fn format_dispatch(r: &DispatchResult) -> String {
     };
     opt(&mut s, "sperre_note", r.sperre_note.clone());
     opt(&mut s, "branch", r.branch.clone());
-    opt(&mut s, "patch", r.patch_path.as_ref().map(|p| p.display().to_string()));
+    opt(
+        &mut s,
+        "patch",
+        r.patch_path.as_ref().map(|p| p.display().to_string()),
+    );
     opt(&mut s, "block_reason", r.block_reason.clone());
     opt(&mut s, "reason", r.reason.clone());
     if r.proposal_mode {
@@ -1102,9 +1113,17 @@ fn format_dispatch(r: &DispatchResult) -> String {
     }
     opt(&mut s, "evidence_hash", r.evidence_hash.clone());
     opt(&mut s, "event_id", r.event_id.clone());
-    let _ = writeln!(s, "applied: {}\ndiff_discarded: {}", r.applied, r.diff_discarded);
+    let _ = writeln!(
+        s,
+        "applied: {}\ndiff_discarded: {}",
+        r.applied, r.diff_discarded
+    );
     if !r.unsupported_limits.is_empty() {
-        let _ = writeln!(s, "limits not enforced by this harness: {}", r.unsupported_limits.join(", "));
+        let _ = writeln!(
+            s,
+            "limits not enforced by this harness: {}",
+            r.unsupported_limits.join(", ")
+        );
     }
     for w in &r.warnings {
         let _ = writeln!(s, "warning: {w}");
@@ -1237,17 +1256,18 @@ impl SidekickServer {
             return tool_error_with(&snap, format!("fallback: {msg}"));
         }
         let dimension = params.dimension.clone().filter(|d| !d.trim().is_empty());
-        let dispatch_params = |backend: &Backend, model: Option<String>, dimension: String| DispatchParams {
-            prompt: params.prompt.clone(),
-            cwd: params.cwd.clone(),
-            dimension,
-            scope: params.scope.clone(),
-            backend: Some(backend.name.clone()),
-            model,
-            max_turns: params.max_turns,
-            timeout_s: params.timeout_s,
-            ..Default::default()
-        };
+        let dispatch_params =
+            |backend: &Backend, model: Option<String>, dimension: String| DispatchParams {
+                prompt: params.prompt.clone(),
+                cwd: params.cwd.clone(),
+                dimension,
+                scope: params.scope.clone(),
+                backend: Some(backend.name.clone()),
+                model,
+                max_turns: params.max_turns,
+                timeout_s: params.timeout_s,
+                ..Default::default()
+            };
         let needs_dimension = |backend: &Backend| {
             format!(
                 "backend {} with this model is registered (has a Steckbrief), so sidekick_run needs `dimension` \
@@ -1256,11 +1276,21 @@ impl SidekickServer {
                 backend.name
             )
         };
-        match self.registry_gate(&snap, primary, req.model.as_deref()).await {
+        match self
+            .registry_gate(&snap, primary, req.model.as_deref())
+            .await
+        {
             Err(msg) => return tool_error_with(&snap, msg),
             Ok(true) => {
-                let Some(dimension) = dimension else { return tool_error_with(&snap, needs_dimension(primary)) };
-                return self.sidekick_dispatch(Parameters(dispatch_params(primary, params.model.clone(), dimension)), ctx).await;
+                let Some(dimension) = dimension else {
+                    return tool_error_with(&snap, needs_dimension(primary));
+                };
+                return self
+                    .sidekick_dispatch(
+                        Parameters(dispatch_params(primary, params.model.clone(), dimension)),
+                        ctx,
+                    )
+                    .await;
             }
             Ok(false) => {}
         }
@@ -1273,7 +1303,12 @@ impl SidekickServer {
                     Ok(false) => None,
                     Ok(true) => match dimension {
                         Some(dimension) => Some(dispatch_params(fb, fb_model, dimension)),
-                        None => return tool_error_with(&snap, format!("fallback: {}", needs_dimension(fb))),
+                        None => {
+                            return tool_error_with(
+                                &snap,
+                                format!("fallback: {}", needs_dimension(fb)),
+                            )
+                        }
                     },
                 }
             }
@@ -1371,7 +1406,12 @@ impl SidekickServer {
                 (first, Some(fb)) if fallback_eligible(&first) && fallback_dispatch.is_some() => {
                     tracing::warn!(primary = %primary.name, fallback = %fb.name, "primary backend failed; the registered fallback runs as dispatch");
                     drop(ticker);
-                    return self.sidekick_dispatch(Parameters(fallback_dispatch.clone().expect("checked above")), ctx).await;
+                    return self
+                        .sidekick_dispatch(
+                            Parameters(fallback_dispatch.clone().expect("checked above")),
+                            ctx,
+                        )
+                        .await;
                 }
                 (first, Some(fb)) if fallback_eligible(&first) => {
                     let why = match &first {
@@ -1526,10 +1566,11 @@ impl SidekickServer {
             Ok(s) => s.unwrap_or(Scope::Global),
             Err(e) => return tool_error(format!("{e:#}")),
         };
-        let (id, backend) = match Self::model_id_for(&snap, p.model_id, p.backend.as_deref(), p.model.as_deref()) {
-            Ok(v) => v,
-            Err(e) => return tool_error_with(&snap, e),
-        };
+        let (id, backend) =
+            match Self::model_id_for(&snap, p.model_id, p.backend.as_deref(), p.model.as_deref()) {
+                Ok(v) => v,
+                Err(e) => return tool_error_with(&snap, e),
+            };
         let now = chrono::Utc::now().timestamp_millis();
         let detail = p.detail.unwrap_or(false);
         let label = backend.as_ref().map(|b| match &b.account {
@@ -1540,7 +1581,13 @@ impl SidekickServer {
             store
                 .data
                 .steckbrief(&id, &scope, Some(&store.local_root), now)
-                .map(|s| if detail { s.render() } else { s.render_short(label.as_deref()) })
+                .map(|s| {
+                    if detail {
+                        s.render()
+                    } else {
+                        s.render_short(label.as_deref())
+                    }
+                })
                 .map_err(|e| format!("{e:#}"))
         })
         .await;
@@ -1549,7 +1596,11 @@ impl SidekickServer {
                 if let Some(b) = backend.filter(|_| detail) {
                     let unsupported = dispatch::unsupported_limits(&b);
                     if !unsupported.is_empty() {
-                        let _ = write!(text, "\nharness limits not enforced: {}", unsupported.join(", "));
+                        let _ = write!(
+                            text,
+                            "\nharness limits not enforced: {}",
+                            unsupported.join(", ")
+                        );
                     }
                 }
                 Ok(text_result(redact_all(&text), false))
@@ -1575,22 +1626,36 @@ impl SidekickServer {
         };
         if let Some(job_id) = p.job_id.clone().filter(|j| !j.trim().is_empty()) {
             let verdict = (|| -> anyhow::Result<(Outcome, Visibility)> {
-                Ok((Outcome::parse(&p.outcome)?, p.visibility.as_deref().map(Visibility::parse).transpose()?.unwrap_or(Visibility::Private)))
+                Ok((
+                    Outcome::parse(&p.outcome)?,
+                    p.visibility
+                        .as_deref()
+                        .map(Visibility::parse)
+                        .transpose()?
+                        .unwrap_or(Visibility::Private),
+                ))
             })();
             let (outcome, visibility) = match verdict {
                 Ok(v) => v,
                 Err(e) => return tool_error(format!("{e:#}")),
             };
             let conclusion = p.conclusion;
-            return match blocking(move || store.record_verdict(job_id.trim(), outcome, conclusion, visibility).map_err(|e| format!("{e:#}"))).await {
+            return match blocking(move || {
+                store
+                    .record_verdict(job_id.trim(), outcome, conclusion, visibility)
+                    .map_err(|e| format!("{e:#}"))
+            })
+            .await
+            {
                 Ok(Ok((id, pushed))) => Ok(text_result(push_note(&id, pushed, visibility), false)),
                 Ok(Err(e)) | Err(e) => tool_error(e),
             };
         }
-        let (model_id, _) = match Self::model_id_for(&snap, p.model_id, p.backend.as_deref(), p.model.as_deref()) {
-            Ok(v) => v,
-            Err(e) => return tool_error_with(&snap, e),
-        };
+        let (model_id, _) =
+            match Self::model_id_for(&snap, p.model_id, p.backend.as_deref(), p.model.as_deref()) {
+                Ok(v) => v,
+                Err(e) => return tool_error_with(&snap, e),
+            };
         let visibility = match p.visibility.as_deref().map(Visibility::parse).transpose() {
             Ok(v) => v.unwrap_or(Visibility::Private),
             Err(e) => return tool_error(format!("{e:#}")),
@@ -1603,7 +1668,12 @@ impl SidekickServer {
                     (None, "reset") => Dimension::Search,
                     (None, _) => anyhow::bail!("dimension is required without job_id"),
                 },
-                scope: p.scope.as_deref().map(Scope::parse).transpose()?.unwrap_or(Scope::Global),
+                scope: p
+                    .scope
+                    .as_deref()
+                    .map(Scope::parse)
+                    .transpose()?
+                    .unwrap_or(Scope::Global),
                 outcome: Outcome::parse(&p.outcome)?,
                 job_id: p.job_id,
                 steps: p.steps,
@@ -1628,7 +1698,10 @@ impl SidekickServer {
     /// Read-only SQL (DataFusion) over the tables models, protected and experiences (all
     /// events: aggregate, shared experiences and the local log). Returns a text table.
     #[tool]
-    async fn sidekick_query(&self, Parameters(p): Parameters<QueryParams>) -> Result<CallToolResult, McpError> {
+    async fn sidekick_query(
+        &self,
+        Parameters(p): Parameters<QueryParams>,
+    ) -> Result<CallToolResult, McpError> {
         let snap = self.state.refresh();
         let store = match self.store(&snap).await {
             Ok(s) => s,
@@ -1675,13 +1748,21 @@ impl SidekickServer {
         };
         let phase: SharedPhase = Arc::new(std::sync::Mutex::new(RunPhase::primary()));
         let job_id = prep.dreq.job_id.clone();
-        let session = match self.state.broker.open(&job_id, std::slice::from_ref(&job_id), &self.state.shutdown, phase, prep.dreq.timeout) {
+        let session = match self.state.broker.open(
+            &job_id,
+            std::slice::from_ref(&job_id),
+            &self.state.shutdown,
+            phase,
+            prep.dreq.timeout,
+        ) {
             Ok(s) => s,
             Err(msg) => return tool_error_with(&snap, msg),
         };
         let (server, job_snap, job_session) = (self.clone(), snap.clone(), session.clone());
         self.spawn_job(&session, async move {
-            let report = server.execute_job(job_snap, prep, job_session, JobExtras::default()).await;
+            let report = server
+                .execute_job(job_snap, prep, job_session, JobExtras::default())
+                .await;
             (report.text, report.is_error)
         });
         self.wait_event(&session, &ctx).await
@@ -1736,13 +1817,22 @@ impl SidekickServer {
             Err(msg) => return tool_error_with(&snap, msg),
         };
         let phase: SharedPhase = Arc::new(std::sync::Mutex::new(RunPhase::primary()));
-        let session = match self.state.broker.open(&plan.id, &plan.job_ids(), &self.state.shutdown, phase, plan.total_timeout()) {
+        let session = match self.state.broker.open(
+            &plan.id,
+            &plan.job_ids(),
+            &self.state.shutdown,
+            phase,
+            plan.total_timeout(),
+        ) {
             Ok(s) => s,
             Err(msg) => return tool_error_with(&snap, msg),
         };
         with_phase(&session.phase, |p| p.started = Some(Instant::now()));
         let (server, job_snap, job_session) = (self.clone(), snap.clone(), session.clone());
-        self.spawn_job(&session, crate::workflow::run(server, job_snap, plan, job_session));
+        self.spawn_job(
+            &session,
+            crate::workflow::run(server, job_snap, plan, job_session),
+        );
         self.wait_event(&session, &ctx).await
     }
 }
@@ -1767,7 +1857,13 @@ pub(crate) struct JobReport {
     pub result: Option<DispatchResult>,
 }
 
-fn format_question(job_id: &str, question_id: u64, step: Option<&str>, workflow: &str, text: &str) -> String {
+fn format_question(
+    job_id: &str,
+    question_id: u64,
+    step: Option<&str>,
+    workflow: &str,
+    text: &str,
+) -> String {
     let mut s = format!("status: question\njob_id: {job_id}\nquestion_id: {question_id}\n");
     if let Some(step) = step {
         let _ = writeln!(s, "workflow: {workflow}\nstep: {step}");
@@ -1777,7 +1873,11 @@ fn format_question(job_id: &str, question_id: u64, step: Option<&str>, workflow:
 }
 
 fn text_of(r: &CallToolResult) -> String {
-    r.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n")
+    r.content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 type LocateResult = Result<Result<Located, LocateError>, String>;
@@ -1794,13 +1894,29 @@ impl SidekickServer {
         }
     }
 
-    pub(crate) async fn prepare_dispatch(&self, snap: &Snapshot, p: &DispatchParams) -> Result<Prepared, String> {
-        let backends = snap.backends.as_ref().map_err(|e| config_invalid_message(e))?;
+    pub(crate) async fn prepare_dispatch(
+        &self,
+        snap: &Snapshot,
+        p: &DispatchParams,
+    ) -> Result<Prepared, String> {
+        let backends = snap
+            .backends
+            .as_ref()
+            .map_err(|e| config_invalid_message(e))?;
         let store = self.store(snap).await?;
-        let base_dir = std::env::current_dir().map_err(|e| format!("Cannot determine the server's current directory: {e}. Pass an absolute 'cwd'."))?;
+        let base_dir = std::env::current_dir().map_err(|e| {
+            format!("Cannot determine the server's current directory: {e}. Pass an absolute 'cwd'.")
+        })?;
         let home = crate::paths::home_dir().ok();
         let parsed = (|| -> anyhow::Result<(Dimension, Scope)> {
-            Ok((Dimension::parse(&p.dimension)?, p.scope.as_deref().map(Scope::parse).transpose()?.unwrap_or(Scope::Global)))
+            Ok((
+                Dimension::parse(&p.dimension)?,
+                p.scope
+                    .as_deref()
+                    .map(Scope::parse)
+                    .transpose()?
+                    .unwrap_or(Scope::Global),
+            ))
         })();
         let (dimension, scope) = parsed.map_err(|e| format!("{e:#}"))?;
         let run_params = RunParams {
@@ -1816,11 +1932,19 @@ impl SidekickServer {
         backend.effective_model(req.model.as_deref())?;
         backend.account_guard(backends::caller_account().as_deref())?;
         if let Some(secs) = self.state.cooldown(&backend.name) {
-            return Err(format!("backend {} is rate limited, retry in {secs}s; choose another backend", backend.name));
+            return Err(format!(
+                "backend {} is rate limited, retry in {secs}s; choose another backend",
+                backend.name
+            ));
         }
         let job_id = match p.job_id.as_deref() {
             Some(j) if dispatch::valid_id(j, dispatch::JOB_ID_MAX) => j.to_string(),
-            Some(j) => return Err(format!("job_id `{j}` must be 1-{} letters, digits, `-` or `_`", dispatch::JOB_ID_MAX)),
+            Some(j) => {
+                return Err(format!(
+                    "job_id `{j}` must be 1-{} letters, digits, `-` or `_`",
+                    dispatch::JOB_ID_MAX
+                ))
+            }
             None => format!("j-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
         };
         self.check_free(&req.cwd, &store.base.join("work"), &job_id)?;
@@ -1833,20 +1957,42 @@ impl SidekickServer {
             model: req.model.clone(),
             max_turns: req.max_turns,
             timeout: req.timeout,
-            identity: Identity { checkpoint: p.checkpoint.clone(), quant: p.quant.clone() },
+            identity: Identity {
+                checkpoint: p.checkpoint.clone(),
+                quant: p.quant.clone(),
+            },
         };
-        Ok(Prepared { backend: backend.clone(), dreq, store })
+        Ok(Prepared {
+            backend: backend.clone(),
+            dreq,
+            store,
+        })
     }
 
-    pub(crate) async fn execute_job(&self, snap: Arc<Snapshot>, prep: Prepared, session: Arc<Session>, extras: JobExtras) -> JobReport {
-        let fail = |msg: String| JobReport { text: redact_all(&msg), is_error: true, result: None };
-        let st = &self.state;
-        let Prepared { backend, dreq, store } = prep;
-        let cancel = session.cancel.clone();
-        let (backend_permit, global_permit) = match self.acquire_permits(&snap, &backend, &cancel).await {
-            Ok(p) => p,
-            Err(msg) => return fail(msg),
+    pub(crate) async fn execute_job(
+        &self,
+        snap: Arc<Snapshot>,
+        prep: Prepared,
+        session: Arc<Session>,
+        extras: JobExtras,
+    ) -> JobReport {
+        let fail = |msg: String| JobReport {
+            text: redact_all(&msg),
+            is_error: true,
+            result: None,
         };
+        let st = &self.state;
+        let Prepared {
+            backend,
+            dreq,
+            store,
+        } = prep;
+        let cancel = session.cancel.clone();
+        let (backend_permit, global_permit) =
+            match self.acquire_permits(&snap, &backend, &cancel).await {
+                Ok(p) => p,
+                Err(msg) => return fail(msg),
+            };
         if cancel.is_cancelled() {
             return fail(CANCELLED_QUEUED_MSG.into());
         }
@@ -1866,22 +2012,53 @@ impl SidekickServer {
             logs_dir,
             machine_id: store.machine_id.clone(),
             user_id: store.user_id.clone(),
-            launcher: dispatch::real_launcher(snap.config.claude_path.clone(), snap.config.pass_env.clone()),
+            launcher: dispatch::real_launcher(
+                snap.config.claude_path.clone(),
+                snap.config.pass_env.clone(),
+            ),
         };
         let pause = Arc::new(runner::Pause::default());
-        let ask_job = AskJob::new(&dreq.job_id, extras.step.clone(), session.clone(), st.broker.clone(), pause.clone());
+        let ask_job = AskJob::new(
+            &dreq.job_id,
+            extras.step.clone(),
+            session.clone(),
+            st.broker.clone(),
+            pause.clone(),
+        );
         let ask_server = match AskServer::start(&dispatcher.work_dir.join("ask"), ask_job.clone()) {
             Ok(s) => s,
-            Err(e) => return fail(format!("ask_orchestrator cannot be wired for job {}: {e:#}", dreq.job_id)),
+            Err(e) => {
+                return fail(format!(
+                    "ask_orchestrator cannot be wired for job {}: {e:#}",
+                    dreq.job_id
+                ))
+            }
         };
         let exe = match std::env::current_exe() {
             Ok(e) => e,
-            Err(e) => return fail(format!("ask_orchestrator cannot be wired for job {}: {e}", dreq.job_id)),
+            Err(e) => {
+                return fail(format!(
+                    "ask_orchestrator cannot be wired for job {}: {e}",
+                    dreq.job_id
+                ))
+            }
         };
-        let wire = Some(AskWire { exe, job_id: dreq.job_id.clone(), endpoint: ask_server.endpoint.clone() });
+        let wire = Some(AskWire {
+            exe,
+            job_id: dreq.job_id.clone(),
+            endpoint: ask_server.endpoint.clone(),
+        });
         tracing::info!(backend = %backend.name, job = %dreq.job_id, "sidekick_dispatch started");
-        let run_extras = RunExtras { ask: wire, base: extras.base, hold_gold: extras.hold_gold, pause: Some(pause), unanswered: Some(ask_job.unanswered.clone()) };
-        let outcome = dispatcher.run_with(&backend, &dreq, cancel.clone(), run_extras).await;
+        let run_extras = RunExtras {
+            ask: wire,
+            base: extras.base,
+            hold_gold: extras.hold_gold,
+            pause: Some(pause),
+            unanswered: Some(ask_job.unanswered.clone()),
+        };
+        let outcome = dispatcher
+            .run_with(&backend, &dreq, cancel.clone(), run_extras)
+            .await;
         drop(ask_server);
         drop(global_permit);
         drop(backend_permit);
@@ -1900,7 +2077,9 @@ impl SidekickServer {
             match blocking(move || store.append(event).map_err(|e| format!("{e:#}"))).await {
                 Ok(Ok((_, pushed))) => {
                     if !pushed {
-                        text.push_str("\nnote: event stored locally, not pushed yet (sidekick_sync retries)");
+                        text.push_str(
+                            "\nnote: event stored locally, not pushed yet (sidekick_sync retries)",
+                        );
                     }
                 }
                 Ok(Err(e)) | Err(e) => {
@@ -1908,14 +2087,27 @@ impl SidekickServer {
                 }
             }
         }
-        let is_error = matches!(result.status, dispatch::Status::Blocked | dispatch::Status::Failed);
-        JobReport { text: redact_all(&text), is_error, result: Some(result) }
+        let is_error = matches!(
+            result.status,
+            dispatch::Status::Blocked | dispatch::Status::Failed
+        );
+        JobReport {
+            text: redact_all(&text),
+            is_error,
+            result: Some(result),
+        }
     }
 
-    fn spawn_job(&self, session: &Arc<Session>, job: impl std::future::Future<Output = (String, bool)> + Send + 'static) {
+    fn spawn_job(
+        &self,
+        session: &Arc<Session>,
+        job: impl std::future::Future<Output = (String, bool)> + Send + 'static,
+    ) {
         let (session, broker) = (session.clone(), self.state.broker.clone());
         tokio::spawn(async move {
-            let (text, is_error) = tokio::spawn(job).await.unwrap_or_else(|e| (format!("the job task failed: {e}"), true));
+            let (text, is_error) = tokio::spawn(job)
+                .await
+                .unwrap_or_else(|e| (format!("the job task failed: {e}"), true));
             session.send(JobEvent::Done { text, is_error });
             tokio::select! {
                 _ = tokio::time::sleep(ask::result_grace()) => {}
@@ -1925,9 +2117,19 @@ impl SidekickServer {
         });
     }
 
-    async fn wait_event(&self, session: &Arc<Session>, ctx: &RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn wait_event(
+        &self,
+        session: &Arc<Session>,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let ticker = ctx.meta.get_progress_token().map(|token| {
-            spawn_progress_ticker(ctx.peer.clone(), token, session.phase.clone(), session.timeout, progress_interval())
+            spawn_progress_ticker(
+                ctx.peer.clone(),
+                token,
+                session.phase.clone(),
+                session.timeout,
+                progress_interval(),
+            )
         });
         let event = loop {
             let event = tokio::select! {
@@ -1940,13 +2142,31 @@ impl SidekickServer {
                 }
             };
             match &event {
-                Some(JobEvent::Question { job_id, question_id, .. }) if !self.state.broker.is_open(job_id, *question_id) => continue,
+                Some(JobEvent::Question {
+                    job_id,
+                    question_id,
+                    ..
+                }) if !self.state.broker.is_open(job_id, *question_id) => continue,
                 _ => break event,
             }
         };
         drop(ticker);
         match event {
-            Some(JobEvent::Question { job_id, step, question_id, text }) => Ok(text_result(redact_all(&format_question(&job_id, question_id, step.as_deref(), &session.id, &text)), false)),
+            Some(JobEvent::Question {
+                job_id,
+                step,
+                question_id,
+                text,
+            }) => Ok(text_result(
+                redact_all(&format_question(
+                    &job_id,
+                    question_id,
+                    step.as_deref(),
+                    &session.id,
+                    &text,
+                )),
+                false,
+            )),
             Some(JobEvent::Done { text, is_error }) => {
                 self.state.broker.close(session);
                 Ok(text_result(text, is_error))
@@ -1999,7 +2219,9 @@ impl SidekickServer {
                 let base = crate::paths::data_dir().map_err(|e| format!("{e:#}"))?;
                 let (repo, name) = (snap.config.data_repo.clone(), snap.config.data_name.clone());
                 blocking(move || {
-                    DataStore::open(&base, &repo, name.as_deref()).map(Arc::new).map_err(|e| format!("data store: {e:#}"))
+                    DataStore::open(&base, &repo, name.as_deref())
+                        .map(Arc::new)
+                        .map_err(|e| format!("data store: {e:#}"))
                 })
                 .await?
             })
@@ -2007,15 +2229,28 @@ impl SidekickServer {
             .cloned()
     }
 
-    pub(crate) async fn registry_gate(&self, snap: &Snapshot, backend: &Backend, model: Option<&str>) -> Result<bool, String> {
+    pub(crate) async fn registry_gate(
+        &self,
+        snap: &Snapshot,
+        backend: &Backend,
+        model: Option<&str>,
+    ) -> Result<bool, String> {
         let model = backend.effective_model(model)?;
         let store = self.store(snap).await?;
-        let rows = store.data.models().map_err(|e| format!("registry cannot be read: {e:#}"))?;
-        let id = Identity::default().key(backend, model.as_deref()).model_id();
+        let rows = store
+            .data
+            .models()
+            .map_err(|e| format!("registry cannot be read: {e:#}"))?;
+        let id = Identity::default()
+            .key(backend, model.as_deref())
+            .model_id();
         if rows.iter().any(|r| r.model_id() == id) {
             return Ok(true);
         }
-        if rows.iter().any(|r| dispatch::same_registry_scope(backend, &r.key)) {
+        if rows
+            .iter()
+            .any(|r| dispatch::same_registry_scope(backend, &r.key))
+        {
             return Err(format!(
                 "backend {} has registered models, but `{}` is not one of them (model_id {id}); it would run without gating. \
                  Register it or choose a registered model (see sidekick_steckbrief)",
@@ -2035,7 +2270,10 @@ impl SidekickServer {
         if let Some(id) = model_id.filter(|i| !i.trim().is_empty()) {
             return Ok((id.trim().to_string(), None));
         }
-        let backends = snap.backends.as_ref().map_err(|e| config_invalid_message(e))?;
+        let backends = snap
+            .backends
+            .as_ref()
+            .map_err(|e| config_invalid_message(e))?;
         let (b, _) = select_backends(backends, backend, None)?;
         let model = b.effective_model(model.map(str::trim).filter(|m| !m.is_empty()))?;
         let id = Identity::default().key(b, model.as_deref()).model_id();

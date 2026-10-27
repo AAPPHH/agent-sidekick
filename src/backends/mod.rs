@@ -695,7 +695,9 @@ fn read_json(path: &std::path::Path) -> Option<serde_json::Value> {
 }
 
 fn env_dir(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 pub fn claude_account(config_dir: Option<PathBuf>) -> Option<String> {
@@ -711,14 +713,16 @@ pub fn claude_account(config_dir: Option<PathBuf>) -> Option<String> {
 pub fn codex_account(auth_file: &std::path::Path) -> Option<String> {
     let json = read_json(auth_file)?;
     let jwt = json.pointer("/tokens/id_token")?.as_str()?;
-    let payload: serde_json::Value = serde_json::from_slice(&base64url_decode(jwt.split('.').nth(1)?)?).ok()?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&base64url_decode(jwt.split('.').nth(1)?)?).ok()?;
     let email = payload.get("email")?.as_str()?.trim();
     (!email.is_empty()).then(|| email.to_owned())
 }
 
 pub fn caller_account() -> Option<String> {
     claude_account(env_dir("CLAUDE_CONFIG_DIR")).or_else(|| {
-        let home = env_dir("CODEX_HOME").or_else(|| crate::paths::home_dir().ok().map(|h| h.join(".codex")))?;
+        let home = env_dir("CODEX_HOME")
+            .or_else(|| crate::paths::home_dir().ok().map(|h| h.join(".codex")))?;
         codex_account(&home.join("auth.json"))
     })
 }
@@ -740,17 +744,28 @@ mod account_tests {
             env: BTreeMap::new(),
             pass_env: Vec::new(),
             implicit: false,
-            kind: BackendKind::ClaudeOauth { config_dir: PathBuf::from("c"), permissions: Default::default() },
+            kind: BackendKind::ClaudeOauth {
+                config_dir: PathBuf::from("c"),
+                permissions: Default::default(),
+            },
             foreign_secret_env: Vec::new(),
         }
     }
 
     #[test]
     fn guard_cases() {
-        assert!(oauth(Some("A@x.com")).account_guard(Some(" a@X.com ")).unwrap_err().contains("gleiches Konto wie der Aufrufer"));
-        assert!(oauth(None).account_guard(None).unwrap_err().contains("Konto unbekannt"));
+        assert!(oauth(Some("A@x.com"))
+            .account_guard(Some(" a@X.com "))
+            .unwrap_err()
+            .contains("gleiches Konto wie der Aufrufer"));
+        assert!(oauth(None)
+            .account_guard(None)
+            .unwrap_err()
+            .contains("Konto unbekannt"));
         assert!(oauth(Some("a@x.com")).account_guard(None).is_ok());
-        assert!(oauth(Some("a@x.com")).account_guard(Some("b@x.com")).is_ok());
+        assert!(oauth(Some("a@x.com"))
+            .account_guard(Some("b@x.com"))
+            .is_ok());
     }
 
     #[test]
@@ -758,7 +773,11 @@ mod account_tests {
         let d = tempfile::tempdir().unwrap();
         let payload = "eyJlbWFpbCI6ImNAeC5jb20ifQ";
         let f = d.path().join("auth.json");
-        std::fs::write(&f, format!(r#"{{"tokens":{{"id_token":"h.{payload}.s"}}}}"#)).unwrap();
+        std::fs::write(
+            &f,
+            format!(r#"{{"tokens":{{"id_token":"h.{payload}.s"}}}}"#),
+        )
+        .unwrap();
         assert_eq!(codex_account(&f).as_deref(), Some("c@x.com"));
         assert_eq!(codex_account(&d.path().join("none.json")), None);
     }

@@ -17,9 +17,18 @@ use crate::harness::HarnessKind;
 use crate::runner::{self, Launch, Pause, RunRequest};
 use crate::trust::{Dimension, Event, ModelKey, Outcome, Scope, Sperre, Standing};
 
-pub const GLOBAL_LIMITS: Limits = Limits { max_files: 8, max_lines: 300 };
-pub const REPO_LIMITS: Limits = Limits { max_files: 15, max_lines: 600 };
-pub const MODULE_LIMITS: Limits = Limits { max_files: 25, max_lines: 1000 };
+pub const GLOBAL_LIMITS: Limits = Limits {
+    max_files: 8,
+    max_lines: 300,
+};
+pub const REPO_LIMITS: Limits = Limits {
+    max_files: 15,
+    max_lines: 600,
+};
+pub const MODULE_LIMITS: Limits = Limits {
+    max_files: 25,
+    max_lines: 1000,
+};
 pub const TEST_GLOBS: [&str; 2] = ["tests/**", "spec/**"];
 pub const WRITE_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"];
 pub const READ_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
@@ -28,7 +37,12 @@ pub const PATCH_BEGIN: &str = "<<<SIDEKICK-PATCH";
 pub const PATCH_END: &str = "SIDEKICK-PATCH>>>";
 pub const PROPOSAL_INSTRUCTION: &str = "You have no write tools in this job. Do not try to modify files. Return the complete change as one unified diff (git format, paths relative to the repository root, a/ and b/ prefixes) in your final answer, between a line containing only <<<SIDEKICK-PATCH and a line containing only SIDEKICK-PATCH>>>. Nothing else may be inside the markers.";
 pub const BRANCH_PREFIX: &str = "sidekick/";
-pub(crate) const GIT_IDENT: [&str; 4] = ["-c", "user.name=agent-sidekick", "-c", "user.email=agent-sidekick@localhost"];
+pub(crate) const GIT_IDENT: [&str; 4] = [
+    "-c",
+    "user.name=agent-sidekick",
+    "-c",
+    "user.email=agent-sidekick@localhost",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -60,7 +74,11 @@ pub const CLAUDE_ALIASES: [(&str, &str); 4] = [
 ];
 
 pub fn resolve_claude_alias(model: &str) -> String {
-    CLAUDE_ALIASES.iter().find(|(alias, _)| *alias == model).map_or(model, |(_, id)| id).to_string()
+    CLAUDE_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == model)
+        .map_or(model, |(_, id)| id)
+        .to_string()
 }
 
 pub fn normalize_claude_model(model: &str) -> String {
@@ -73,8 +91,14 @@ pub fn normalize_claude_model(model: &str) -> String {
     resolve_claude_alias(base)
 }
 
-fn claude_model_with(backend: &Backend, model: Option<&str>, f: fn(&str) -> String) -> Option<String> {
-    matches!(backend.kind, BackendKind::ClaudeOauth { .. }).then(|| model.or(backend.model.as_deref()).map(f)).flatten()
+fn claude_model_with(
+    backend: &Backend,
+    model: Option<&str>,
+    f: fn(&str) -> String,
+) -> Option<String> {
+    matches!(backend.kind, BackendKind::ClaudeOauth { .. })
+        .then(|| model.or(backend.model.as_deref()).map(f))
+        .flatten()
 }
 
 pub fn expected_claude_model(backend: &Backend, model: Option<&str>) -> Option<String> {
@@ -117,9 +141,16 @@ fn default_provider(backend: &Backend) -> String {
     match &backend.kind {
         BackendKind::ClaudeOauth { .. } => "anthropic".into(),
         BackendKind::ClaudeEndpoint { base_url, .. } => url_host(base_url),
-        BackendKind::Codex { base_url: Some(url), .. } => url_host(url),
+        BackendKind::Codex {
+            base_url: Some(url),
+            ..
+        } => url_host(url),
         BackendKind::Codex { .. } => "openai".into(),
-        BackendKind::OpenCode { provider: OpencodeProvider::OpenaiCompatible, base_url: Some(url), .. } => url_host(url),
+        BackendKind::OpenCode {
+            provider: OpencodeProvider::OpenaiCompatible,
+            base_url: Some(url),
+            ..
+        } => url_host(url),
         BackendKind::OpenCode { provider, .. } => provider.as_str().into(),
         BackendKind::Command { command, .. } => Path::new(&command[0])
             .file_name()
@@ -157,8 +188,14 @@ pub fn with_registry_limits(backend: &Backend, row: &ModelRow) -> Backend {
 pub fn withhold_writes(backend: &Backend) -> Backend {
     let mut b = backend.clone();
     match &mut b.kind {
-        BackendKind::ClaudeOauth { permissions, .. } | BackendKind::ClaudeEndpoint { permissions, .. } => {
-            if matches!(permissions.mode, PermissionMode::AcceptEdits | PermissionMode::Auto | PermissionMode::BypassPermissions) {
+        BackendKind::ClaudeOauth { permissions, .. }
+        | BackendKind::ClaudeEndpoint { permissions, .. } => {
+            if matches!(
+                permissions.mode,
+                PermissionMode::AcceptEdits
+                    | PermissionMode::Auto
+                    | PermissionMode::BypassPermissions
+            ) {
                 permissions.mode = PermissionMode::Default;
             }
             permissions.allowed_tools = Some(READ_TOOLS.map(String::from).to_vec());
@@ -168,7 +205,9 @@ pub fn withhold_writes(backend: &Backend) -> Backend {
                 }
             }
         }
-        BackendKind::OpenCode { read_only, .. } | BackendKind::Codex { read_only, .. } => *read_only = true,
+        BackendKind::OpenCode { read_only, .. } | BackendKind::Codex { read_only, .. } => {
+            *read_only = true
+        }
         BackendKind::Command { .. } => {}
     }
     b
@@ -176,21 +215,34 @@ pub fn withhold_writes(backend: &Backend) -> Backend {
 
 pub fn extract_patch(text: &str) -> Result<String, String> {
     let lines: Vec<&str> = text.lines().collect();
-    let end_after = |i: usize| lines[i + 1..].iter().position(|l| l.trim() == PATCH_END).map(|j| i + 1 + j);
+    let end_after = |i: usize| {
+        lines[i + 1..]
+            .iter()
+            .position(|l| l.trim() == PATCH_END)
+            .map(|j| i + 1 + j)
+    };
     let (begin, end) = (0..lines.len())
         .rev()
         .filter(|&i| lines[i].trim() == PATCH_BEGIN)
         .find_map(|i| end_after(i).map(|j| (i, j)))
         .ok_or("no complete patch between the SIDEKICK-PATCH markers")?;
     let mut body = &lines[begin + 1..end];
-    while body.first().is_some_and(|l| l.trim_start().starts_with("```")) {
+    while body
+        .first()
+        .is_some_and(|l| l.trim_start().starts_with("```"))
+    {
         body = &body[1..];
     }
-    while body.last().is_some_and(|l| l.trim_start().starts_with("```")) {
+    while body
+        .last()
+        .is_some_and(|l| l.trim_start().starts_with("```"))
+    {
         body = &body[..body.len() - 1];
     }
     let patch = body.join("\n");
-    if !patch.lines().any(|l| l.starts_with("--- ")) || !patch.lines().any(|l| l.starts_with("+++ ")) {
+    if !patch.lines().any(|l| l.starts_with("--- "))
+        || !patch.lines().any(|l| l.starts_with("+++ "))
+    {
         return Err("the text between the markers is not a unified diff".into());
     }
     Ok(format!("{patch}\n"))
@@ -218,7 +270,9 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
                 }
                 (0..=s.len()).any(|i| go(&p[2..], &s[i..]))
             }
-            Some(b'*') => (0..=s.len()).take_while(|&i| i == 0 || s[i - 1] != b'/').any(|i| go(&p[1..], &s[i..])),
+            Some(b'*') => (0..=s.len())
+                .take_while(|&i| i == 0 || s[i - 1] != b'/')
+                .any(|i| go(&p[1..], &s[i..])),
             Some(b'?') => !s.is_empty() && s[0] != b'/' && go(&p[1..], &s[1..]),
             Some(c) => s.first() == Some(c) && go(&p[1..], &s[1..]),
         }
@@ -227,7 +281,10 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
-    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -246,29 +303,42 @@ pub struct DiffChecker<'a> {
 
 impl DiffChecker<'_> {
     fn globs(&self) -> impl Iterator<Item = &str> {
-        self.protected.iter().filter(|p| p.kind == ProtectedKind::PathGlob).map(|p| p.value.as_str())
+        self.protected
+            .iter()
+            .filter(|p| p.kind == ProtectedKind::PathGlob)
+            .map(|p| p.value.as_str())
     }
 
     pub fn check(&self, files: &[String], unified0: &str) -> DiffCheck {
-        let mut out = DiffCheck { files: files.to_vec(), ..Default::default() };
+        let mut out = DiffCheck {
+            files: files.to_vec(),
+            ..Default::default()
+        };
         let module = match self.scope {
             Scope::Module(_, path) => Some(path.trim_matches('/')),
             _ => None,
         };
         for f in files {
             if let Some(m) = module.filter(|m| f != m && !f.starts_with(&format!("{m}/"))) {
-                out.violations.push(format!("path {f} outside module path {m}"));
+                out.violations
+                    .push(format!("path {f} outside module path {m}"));
             }
             if self.dimension == Dimension::WriteTests {
                 if !TEST_GLOBS.iter().any(|g| glob_match_path(g, f)) {
-                    out.violations.push(format!("write-tests touches non-test path {f}"));
+                    out.violations
+                        .push(format!("write-tests touches non-test path {f}"));
                 }
             } else if let Some(g) = self.globs().find(|g| glob_match_path(g, f)) {
-                out.violations.push(format!("protected path {f} (matches {g})"));
+                out.violations
+                    .push(format!("protected path {f} (matches {g})"));
             }
         }
-        let terms: Vec<&str> =
-            self.protected.iter().filter(|p| p.kind == ProtectedKind::RemovedTerm).map(|p| p.value.as_str()).collect();
+        let terms: Vec<&str> = self
+            .protected
+            .iter()
+            .filter(|p| p.kind == ProtectedKind::RemovedTerm)
+            .map(|p| p.value.as_str())
+            .collect();
         let mut file = String::new();
         let mut header = false;
         let mut counts: Vec<(String, usize, usize)> = Vec::new();
@@ -281,7 +351,10 @@ impl DiffChecker<'_> {
             if header {
                 if line.starts_with("@@") {
                     header = false;
-                } else if let Some(n) = line.strip_prefix("--- a/").or_else(|| line.strip_prefix("+++ b/")) {
+                } else if let Some(n) = line
+                    .strip_prefix("--- a/")
+                    .or_else(|| line.strip_prefix("+++ b/"))
+                {
                     file = n.to_string();
                 }
                 continue;
@@ -316,14 +389,22 @@ impl DiffChecker<'_> {
             if removed > added {
                 let (f, i) = key.split_once('\0').unwrap();
                 let term = terms[i.parse::<usize>().unwrap()];
-                out.violations.push(format!("removed protected term `{term}` in {f}"));
+                out.violations
+                    .push(format!("removed protected term `{term}` in {f}"));
             }
         }
         if files.len() > self.limits.max_files {
-            out.violations.push(format!("{} files exceed limit {}", files.len(), self.limits.max_files));
+            out.violations.push(format!(
+                "{} files exceed limit {}",
+                files.len(),
+                self.limits.max_files
+            ));
         }
         if out.lines > self.limits.max_lines {
-            out.violations.push(format!("{} changed lines exceed limit {}", out.lines, self.limits.max_lines));
+            out.violations.push(format!(
+                "{} changed lines exceed limit {}",
+                out.lines, self.limits.max_lines
+            ));
         }
         out
     }
@@ -426,7 +507,14 @@ pub fn real_launcher(claude_path: Option<PathBuf>, pass_env: Vec<String>) -> Lau
         let (cred, _) = backends::load_credential(backend)?;
         let program = backends::resolve_program(backend, claude_path.as_deref())?;
         backend.harness().pre_run_check(backend, &cred)?;
-        backends::build_launch(backend, req, &cred, &program, std::env::vars_os(), &pass_env)
+        backends::build_launch(
+            backend,
+            req,
+            &cred,
+            &program,
+            std::env::vars_os(),
+            &pass_env,
+        )
     })
 }
 
@@ -434,25 +522,45 @@ pub const ID_MAX: usize = 40;
 pub const JOB_ID_MAX: usize = 2 * ID_MAX + 1;
 
 pub fn valid_id(s: &str, max: usize) -> bool {
-    !s.is_empty() && s.len() <= max && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !s.is_empty()
+        && s.len() <= max
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 pub fn name_taken(repo: &Path, work_dir: &Path, id: &str) -> Option<String> {
     let branch = format!("refs/heads/{BRANCH_PREFIX}{id}");
-    let exists = Command::new("git").arg("-C").arg(repo).args(["show-ref", "--verify", "--quiet", &branch]).status().is_ok_and(|s| s.success());
+    let exists = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show-ref", "--verify", "--quiet", &branch])
+        .status()
+        .is_ok_and(|s| s.success());
     if exists {
         return Some(format!("branch {BRANCH_PREFIX}{id} already exists"));
     }
     if work_dir.join("worktrees").join(id).exists() {
         return Some(format!("worktree for `{id}` already exists"));
     }
-    ["patches/{}.patch", "patches/{}.proposal", "index/{}"].iter().map(|t| work_dir.join(t.replace("{}", id))).find(|p| p.exists()).map(|p| format!("artefact {} of an earlier job `{id}` already exists (another repository?)", p.display()))
+    ["patches/{}.patch", "patches/{}.proposal", "index/{}"]
+        .iter()
+        .map(|t| work_dir.join(t.replace("{}", id)))
+        .find(|p| p.exists())
+        .map(|p| {
+            format!(
+                "artefact {} of an earlier job `{id}` already exists (another repository?)",
+                p.display()
+            )
+        })
 }
 
 fn no_hooks() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("sidekick-nohooks-{}", uuid::Uuid::new_v4().simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "sidekick-nohooks-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let _ = std::fs::create_dir_all(&dir);
         #[cfg(unix)]
         {
@@ -464,9 +572,20 @@ fn no_hooks() -> &'static Path {
 }
 
 fn run_git(mut cmd: Command, args: &[&str]) -> Result<String> {
-    let out = cmd.env("GIT_TERMINAL_PROMPT", "0").arg("-c").arg(format!("core.hooksPath={}", no_hooks().display())).args(["-c", "core.fsmonitor=false"]).args(args).output().context("running git")?;
+    let out = cmd
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", no_hooks().display()))
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .output()
+        .context("running git")?;
     if !out.status.success() {
-        bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -501,7 +620,9 @@ fn set_file_mode(path: &Path, mode: u32) {
 }
 
 fn scan_files(path: &Path, out: &mut BTreeMap<PathBuf, (Vec<u8>, u32)>) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
     if meta.is_dir() {
         for e in std::fs::read_dir(path).into_iter().flatten().flatten() {
             scan_files(&e.path(), out);
@@ -518,7 +639,10 @@ struct Watch {
 
 impl Watch {
     fn new(paths: Vec<PathBuf>) -> Self {
-        let mut w = Self { paths, files: BTreeMap::new() };
+        let mut w = Self {
+            paths,
+            files: BTreeMap::new(),
+        };
         w.files = w.scan();
         w
     }
@@ -559,7 +683,12 @@ struct Guard {
 
 fn fingerprint(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
-    let modified = meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     #[cfg(unix)]
     let changed = {
         use std::os::unix::fs::MetadataExt;
@@ -579,21 +708,49 @@ fn exe_print() -> Option<(PathBuf, String)> {
 impl Guard {
     fn capture(repo: &Path, admin: &Path, own: Vec<PathBuf>) -> Result<Self> {
         let common = admin_common(admin);
-        let git = Watch::new(vec![common.join("hooks"), common.join("config"), common.join("info/attributes"), admin.join("config.worktree"), admin.join("info/attributes"), admin.join("hooks")]);
-        let mut guard = Self { repo: repo.to_path_buf(), git, own: Watch::new(own), exe: exe_print(), refs: BTreeMap::new(), head: Default::default() };
+        let git = Watch::new(vec![
+            common.join("hooks"),
+            common.join("config"),
+            common.join("info/attributes"),
+            admin.join("config.worktree"),
+            admin.join("info/attributes"),
+            admin.join("hooks"),
+        ]);
+        let mut guard = Self {
+            repo: repo.to_path_buf(),
+            git,
+            own: Watch::new(own),
+            exe: exe_print(),
+            refs: BTreeMap::new(),
+            head: Default::default(),
+        };
         guard.refs = guard.read_refs()?;
         guard.head = guard.read_head()?;
         Ok(guard)
     }
 
     fn read_refs(&self) -> Result<BTreeMap<String, String>> {
-        let out = git(&self.repo, &["for-each-ref", "--format=%(refname) %(objectname)"])?;
-        Ok(out.lines().filter_map(|l| l.split_once(' ')).filter(|(r, _)| !r.starts_with(&format!("refs/heads/{BRANCH_PREFIX}"))).map(|(r, o)| (r.to_string(), o.to_string())).collect())
+        let out = git(
+            &self.repo,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        )?;
+        Ok(out
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter(|(r, _)| !r.starts_with(&format!("refs/heads/{BRANCH_PREFIX}")))
+            .map(|(r, o)| (r.to_string(), o.to_string()))
+            .collect())
     }
 
     fn read_head(&self) -> Result<(String, String)> {
-        let sym = git(&self.repo, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_default().trim().to_string();
-        Ok((sym, git(&self.repo, &["rev-parse", "HEAD"])?.trim().to_string()))
+        let sym = git(&self.repo, &["symbolic-ref", "-q", "HEAD"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        Ok((
+            sym,
+            git(&self.repo, &["rev-parse", "HEAD"])?.trim().to_string(),
+        ))
     }
 
     fn check_and_restore(&self) -> Option<String> {
@@ -602,7 +759,10 @@ impl Guard {
             found.push("Git-Hooks/Config verändert");
         }
         let own_changed = self.own.restore();
-        let exe_changed = self.exe.as_ref().is_some_and(|(p, h)| fingerprint(p).as_ref() != Some(h));
+        let exe_changed = self
+            .exe
+            .as_ref()
+            .is_some_and(|(p, h)| fingerprint(p).as_ref() != Some(h));
         if own_changed || exe_changed {
             found.push("Sidekick-Dateien verändert");
         }
@@ -617,7 +777,14 @@ impl Guard {
                 let _ = git(&self.repo, &["update-ref", "-d", r]);
             }
             if head != self.head {
-                let _ = if self.head.0.is_empty() { git(&self.repo, &["update-ref", "--no-deref", "HEAD", &self.head.1]) } else { git(&self.repo, &["symbolic-ref", "HEAD", &self.head.0]) };
+                let _ = if self.head.0.is_empty() {
+                    git(
+                        &self.repo,
+                        &["update-ref", "--no-deref", "HEAD", &self.head.1],
+                    )
+                } else {
+                    git(&self.repo, &["symbolic-ref", "HEAD", &self.head.0])
+                };
             }
         }
         (!found.is_empty()).then(|| format!("Ausbruchsversuch: {}", found.join(", ")))
@@ -630,7 +797,10 @@ fn admin_common(admin: &Path) -> PathBuf {
     if rel.is_empty() {
         admin.to_path_buf()
     } else {
-        admin.join(rel).canonicalize().unwrap_or_else(|_| admin.join(rel))
+        admin
+            .join(rel)
+            .canonicalize()
+            .unwrap_or_else(|_| admin.join(rel))
     }
 }
 
@@ -653,16 +823,38 @@ impl Worktree {
         let path = work_dir.join("worktrees").join(job_id);
         let branch = format!("{BRANCH_PREFIX}{job_id}");
         std::fs::create_dir_all(path.parent().unwrap())?;
-        git(repo, &["worktree", "add", "-b", &branch, &path.to_string_lossy(), &base])?;
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                &path.to_string_lossy(),
+                &base,
+            ],
+        )?;
         let admin = PathBuf::from(git(&path, &["rev-parse", "--absolute-git-dir"])?.trim());
         let index = work_dir.join("index").join(job_id);
         std::fs::create_dir_all(index.parent().unwrap())?;
-        Ok(Self { repo: repo.to_path_buf(), path, branch, base, admin, index })
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            path,
+            branch,
+            base,
+            admin,
+            index,
+        })
     }
 
     fn private(&self, args: &[&str]) -> Result<String> {
         let mut cmd = Command::new("git");
-        cmd.arg("--git-dir").arg(&self.admin).arg("--work-tree").arg(&self.path).current_dir(&self.path).env("GIT_INDEX_FILE", &self.index);
+        cmd.arg("--git-dir")
+            .arg(&self.admin)
+            .arg("--work-tree")
+            .arg(&self.path)
+            .current_dir(&self.path)
+            .env("GIT_INDEX_FILE", &self.index);
         run_git(cmd, args)
     }
 
@@ -674,17 +866,56 @@ impl Worktree {
     }
 
     fn diff(&self, tree: &str, unified: &str) -> Result<String> {
-        git(&self.repo, &["-c", "core.quotepath=false", "diff", "--binary", "--no-color", "--no-renames", "--no-ext-diff", "--no-textconv", unified, &self.base, tree])
+        git(
+            &self.repo,
+            &[
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--binary",
+                "--no-color",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                unified,
+                &self.base,
+                tree,
+            ],
+        )
     }
 
     fn files(&self, tree: &str) -> Result<Vec<String>> {
-        let out = git(&self.repo, &["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", &self.base, tree])?;
-        Ok(out.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+        let out = git(
+            &self.repo,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                &self.base,
+                tree,
+            ],
+        )?;
+        Ok(out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect())
     }
 
     fn remove(&self, drop_branch: bool) {
         let _ = std::fs::remove_file(&self.index);
-        let _ = git(&self.repo, &["worktree", "remove", "--force", &self.path.to_string_lossy()]);
+        let _ = git(
+            &self.repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &self.path.to_string_lossy(),
+            ],
+        );
         if drop_branch {
             let _ = git(&self.repo, &["branch", "-D", &self.branch]);
         }
@@ -694,14 +925,25 @@ impl Worktree {
         let mut args: Vec<&str> = GIT_IDENT.to_vec();
         args.extend(["commit-tree", tree, "-p", &self.base, "-m", message]);
         let commit = git(&self.repo, &args)?.trim().to_string();
-        git(&self.repo, &["update-ref", &format!("refs/heads/{}", self.branch), &commit]).map(|_| ())
+        git(
+            &self.repo,
+            &[
+                "update-ref",
+                &format!("refs/heads/{}", self.branch),
+                &commit,
+            ],
+        )
+        .map(|_| ())
     }
 }
 
 fn final_answer(backend: &Backend, report_text: Option<&str>, raw: &str) -> String {
     match report_text {
         Some(t) => t.to_string(),
-        None => backend.harness().normalize_output(raw).map_or_else(|| raw.to_string(), |n| n.text),
+        None => backend
+            .harness()
+            .normalize_output(raw)
+            .map_or_else(|| raw.to_string(), |n| n.text),
     }
 }
 
@@ -711,14 +953,30 @@ fn now_ms() -> i64 {
 
 impl Dispatcher {
     fn own_files(&self) -> Vec<PathBuf> {
-        let base = self.work_dir.parent().map(Path::to_path_buf).unwrap_or_default();
+        let base = self
+            .work_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         let checkout = base.join("checkout");
-        let mut paths = vec![base.join("secret"), base.join("machine_id"), checkout.join("models.parquet"), checkout.join("protected.parquet"), checkout.join(".git/hooks"), checkout.join(".git/config")];
+        let mut paths = vec![
+            base.join("secret"),
+            base.join("machine_id"),
+            checkout.join("models.parquet"),
+            checkout.join("protected.parquet"),
+            checkout.join(".git/hooks"),
+            checkout.join(".git/config"),
+        ];
         paths.extend(crate::paths::config_file().ok());
         paths
     }
 
-    pub async fn dispatch(&self, backend: &Backend, req: &DispatchRequest, log: &mut SessionLog) -> Result<DispatchResult> {
+    pub async fn dispatch(
+        &self,
+        backend: &Backend,
+        req: &DispatchRequest,
+        log: &mut SessionLog,
+    ) -> Result<DispatchResult> {
         let (result, event) = self.run(backend, req, CancellationToken::new()).await?;
         if let Some(event) = event {
             log.append(event)?;
@@ -726,12 +984,26 @@ impl Dispatcher {
         Ok(result)
     }
 
-    pub async fn run(&self, backend: &Backend, req: &DispatchRequest, cancel: CancellationToken) -> Result<(DispatchResult, Option<Event>)> {
-        self.run_with(backend, req, cancel, RunExtras::default()).await
+    pub async fn run(
+        &self,
+        backend: &Backend,
+        req: &DispatchRequest,
+        cancel: CancellationToken,
+    ) -> Result<(DispatchResult, Option<Event>)> {
+        self.run_with(backend, req, cancel, RunExtras::default())
+            .await
     }
 
-    pub async fn run_with(&self, backend: &Backend, req: &DispatchRequest, cancel: CancellationToken, extras: RunExtras) -> Result<(DispatchResult, Option<Event>)> {
-        let model = backend.effective_model(req.model.as_deref()).map_err(|e| anyhow!(e))?;
+    pub async fn run_with(
+        &self,
+        backend: &Backend,
+        req: &DispatchRequest,
+        cancel: CancellationToken,
+        extras: RunExtras,
+    ) -> Result<(DispatchResult, Option<Event>)> {
+        let model = backend
+            .effective_model(req.model.as_deref())
+            .map_err(|e| anyhow!(e))?;
         let key = req.identity.key(backend, model.as_deref());
         let model_id = key.model_id();
         let row = self.data.model(&model_id).map_err(|_| {
@@ -741,24 +1013,40 @@ impl Dispatcher {
             )
         })?;
         let technical = technical_sperre(backend);
-        let sperre = if row.sperre == Sperre::Technisch && technical == Sperre::Technisch { Sperre::Technisch } else { Sperre::NurDiff };
+        let sperre = if row.sperre == Sperre::Technisch && technical == Sperre::Technisch {
+            Sperre::Technisch
+        } else {
+            Sperre::NurDiff
+        };
         let sperre_note = (sperre != row.sperre).then(|| {
             format!("registry says {} but the {} harness cannot withhold write tools; treated as nur-diff", row.sperre.as_str(), key.harness)
         });
         let events = self.data.events(Some(&self.local_root))?;
         let standing = Standing::compute(&key, sperre, &events, now_ms());
-        let write_right = req.dimension.is_write() && standing.write_right(req.dimension, &req.scope);
+        let write_right =
+            req.dimension.is_write() && standing.write_right(req.dimension, &req.scope);
         let protected = self.data.protected()?;
         let limited = with_registry_limits(backend, &row);
-        let prepared = if write_right { limited } else { withhold_writes(&limited) };
+        let prepared = if write_right {
+            limited
+        } else {
+            withhold_writes(&limited)
+        };
         let expected = expected_claude_model(backend, model.as_deref());
         let model = claude_model_with(backend, model.as_deref(), resolve_claude_alias).or(model);
         let max_turns = match (backend.harness_kind(), row.max_steps) {
-            (HarnessKind::Claude | HarnessKind::OpenCode, Some(m)) if m > 0 => req.max_turns.min(m as u32),
+            (HarnessKind::Claude | HarnessKind::OpenCode, Some(m)) if m > 0 => {
+                req.max_turns.min(m as u32)
+            }
             _ => req.max_turns,
         };
         let proposal = req.dimension.is_write() && !write_right;
-        let wt = Worktree::create(&req.repo, &self.work_dir, &req.job_id, extras.base.as_deref())?;
+        let wt = Worktree::create(
+            &req.repo,
+            &self.work_dir,
+            &req.job_id,
+            extras.base.as_deref(),
+        )?;
         let guard = match Guard::capture(&req.repo, &wt.admin, self.own_files()) {
             Ok(g) => g,
             Err(e) => {
@@ -784,18 +1072,33 @@ impl Dispatcher {
             timeout: req.timeout,
         };
         let json_output = matches!(backend.kind, BackendKind::ClaudeOauth { .. });
-        let launched = (self.launcher)(&prepared, &run_req).map_err(|e| anyhow!(e)).and_then(|mut l| {
-            if json_output {
-                let at = if l.args.len() >= 2 && l.args[l.args.len() - 2] == "--" { l.args.len() - 2 } else { l.args.len() };
-                l.args.splice(at..at, ["--output-format".into(), "json".into()]);
-            }
-            if let Some(wire) = &extras.ask {
-                ask::wire_launch(backend.harness_kind(), &mut l, wire)?;
-            }
-            Ok(l)
-        });
+        let launched = (self.launcher)(&prepared, &run_req)
+            .map_err(|e| anyhow!(e))
+            .and_then(|mut l| {
+                if json_output {
+                    let at = if l.args.len() >= 2 && l.args[l.args.len() - 2] == "--" {
+                        l.args.len() - 2
+                    } else {
+                        l.args.len()
+                    };
+                    l.args
+                        .splice(at..at, ["--output-format".into(), "json".into()]);
+                }
+                if let Some(wire) = &extras.ask {
+                    ask::wire_launch(backend.harness_kind(), &mut l, wire)?;
+                }
+                Ok(l)
+            });
         let outcome = match launched {
-            Ok(launch) => runner::run_launch_with(launch, run_req, &self.logs_dir, cancel, extras.pause.clone()).await.map_err(anyhow::Error::from),
+            Ok(launch) => runner::run_launch_with(
+                launch,
+                run_req,
+                &self.logs_dir,
+                cancel,
+                extras.pause.clone(),
+            )
+            .await
+            .map_err(anyhow::Error::from),
             Err(e) => Err(e),
         };
         let outcome = match outcome {
@@ -835,7 +1138,8 @@ impl Dispatcher {
             log_path: outcome.log_path.clone(),
             tail: outcome.tail.clone(),
         };
-        let raw = runner::read_logged_output(&outcome.log_path, outcome.output_offset).unwrap_or_else(|| outcome.output.clone());
+        let raw = runner::read_logged_output(&outcome.log_path, outcome.output_offset)
+            .unwrap_or_else(|| outcome.output.clone());
         let report = json_output.then(|| parse_report(&raw)).flatten();
         if let Some(r) = &report {
             result.tail = runner::truncate_tail(&r.text, runner::TAIL_CHARS);
@@ -850,22 +1154,37 @@ impl Dispatcher {
                 }
                 Some(m) if model_matches(m, exp) => true,
                 Some(m) => {
-                    result.warnings.push(format!("model mismatch: expected {exp}, the claude CLI reported {m}"));
+                    result.warnings.push(format!(
+                        "model mismatch: expected {exp}, the claude CLI reported {m}"
+                    ));
                     false
                 }
             },
         };
         if !model_verified && standing.apply_without_review() {
-            result.warnings.push("gold not applied without a verified model: result returned as branch/patch".into());
+            result.warnings.push(
+                "gold not applied without a verified model: result returned as branch/patch".into(),
+            );
         }
-        let gold_model = standing.apply_without_review() && matches!(backend.kind, BackendKind::ClaudeOauth { .. }) && model_verified;
+        let gold_model = standing.apply_without_review()
+            && matches!(backend.kind, BackendKind::ClaudeOauth { .. })
+            && model_verified;
         result.gold_model = gold_model;
-        let mut event = Event::new(&model_id, req.dimension, req.scope.clone(), Outcome::Note, now_ms());
+        let mut event = Event::new(
+            &model_id,
+            req.dimension,
+            req.scope.clone(),
+            Outcome::Note,
+            now_ms(),
+        );
         event.machine_id = self.machine_id.clone();
         event.user_id = self.user_id.clone();
         event.job_id = Some(req.job_id.clone());
         event.duration_s = Some(result.duration_s);
-        let unanswered = extras.unanswered.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+        let unanswered = extras
+            .unanswered
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::SeqCst));
         if unanswered {
             result.warnings.push("a question of the worker went unanswered: gold is not applied directly, result returned as branch/patch".into());
         }
@@ -883,8 +1202,13 @@ impl Dispatcher {
                 wt.remove(true);
                 return Ok(());
             }
-            let max_turns_hit = report.as_ref().is_some_and(|r| r.subtype == MAX_TURNS_SUBTYPE);
-            if let Some(r) = report.as_ref().filter(|r| r.is_error && r.subtype != MAX_TURNS_SUBTYPE) {
+            let max_turns_hit = report
+                .as_ref()
+                .is_some_and(|r| r.subtype == MAX_TURNS_SUBTYPE);
+            if let Some(r) = report
+                .as_ref()
+                .filter(|r| r.is_error && r.subtype != MAX_TURNS_SUBTYPE)
+            {
                 result.status = Status::Failed;
                 let reason = format!("claude reported an error ({}): {}", r.subtype, r.text);
                 result.tail = runner::truncate_tail(&reason, runner::TAIL_CHARS);
@@ -898,8 +1222,12 @@ impl Dispatcher {
             let mut proposed = false;
             if proposal && files.is_empty() {
                 let applied = extract_patch(&result.answer).and_then(|patch| {
-                    let proposal_path = self.work_dir.join("patches").join(format!("{}.proposal", req.job_id));
-                    std::fs::create_dir_all(proposal_path.parent().unwrap()).map_err(|e| e.to_string())?;
+                    let proposal_path = self
+                        .work_dir
+                        .join("patches")
+                        .join(format!("{}.proposal", req.job_id));
+                    std::fs::create_dir_all(proposal_path.parent().unwrap())
+                        .map_err(|e| e.to_string())?;
                     std::fs::write(&proposal_path, patch).map_err(|e| e.to_string())?;
                     let arg = proposal_path.to_string_lossy().into_owned();
                     let done = wt
@@ -936,7 +1264,11 @@ impl Dispatcher {
             }
             let patch = wt.diff(&tree, "-U3")?;
             if !write_right && !proposed {
-                let reason = format!("diff without write right ({}): {}", req.dimension, files.join(", "));
+                let reason = format!(
+                    "diff without write right ({}): {}",
+                    req.dimension,
+                    files.join(", ")
+                );
                 result.status = Status::Blocked;
                 result.diff_discarded = true;
                 result.evidence_hash = Some(sha256_hex(patch.as_bytes()));
@@ -949,7 +1281,12 @@ impl Dispatcher {
                 wt.remove(true);
                 return Ok(());
             }
-            let checker = DiffChecker { protected: &protected, dimension: req.dimension, limits: Limits::for_scope(&req.scope), scope: &req.scope };
+            let checker = DiffChecker {
+                protected: &protected,
+                dimension: req.dimension,
+                limits: Limits::for_scope(&req.scope),
+                scope: &req.scope,
+            };
             let check = checker.check(&files, &wt.diff(&tree, "-U0")?);
             let gold = gold_model;
             if !check.violations.is_empty() && (!gold || aborted) {
@@ -978,12 +1315,21 @@ impl Dispatcher {
             std::fs::write(&patch_path, &patch)?;
             result.gold = gold;
             if gold && !extras.hold_gold && !unanswered {
-                match git(&req.repo, &["apply", "--whitespace=nowarn", &patch_path.to_string_lossy()]) {
+                match git(
+                    &req.repo,
+                    &[
+                        "apply",
+                        "--whitespace=nowarn",
+                        &patch_path.to_string_lossy(),
+                    ],
+                ) {
                     Ok(_) => {
                         result.applied = true;
                         wt.remove(true);
                     }
-                    Err(e) => result.warnings.push(format!("gold apply failed, branch and patch kept: {e:#}")),
+                    Err(e) => result
+                        .warnings
+                        .push(format!("gold apply failed, branch and patch kept: {e:#}")),
                 }
             }
             if !result.applied {
@@ -1016,7 +1362,11 @@ mod tests {
     #[test]
     fn the_final_answer_is_the_text_not_the_json_event_stream_for_opencode() {
         let cfg: crate::config::Config = toml::from_str("[backends.dgx]\nharness = \"opencode\"\nprovider = \"ollama\"\nbase_url = \"http://127.0.0.1:1\"\nmodel = \"m\"\ndescription = \"d\"\ndefault = true\n").unwrap();
-        let defaults = crate::backends::ResolveDefaults { home: None, legacy_agent_config_dir: None, config_dir: Some(std::env::temp_dir().join("sk-final-answer-cfg")) };
+        let defaults = crate::backends::ResolveDefaults {
+            home: None,
+            legacy_agent_config_dir: None,
+            config_dir: Some(std::env::temp_dir().join("sk-final-answer-cfg")),
+        };
         let backends = crate::backends::resolve_with(&cfg, &defaults).unwrap();
         let backend = backends.get("dgx").unwrap();
         let raw = [
@@ -1026,7 +1376,10 @@ mod tests {
         ]
         .join("\n");
         let answer = final_answer(backend, None, &raw);
-        assert!(answer.starts_with("the inventory: a.rs, b.rs") && !answer.contains("\"type\""), "{answer}");
+        assert!(
+            answer.starts_with("the inventory: a.rs, b.rs") && !answer.contains("\"type\""),
+            "{answer}"
+        );
         assert_eq!(final_answer(backend, Some("report"), &raw), "report");
     }
 
@@ -1046,10 +1399,24 @@ mod tests {
     #[test]
     fn term_removal_needs_readd() {
         let protected = ProtectedRow::defaults();
-        let checker = DiffChecker { protected: &protected, dimension: Dimension::WriteCode, limits: GLOBAL_LIMITS, scope: &Scope::Global };
+        let checker = DiffChecker {
+            protected: &protected,
+            dimension: Dimension::WriteCode,
+            limits: GLOBAL_LIMITS,
+            scope: &Scope::Global,
+        };
         let removed = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-assert!(x);\n+x;\n";
-        assert_eq!(checker.check(&["src/a.rs".into()], removed).violations.len(), 1);
+        assert_eq!(
+            checker
+                .check(&["src/a.rs".into()], removed)
+                .violations
+                .len(),
+            1
+        );
         let moved = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-assert!(x);\n+assert!(y);\n";
-        assert!(checker.check(&["src/a.rs".into()], moved).violations.is_empty());
+        assert!(checker
+            .check(&["src/a.rs".into()], moved)
+            .violations
+            .is_empty());
     }
 }

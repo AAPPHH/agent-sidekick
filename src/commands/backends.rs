@@ -320,7 +320,12 @@ fn account_line(backend: &Backend, can_detect: bool) -> String {
         return format!("account:     {configured}");
     }
     match backends::detect_account(backend) {
-        Ok(found) if backend.account.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&found)) => {
+        Ok(found)
+            if backend
+                .account
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&found)) =>
+        {
             format!("account:     {configured} (matches the detected login)")
         }
         Ok(found) => format!("account:     {configured}; detected {found}"),
