@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::data::{DataDir, SessionLog};
-use crate::dispatch::{git, status_summary, Status, GIT_IDENT};
+use crate::dispatch::{git_user_config as git, status_summary, Status};
 use crate::trust::{Dimension, Event, Outcome, Scope, Visibility};
 
 pub const BRANCH: &str = "main";
@@ -192,6 +192,13 @@ impl DataStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn identified(&self, args: &[&str]) -> Result<String> {
+        let email = format!("user.email={}@agent-sidekick.invalid", self.name);
+        let mut full = vec!["-c", "user.name=agent-sidekick", "-c", &email];
+        full.extend(args);
+        git(&self.checkout, &full)
+    }
+
     fn own_prefix(&self) -> PathBuf {
         Path::new("experiences").join(&self.name)
     }
@@ -202,10 +209,7 @@ impl DataStore {
     }
 
     fn pull_locked(&self) -> Result<()> {
-        let r = git(
-            &self.checkout,
-            &["pull", "--rebase", "--autostash", "-q", REMOTE, BRANCH],
-        );
+        let r = self.identified(&["pull", "--rebase", "--autostash", "-q", REMOTE, BRANCH]);
         if r.is_err() {
             let _ = git(&self.checkout, &["rebase", "--abort"]);
         }
@@ -214,11 +218,9 @@ impl DataStore {
 
     fn push_locked(&self) -> bool {
         for _ in 0..PUSH_ATTEMPTS {
-            if git(
-                &self.checkout,
-                &["push", "-q", REMOTE, &format!("HEAD:{BRANCH}")],
-            )
-            .is_ok()
+            if self
+                .identified(&["push", "-q", REMOTE, &format!("HEAD:{BRANCH}")])
+                .is_ok()
             {
                 let _ = fs::remove_file(self.pending_path());
                 return true;
@@ -247,9 +249,8 @@ impl DataStore {
         {
             return Ok(());
         }
-        let mut args: Vec<&str> = GIT_IDENT.to_vec();
-        args.extend(["commit", "-q", "-m", message, "--", &rel]);
-        git(&self.checkout, &args).map(|_| ())
+        self.identified(&["commit", "-q", "-m", message, "--", &rel])
+            .map(|_| ())
     }
 
     pub fn append(&self, event: Event) -> Result<(String, bool)> {

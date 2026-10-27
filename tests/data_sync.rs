@@ -160,7 +160,20 @@ fn rebase_retry_after_concurrent_push() {
     )
     .unwrap();
     commit_all(&f.peer, "data: other");
-    sh(&f.peer, &["pull", "-q", "--rebase", "origin", "main"]);
+    sh(
+        &f.peer,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "pull",
+            "-q",
+            "--rebase",
+            "origin",
+            "main",
+        ],
+    );
     sh(&f.peer, &["push", "-q", "origin", "main"]);
     let (_, pushed) = s
         .record(input(Outcome::Rejected, Dimension::Search))
@@ -302,5 +315,26 @@ fn repo_slug_becomes_github_url_and_paths_stay() {
     assert_eq!(
         remote_url("https://example.com/a/b.git"),
         "https://example.com/a/b.git"
+    );
+}
+
+#[test]
+fn data_commits_carry_the_sidekick_identity_even_without_any_git_identity() {
+    let f = fx();
+    let empty = f._dir.path().join("empty.gitconfig");
+    std::fs::write(&empty, "").unwrap();
+    std::env::set_var("GIT_CONFIG_GLOBAL", &empty);
+    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    std::env::set_var("GIT_CONFIG_COUNT", "1");
+    std::env::set_var("GIT_CONFIG_KEY_0", "user.useConfigOnly");
+    std::env::set_var("GIT_CONFIG_VALUE_0", "true");
+    let s = open(&f);
+    let (_, pushed) = s
+        .record(input(Outcome::Accepted, Dimension::WriteCode))
+        .unwrap();
+    assert!(pushed);
+    assert_eq!(
+        sh(&f.bare, &["log", "-1", "--format=%an <%ae>", "main"]).trim(),
+        "agent-sidekick <me@agent-sidekick.invalid>"
     );
 }
