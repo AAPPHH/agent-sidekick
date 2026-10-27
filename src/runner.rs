@@ -729,6 +729,19 @@ fn descendants(procs: &[ProcStat], roots: &[i32]) -> Vec<ProcStat> {
 /// Processes reparented to us are reaped with `waitpid(pid, WNOHANG)` for exactly those
 /// pids -- never `waitpid(-1)`, which would steal exit statuses from tokio.
 /// Assumption: in the server process only this module spawns long-lived children.
+/// Held while the sidekick runs a helper process of its own (git): a concurrent orphan sweep must not mistake it for a leftover of a finished job.
+pub(crate) struct HelperGuard {
+    #[cfg(target_os = "linux")]
+    _spawn: linux::SpawnGuard,
+}
+
+pub(crate) fn helper_guard() -> HelperGuard {
+    HelperGuard {
+        #[cfg(target_os = "linux")]
+        _spawn: linux::SpawnGuard::new(),
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

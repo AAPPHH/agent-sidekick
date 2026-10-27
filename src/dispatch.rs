@@ -572,6 +572,7 @@ fn no_hooks() -> &'static Path {
 }
 
 fn run_git(mut cmd: Command, args: &[&str]) -> Result<String> {
+    let _helper = runner::helper_guard();
     let out = cmd
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-c")
@@ -582,8 +583,9 @@ fn run_git(mut cmd: Command, args: &[&str]) -> Result<String> {
         .context("running git")?;
     if !out.status.success() {
         bail!(
-            "git {} failed: {}",
+            "git {} failed ({}): {}",
             args.join(" "),
+            out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }

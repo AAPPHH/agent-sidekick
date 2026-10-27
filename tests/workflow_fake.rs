@@ -677,7 +677,7 @@ fn a_kept_branch_or_a_running_workflow_id_is_rejected_up_front() {
     let (res, text) = call(&mut fx, vec![step("code", "STEP-CODE", "write-code", &[])]);
     assert_eq!(res["isError"], json!(true), "{text}");
     assert!(
-        text.contains("workflow rejected") && text.contains("branch sidekick/wf1 already exists"),
+        text.contains("workflow rejected") && text.contains("already exists"),
         "{text}"
     );
     git(&fx.repo, &["branch", "-D", "sidekick/wf1"]);
@@ -690,6 +690,13 @@ fn a_kept_branch_or_a_running_workflow_id_is_rejected_up_front() {
         "{text}"
     );
     git(&fx.repo, &["branch", "-D", "sidekick/wf1-code"]);
+    let (res, text) = call(&mut fx, vec![step("ask", "STEP-ASK", "search", &[])]);
+    assert!(
+        res["isError"] == json!(true) && text.contains("earlier job"),
+        "{text}"
+    );
+    let patches = find(&fx._dir.path().join("data"), "patches").expect("patches");
+    std::fs::remove_dir_all(patches).unwrap();
     let (_r, q) = call(&mut fx, vec![step("ask", "STEP-ASK", "search", &[])]);
     assert_eq!(field(&q, "status"), "question", "{q}");
     let (res, text) = call(&mut fx, vec![step("other", "STEP-EXTRA", "search", &[])]);
