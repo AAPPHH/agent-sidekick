@@ -218,6 +218,10 @@ Lade VS Code neu oder starte es komplett neu. Hilft das nicht, führe `agent-sid
 
 Seit Version 0.5.0 liest agent-sidekick die `config.toml` beim nächsten Aufruf eines Werkzeugs (`sidekick_run`, `sidekick_backends`, `sidekick_status`) neu ein; ein Neustart ist nicht nötig. Ist die geänderte Datei fehlerhaft, arbeitet agent-sidekick mit der letzten gültigen Fassung weiter und meldet den Fehler als `config_error` in `sidekick_backends`; `agent-sidekick doctor` zeigt Details. Ältere Versionen lesen die Datei nur beim Start: Wähle in Claude Code `/mcp`, dann agent-sidekick und **Reconnect**.
 
+### Vertrauen und Steckbriefe
+
+Neben `sidekick_run` gibt es `sidekick_steckbrief`, `sidekick_dispatch`, `sidekick_record_experience`, `sidekick_query` und `sidekick_sync`. Erfahrungsdaten liegen unter `data/` im Code-Repo; `data_remote` und `data_name` in der `config.toml` legen Remote und Präfix fest (ohne `data_name` wird nichts gepusht). Nutzer- und Maschinen-IDs werden vor dem Push pseudonymisiert. Details: [docs/REFERENCE.md](docs/REFERENCE.md#trust-tools).
+
 ### Der KI:connect-Schlüssel ist abgelaufen
 
 Erzeuge im KI:connect-Webinterface unter **API Key Management** mit **Rotate** einen neuen Schlüssel und speichere ihn mit `agent-sidekick setup --backend kiconnect` (siehe [KI:connect-API-Schlüssel erzeugen](#kiconnect-api-schlüssel-erzeugen)).

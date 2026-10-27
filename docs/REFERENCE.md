@@ -429,6 +429,18 @@ It never contains secrets or environment values.
 Shows running and queued runs, per backend and in total, with the global and per-backend limits.
 Without a `[backends]` section it also shows the global `default model` and the agent's Claude config dir. With `[backends]`, the line of each `claude-oauth` and `claude-endpoint` backend shows that backend's effective `model` and `config_dir` instead (the top-level `default_model` is not used then). A backend with `models` also shows its allowlist (`models [a, b]`); a command backend with `{model}` shows its default model and allowlist.
 
+### Trust tools
+
+Experience data lives in the public code repo under `data/`. The sidekick keeps a sparse checkout (`data/` only) in `<config-dir>/data/checkout` (override: `AGENT_SIDEKICK_DATA_DIR`) and full local copies of its own session files in `<data>/local`. `secret` (HMAC key, never pushed), `machine_id` and a `pending` flag sit next to them.
+
+- `sidekick_steckbrief(model_id | backend[+model], scope?)`: rendered profile (registry, trust per dimension and scope, counters, last block, review share, write and decisions right, cost balance, newest conclusions).
+- `sidekick_dispatch(prompt, dimension, scope?, backend?, model?, cwd?, job_id?, max_turns?, timeout_s?, provider?, checkpoint?, quant?)`: job in its own git worktree, same queues and progress as `sidekick_run`. No write right: no write tools, any diff is a block. Diff checks: protected paths and terms, module path bound, file and line limits. Result as branch `sidekick/<job_id>` plus patch; applied only for the Gold model (on a conflict branch and patch are kept). Blocked and aborted outcomes are recorded automatically.
+- `sidekick_record_experience(model_id | backend[+model], dimension, outcome, scope?, review_s?, conclusion?, visibility?, ...)`: outcome `accepted|rejected|aborted|note|seed`. `seed` only for search and inventory with `seed_value`. `visibility` defaults to `private`.
+- `sidekick_query(sql)`: read-only SQL over `models`, `protected`, `experiences`.
+- `sidekick_sync()`: pull, then push pending commits.
+
+Sync: pull at server start (when `data_name` is set or a checkout exists; failure keeps the local state). Each recorded event rewrites the own session file, `git add`s only that path, commits as `data: ...` and pushes; a rejection triggers `pull --rebase` and a bounded retry, offline leaves the pending flag for the next `sidekick_sync`. Nothing outside `data/experiences/<data_name>/` is ever committed. In the pushed copy `user_id` and `machine_id` are the first 16 hex of HMAC-SHA256(local secret, raw value); `summary` and `conclusion` are pushed only for `visibility = shared`.
+
 ## CLI reference
 
 | Command | Purpose |
@@ -457,6 +469,8 @@ default_timeout_s = 1800
 default_model = "sonnet"  # optional; only for the implicit backend (no [backends] section)
 claude_path = "/abs/path/to/claude"  # optional, used by claude-* backends
 pass_env = []             # inherited variables to keep for every backend, see above
+data_remote = "https://github.com/AAPPHH/agent-sidekick.git"  # git remote carrying data/
+data_name = "alice"       # your prefix under data/experiences/; unset: nothing is pushed
 ```
 
 The server rereads `config.toml` before every tool call (`sidekick_run`, `sidekick_backends`, `sidekick_status`) when the file has changed, so edits take effect on the next call without an MCP reconnect. A call that is already running keeps the configuration it started with. If the changed file is invalid, the server keeps the last valid configuration, reports the error as `config_error` in `sidekick_backends` and as `config error` in `sidekick_status`, and adds a note to `sidekick_run` errors; the log gets a warning per change and an info line "config reloaded" with the backend names after every successful reload. If the file was already invalid when the server started, `sidekick_run` stays disabled until it is fixed. Rate-limit cooldowns and the running/queued counters survive a reload; a changed `max_concurrent` gets a new limit for new runs.

@@ -20,7 +20,7 @@ pub const WRITE_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "NotebookEdit"
 pub const READ_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
 pub const MAX_TURNS_MARKER: &str = "reached max turns";
 pub const BRANCH_PREFIX: &str = "sidekick/";
-const GIT_IDENT: [&str; 4] = ["-c", "user.name=agent-sidekick", "-c", "user.email=agent-sidekick@localhost"];
+pub(crate) const GIT_IDENT: [&str; 4] = ["-c", "user.name=agent-sidekick", "-c", "user.email=agent-sidekick@localhost"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -301,8 +301,8 @@ pub fn real_launcher(claude_path: Option<PathBuf>, pass_env: Vec<String>) -> Lau
     })
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().context("running git")?;
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git").env("GIT_TERMINAL_PROMPT", "0").arg("-C").arg(dir).args(args).output().context("running git")?;
     if !out.status.success() {
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -360,6 +360,14 @@ fn now_ms() -> i64 {
 
 impl Dispatcher {
     pub async fn dispatch(&self, backend: &Backend, req: &DispatchRequest, log: &mut SessionLog) -> Result<DispatchResult> {
+        let (result, event) = self.run(backend, req, CancellationToken::new()).await?;
+        if let Some(event) = event {
+            log.append(event)?;
+        }
+        Ok(result)
+    }
+
+    pub async fn run(&self, backend: &Backend, req: &DispatchRequest, cancel: CancellationToken) -> Result<(DispatchResult, Option<Event>)> {
         let model = backend.effective_model(req.model.as_deref()).map_err(|e| anyhow!(e))?;
         let key = req.identity.key(backend, model.as_deref());
         let model_id = key.model_id();
@@ -394,7 +402,7 @@ impl Dispatcher {
         };
         let launched = (self.launcher)(&prepared, &run_req).map_err(|e| anyhow!(e));
         let outcome = match launched {
-            Ok(launch) => runner::run_launch(launch, run_req, &self.logs_dir, CancellationToken::new()).await.map_err(anyhow::Error::from),
+            Ok(launch) => runner::run_launch(launch, run_req, &self.logs_dir, cancel).await.map_err(anyhow::Error::from),
             Err(e) => Err(e),
         };
         let outcome = match outcome {
@@ -499,11 +507,11 @@ impl Dispatcher {
             wt.remove(result.branch.is_none());
             return Err(e);
         }
-        if matches!(result.status, Status::Blocked | Status::Aborted) {
+        let event = matches!(result.status, Status::Blocked | Status::Aborted).then(|| {
             result.event_id = Some(event.event_id.clone());
-            log.append(event)?;
-        }
-        Ok(result)
+            event
+        });
+        Ok((result, event))
     }
 }
 

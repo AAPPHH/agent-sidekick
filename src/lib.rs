@@ -15,6 +15,7 @@ pub mod paths;
 pub mod redact;
 pub mod runner;
 pub mod server;
+pub mod sync;
 pub mod token;
 pub mod trust;
 

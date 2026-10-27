@@ -367,11 +367,38 @@ pub fn strip_private(event: &Event) -> Event {
     shared
 }
 
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| block.map(|k| k ^ b);
+    let inner = Sha256::new().chain_update(pad(0x36)).chain_update(msg).finalize();
+    Sha256::new().chain_update(pad(0x5c)).chain_update(inner).finalize().into()
+}
+
+pub fn pseudonym(secret: &[u8], raw: &str) -> String {
+    hmac_sha256(secret, raw.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn shared_copy(event: &Event, secret: Option<&[u8]>) -> Event {
+    let mut shared = strip_private(event);
+    if let Some(secret) = secret {
+        shared.user_id = pseudonym(secret, &event.user_id);
+        shared.machine_id = pseudonym(secret, &event.machine_id);
+    }
+    shared
+}
+
 #[derive(Debug)]
 pub struct SessionLog {
     pub shared_path: PathBuf,
     pub local_path: PathBuf,
     events: Vec<Event>,
+    secret: Option<Vec<u8>>,
 }
 
 impl SessionLog {
@@ -382,7 +409,12 @@ impl SessionLog {
         let rel = Path::new("experiences").join(name).join(format!("{session}.parquet"));
         let local_path = local_root.join(&rel);
         let events = if local_path.exists() { read_events(&local_path)? } else { Vec::new() };
-        Ok(Self { shared_path: shared_root.join(rel), local_path, events })
+        Ok(Self { shared_path: shared_root.join(rel), local_path, events, secret: None })
+    }
+
+    pub fn with_secret(mut self, secret: Vec<u8>) -> Self {
+        self.secret = Some(secret);
+        self
     }
 
     pub fn events(&self) -> &[Event] {
@@ -396,7 +428,7 @@ impl SessionLog {
         let mut next = self.events.clone();
         next.push(event);
         write_events(&self.local_path, &next)?;
-        let shared: Vec<Event> = next.iter().map(strip_private).collect();
+        let shared: Vec<Event> = next.iter().map(|e| shared_copy(e, self.secret.as_deref())).collect();
         write_events(&self.shared_path, &shared)?;
         self.events = next;
         Ok(())

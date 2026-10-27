@@ -19,12 +19,15 @@ use rmcp::{
     tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::backends::reach::PROBE_TIMEOUT;
 use crate::backends::{self, Backend, BackendType, Backends, Credential};
+use crate::dispatch::{self, DispatchRequest, DispatchResult, Dispatcher, Identity};
+use crate::sync::{DataStore, ExperienceInput};
+use crate::trust::{Dimension, Outcome, Scope, Visibility};
 use crate::config::{Config, MAX_TIMEOUT_S, MAX_TURNS_LIMIT};
 use crate::locate::{self, LocateError, Located};
 use crate::redact::{redact_all, Secrets};
@@ -101,6 +104,76 @@ pub struct RunParams {
     /// own full `timeout_s` (and may wait in its own queue), so a request with a fallback can
     /// take up to about 2x timeout_s plus queue time.
     pub fallback: Option<String>,
+}
+
+/// Parameters of `sidekick_steckbrief`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+pub struct SteckbriefParams {
+    /// Stable model id (from an earlier Steckbrief or `query`). Alternative: `backend` (+ `model`).
+    pub model_id: Option<String>,
+    /// Backend whose model is meant (default backend if neither id nor backend is given).
+    pub backend: Option<String>,
+    /// Model of that backend (default: the backend's default model).
+    pub model: Option<String>,
+    /// global (default) | repo:<name> | module:<repo>/<path>.
+    pub scope: Option<String>,
+}
+
+/// Parameters of `sidekick_record_experience`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+pub struct RecordParams {
+    pub model_id: Option<String>,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    /// search | inventory | write-tests | write-code | decisions.
+    pub dimension: String,
+    /// accepted | rejected | aborted | note | seed. `blocked` is written by the sidekick only.
+    /// seed sets the trust value directly: only for search and inventory, needs `seed_value`.
+    pub outcome: String,
+    /// global (default) | repo:<name> | module:<repo>/<path>.
+    pub scope: Option<String>,
+    pub job_id: Option<String>,
+    pub steps: Option<i64>,
+    pub duration_s: Option<f64>,
+    /// Seconds the control model spent reviewing the result.
+    pub review_s: Option<f64>,
+    /// 0..1, only for outcome seed.
+    pub seed_value: Option<f64>,
+    pub summary: Option<String>,
+    pub conclusion: Option<String>,
+    /// private (default; summary and conclusion never leave this machine) | shared.
+    pub visibility: Option<String>,
+}
+
+/// Parameters of `sidekick_query`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+pub struct QueryParams {
+    /// Read-only SQL over the tables `models`, `protected` and `experiences`.
+    pub sql: String,
+}
+
+/// Parameters of `sidekick_dispatch`.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+pub struct DispatchParams {
+    /// Self-contained task for the agent.
+    pub prompt: String,
+    /// Git repository the job works on (the agent gets its own worktree of it). Default: the
+    /// server's current directory.
+    pub cwd: Option<String>,
+    /// search | inventory | write-tests | write-code | decisions.
+    pub dimension: String,
+    /// global (default) | repo:<name> | module:<repo>/<path>.
+    pub scope: Option<String>,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    /// Name of the job's worktree and branch (`sidekick/<job_id>`). Default: generated.
+    pub job_id: Option<String>,
+    pub max_turns: Option<u32>,
+    pub timeout_s: Option<u64>,
+    /// Identity overrides for the registry lookup (default: derived from the backend).
+    pub provider: Option<String>,
+    pub checkpoint: Option<String>,
+    pub quant: Option<String>,
 }
 
 /// Validate `params` and apply defaults from `cfg`. `base_dir` resolves relative `cwd`s,
@@ -922,6 +995,7 @@ struct State {
     shutdown: CancellationToken,
     /// Backend name -> end of its rate-limit cooldown.
     cooldowns: std::sync::Mutex<CooldownMap>,
+    data: std::sync::OnceLock<Arc<DataStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -968,6 +1042,33 @@ fn redact_with(secrets: &[Secrets], text: &str) -> String {
     out
 }
 
+fn format_dispatch(r: &DispatchResult) -> String {
+    let mut s = format!(
+        "status: {:?}\nmodel_id: {}\nwrite_right: {}\nwrite_tools_withheld: {}\nsperre: {}\nduration_s: {:.1}\nexit_code: {:?}\nlog: {}\n",
+        r.status, r.model_id, r.write_right, r.write_tools_withheld, r.sperre.as_str(), r.duration_s, r.exit_code, r.log_path.display()
+    );
+    let opt = |s: &mut String, k: &str, v: Option<String>| {
+        if let Some(v) = v {
+            let _ = writeln!(s, "{k}: {v}");
+        }
+    };
+    opt(&mut s, "sperre_note", r.sperre_note.clone());
+    opt(&mut s, "branch", r.branch.clone());
+    opt(&mut s, "patch", r.patch_path.as_ref().map(|p| p.display().to_string()));
+    opt(&mut s, "block_reason", r.block_reason.clone());
+    opt(&mut s, "evidence_hash", r.evidence_hash.clone());
+    opt(&mut s, "event_id", r.event_id.clone());
+    let _ = writeln!(s, "applied: {}\ndiff_discarded: {}", r.applied, r.diff_discarded);
+    if !r.unsupported_limits.is_empty() {
+        let _ = writeln!(s, "limits not enforced by this harness: {}", r.unsupported_limits.join(", "));
+    }
+    for w in &r.warnings {
+        let _ = writeln!(s, "warning: {w}");
+    }
+    let _ = write!(s, "--- output tail ---\n{}", r.tail);
+    s
+}
+
 #[tool_router]
 impl SidekickServer {
     /// Server state for `config`; `config_error` is the error of `Config::load` (then
@@ -997,6 +1098,7 @@ impl SidekickServer {
                 per_backend: std::sync::Mutex::default(),
                 shutdown: CancellationToken::new(),
                 cooldowns: std::sync::Mutex::default(),
+                data: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -1295,12 +1397,314 @@ impl SidekickServer {
         let text = self.status_text(&snap, located, tokens);
         Ok(text_result(redact_all(&text), false))
     }
+
+    /// Steckbrief (profile) of a model: registry data, harness limits not enforced, trust per
+    /// dimension and scope with counters, last block, review share, write and decisions right,
+    /// cost balance and the newest conclusions. Read this before choosing what to delegate.
+    #[tool]
+    async fn sidekick_steckbrief(
+        &self,
+        Parameters(p): Parameters<SteckbriefParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let snap = self.state.refresh();
+        let store = match self.store(&snap).await {
+            Ok(s) => s,
+            Err(e) => return tool_error(e),
+        };
+        let scope = match p.scope.as_deref().map(Scope::parse).transpose() {
+            Ok(s) => s.unwrap_or(Scope::Global),
+            Err(e) => return tool_error(format!("{e:#}")),
+        };
+        let (id, backend) = match Self::model_id_for(&snap, p.model_id, p.backend.as_deref(), p.model.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return tool_error_with(&snap, e),
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let built = blocking(move || {
+            store.data.steckbrief(&id, &scope, Some(&store.local_root), now).map(|s| s.render()).map_err(|e| format!("{e:#}"))
+        })
+        .await;
+        match built {
+            Ok(Ok(mut text)) => {
+                if let Some(b) = backend {
+                    let unsupported = dispatch::unsupported_limits(&b);
+                    if !unsupported.is_empty() {
+                        let _ = write!(text, "\nharness limits not enforced: {}", unsupported.join(", "));
+                    }
+                }
+                Ok(text_result(redact_all(&text), false))
+            }
+            Ok(Err(e)) | Err(e) => tool_error(e),
+        }
+    }
+
+    /// Write one experience event about a delegated job: outcome accepted | rejected | aborted |
+    /// note | seed, with review_s (your review time), conclusion and visibility (private by
+    /// default). Trust is computed from these events; seed (search/inventory only) sets a value
+    /// directly. Pushes the event to the shared data repository when data_name is configured.
+    #[tool]
+    async fn sidekick_record_experience(
+        &self,
+        Parameters(p): Parameters<RecordParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let snap = self.state.refresh();
+        let store = match self.store(&snap).await {
+            Ok(s) => s,
+            Err(e) => return tool_error(e),
+        };
+        let (model_id, _) = match Self::model_id_for(&snap, p.model_id, p.backend.as_deref(), p.model.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return tool_error_with(&snap, e),
+        };
+        let input = (|| -> anyhow::Result<ExperienceInput> {
+            Ok(ExperienceInput {
+                model_id,
+                dimension: Dimension::parse(&p.dimension)?,
+                scope: p.scope.as_deref().map(Scope::parse).transpose()?.unwrap_or(Scope::Global),
+                outcome: Outcome::parse(&p.outcome)?,
+                job_id: p.job_id,
+                steps: p.steps,
+                duration_s: p.duration_s,
+                review_s: p.review_s,
+                seed_value: p.seed_value,
+                summary: p.summary,
+                conclusion: p.conclusion,
+                visibility: p.visibility.as_deref().map(Visibility::parse).transpose()?.unwrap_or(Visibility::Private),
+            })
+        })();
+        let input = match input {
+            Ok(i) => i,
+            Err(e) => return tool_error(format!("{e:#}")),
+        };
+        match blocking(move || store.record(input).map_err(|e| format!("{e:#}"))).await {
+            Ok(Ok((id, pushed))) => Ok(text_result(
+                format!("recorded event {id}; {}", if pushed { "pushed" } else { "not pushed (offline, rejected or data_name not set); sidekick_sync retries" }),
+                false,
+            )),
+            Ok(Err(e)) | Err(e) => tool_error(e),
+        }
+    }
+
+    /// Read-only SQL (DataFusion) over the tables models, protected and experiences (all
+    /// events: aggregate, shared experiences and the local log). Returns a text table.
+    #[tool]
+    async fn sidekick_query(&self, Parameters(p): Parameters<QueryParams>) -> Result<CallToolResult, McpError> {
+        let snap = self.state.refresh();
+        let store = match self.store(&snap).await {
+            Ok(s) => s,
+            Err(e) => return tool_error(e),
+        };
+        match store.data.query(Some(&store.local_root), &p.sql).await {
+            Ok(t) => Ok(text_result(redact_all(&t), false)),
+            Err(e) => tool_error(format!("{e:#}")),
+        }
+    }
+
+    /// Pull the shared data (registry, aggregate, other experiences) and push pending local
+    /// events. Offline is not an error; pending events are pushed on the next sync.
+    #[tool]
+    async fn sidekick_sync(&self) -> Result<CallToolResult, McpError> {
+        let snap = self.state.refresh();
+        let store = match self.store(&snap).await {
+            Ok(s) => s,
+            Err(e) => return tool_error(e),
+        };
+        match blocking(move || store.sync().map_err(|e| format!("{e:#}"))).await {
+            Ok(Ok(t)) => Ok(text_result(redact_all(&t), false)),
+            Ok(Err(e)) | Err(e) => tool_error(e),
+        }
+    }
+
+    /// Run a job in its own git worktree under the trust rules of the chosen backend's model:
+    /// without write right the agent gets no write tools; the diff is checked against protected
+    /// paths and terms and the scope limits. The result is a branch and patch (never applied,
+    /// except for the Gold model); violations discard the diff and record a block. Backends
+    /// without a registry row are rejected. Waits in the same queues as sidekick_run.
+    #[tool]
+    async fn sidekick_dispatch(
+        &self,
+        Parameters(p): Parameters<DispatchParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let state = &self.state;
+        let snap = state.refresh();
+        let backends = match &snap.backends {
+            Ok(b) => b,
+            Err(e) => return tool_error(config_invalid_message(e)),
+        };
+        let store = match self.store(&snap).await {
+            Ok(s) => s,
+            Err(e) => return tool_error(e),
+        };
+        let base_dir = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => return tool_error_with(&snap, format!("Cannot determine the server's current directory: {e}. Pass an absolute 'cwd'.")),
+        };
+        let home = crate::paths::home_dir().ok();
+        let parsed = (|| -> anyhow::Result<(Dimension, Scope)> {
+            Ok((Dimension::parse(&p.dimension)?, p.scope.as_deref().map(Scope::parse).transpose()?.unwrap_or(Scope::Global)))
+        })();
+        let (dimension, scope) = match parsed {
+            Ok(v) => v,
+            Err(e) => return tool_error(format!("{e:#}")),
+        };
+        let run_params = RunParams {
+            prompt: p.prompt.clone(),
+            cwd: p.cwd.clone(),
+            max_turns: p.max_turns,
+            model: p.model.clone(),
+            timeout_s: p.timeout_s,
+            ..Default::default()
+        };
+        let req = match resolve_request(run_params, &snap.config, &base_dir, home.as_deref()) {
+            Ok(r) => r,
+            Err(msg) => return tool_error_with(&snap, msg),
+        };
+        let backend = match select_backends(backends, p.backend.as_deref(), None) {
+            Ok((b, _)) => b,
+            Err(msg) => return tool_error_with(&snap, msg),
+        };
+        if let Err(msg) = backend.effective_model(req.model.as_deref()) {
+            return tool_error_with(&snap, msg);
+        }
+        if let Some(secs) = state.cooldown(&backend.name) {
+            return tool_error_with(&snap, format!("backend {} is rate limited, retry in {secs}s; choose another backend", backend.name));
+        }
+        let dreq = DispatchRequest {
+            prompt: req.prompt.clone(),
+            repo: req.cwd.clone(),
+            dimension,
+            scope,
+            job_id: p.job_id.clone().unwrap_or_else(|| format!("j-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])),
+            model: req.model.clone(),
+            max_turns: req.max_turns,
+            timeout: req.timeout,
+            identity: Identity { provider: p.provider, checkpoint: p.checkpoint, quant: p.quant },
+        };
+        let logs_dir = match crate::paths::logs_dir() {
+            Ok(d) => d,
+            Err(e) => return tool_error(format!("Cannot determine the logs directory: {e:#}")),
+        };
+        let dispatcher = Dispatcher {
+            data: store.data.clone(),
+            local_root: store.local_root.clone(),
+            work_dir: store.base.join("work"),
+            logs_dir,
+            machine_id: store.machine_id.clone(),
+            user_id: store.user_id.clone(),
+            launcher: dispatch::real_launcher(snap.config.claude_path.clone(), snap.config.pass_env.clone()),
+        };
+        let (cancel, _forward) = run_cancel_token(&ctx.ct, &state.shutdown);
+        let phase: SharedPhase = Arc::new(std::sync::Mutex::new(RunPhase::primary()));
+        let ticker = ctx.meta.get_progress_token().map(|token| {
+            spawn_progress_ticker(ctx.peer.clone(), token, phase.clone(), req.timeout, progress_interval())
+        });
+        let (backend_permit, global_permit) = match self.acquire_permits(&snap, backend, &cancel).await {
+            Ok(p) => p,
+            Err(msg) => return tool_error_with(&snap, msg),
+        };
+        if cancel.is_cancelled() || ctx.ct.is_cancelled() {
+            return tool_error_with(&snap, CANCELLED_QUEUED_MSG);
+        }
+        let counters = state.backend_counters(&backend.name);
+        let _running = CountGuard::all([&state.counters.running, &counters.running]);
+        with_phase(&phase, |p| p.started = Some(Instant::now()));
+        tracing::info!(backend = %backend.name, job = %dreq.job_id, "sidekick_dispatch started");
+        let outcome = dispatcher.run(backend, &dreq, cancel.clone()).await;
+        drop(global_permit);
+        drop(backend_permit);
+        drop(ticker);
+        let (result, event) = match outcome {
+            Ok(v) => v,
+            Err(e) => return tool_error_with(&snap, format!("{e:#}")),
+        };
+        let mut text = format_dispatch(&result);
+        if let Some(event) = event {
+            match blocking(move || store.append(event).map_err(|e| format!("{e:#}"))).await {
+                Ok(Ok((_, pushed))) => {
+                    if !pushed {
+                        text.push_str("\nnote: event stored locally, not pushed yet (sidekick_sync retries)");
+                    }
+                }
+                Ok(Err(e)) | Err(e) => {
+                    let _ = write!(text, "\nwarning: event could not be recorded: {e}");
+                }
+            }
+        }
+        Ok(text_result(redact_all(&text), result.status == dispatch::Status::Blocked))
+    }
 }
 
 type LocateResult = Result<Result<Located, LocateError>, String>;
 type TokenResults = Result<Vec<(SecretId, Result<(Token, TokenSource), TokenError>)>, String>;
 
 impl SidekickServer {
+    async fn acquire_permits(
+        &self,
+        snap: &Snapshot,
+        backend: &Backend,
+        cancel: &CancellationToken,
+    ) -> Result<(Option<OwnedSemaphorePermit>, OwnedSemaphorePermit), String> {
+        let st = &self.state;
+        let counters = st.backend_counters(&backend.name);
+        let _queued = CountGuard::all([&st.counters.queued, &counters.queued]);
+        let backend_permit = match snap.per_backend.get(&backend.name) {
+            None => None,
+            Some(sem) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    tracing::info!("sidekick_run cancelled while queued");
+                    return Err(CANCELLED_QUEUED_MSG.into());
+                }
+                p = sem.semaphore.clone().acquire_owned() => match p {
+                    Ok(p) => Some(p),
+                    Err(_) => return Err("Server is shutting down.".into()),
+                },
+            },
+        };
+        let global_permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::info!("sidekick_run cancelled while queued");
+                return Err(CANCELLED_QUEUED_MSG.into());
+            }
+            p = snap.global.semaphore.clone().acquire_owned() => match p {
+                Ok(p) => p,
+                Err(_) => return Err("Server is shutting down.".into()),
+            },
+        };
+        Ok((backend_permit, global_permit))
+    }
+
+    async fn store(&self, snap: &Snapshot) -> Result<Arc<DataStore>, String> {
+        if let Some(s) = self.state.data.get() {
+            return Ok(s.clone());
+        }
+        let base = crate::paths::data_dir().map_err(|e| format!("{e:#}"))?;
+        let (remote, name) = (snap.config.data_remote.clone(), snap.config.data_name.clone());
+        let opened = blocking(move || {
+            DataStore::open(&base, &remote, name.as_deref()).map(Arc::new).map_err(|e| format!("data store: {e:#}"))
+        })
+        .await??;
+        Ok(self.state.data.get_or_init(|| opened).clone())
+    }
+
+    fn model_id_for(
+        snap: &Snapshot,
+        model_id: Option<String>,
+        backend: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<(String, Option<Backend>), String> {
+        if let Some(id) = model_id.filter(|i| !i.trim().is_empty()) {
+            return Ok((id.trim().to_string(), None));
+        }
+        let backends = snap.backends.as_ref().map_err(|e| config_invalid_message(e))?;
+        let (b, _) = select_backends(backends, backend, None)?;
+        let model = b.effective_model(model.map(str::trim).filter(|m| !m.is_empty()))?;
+        let id = Identity::default().key(b, model.as_deref()).model_id();
+        Ok((id, Some(b.clone())))
+    }
+
     /// One attempt to run `backend`: credentials, program, endpoint probe, launch, permits
     /// (per backend first, then global; both cancellable), run. Secrets of the attempt are
     /// added to `secrets` for redaction of the result.
@@ -1369,35 +1773,11 @@ impl SidekickServer {
         };
 
         let counters = st.backend_counters(&backend.name);
-        let (backend_permit, global_permit) = {
-            let _queued = CountGuard::all([&st.counters.queued, &counters.queued]);
-            let backend_permit = match snap.per_backend.get(&backend.name) {
-                None => None,
-                Some(sem) => tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        tracing::info!("sidekick_run cancelled while queued");
-                        return Attempt::Stopped(CANCELLED_QUEUED_MSG.into());
-                    }
-                    p = sem.semaphore.clone().acquire_owned() => match p {
-                        Ok(p) => Some(p),
-                        Err(_) => return Attempt::Stopped("Server is shutting down.".into()),
-                    },
-                },
+        let (backend_permit, global_permit) =
+            match self.acquire_permits(snap, backend, cancel).await {
+                Ok(p) => p,
+                Err(msg) => return Attempt::Stopped(msg),
             };
-            let global_permit = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    tracing::info!("sidekick_run cancelled while queued");
-                    return Attempt::Stopped(CANCELLED_QUEUED_MSG.into());
-                }
-                p = snap.global.semaphore.clone().acquire_owned() => match p {
-                    Ok(p) => p,
-                    Err(_) => return Attempt::Stopped("Server is shutting down.".into()),
-                },
-            };
-            (backend_permit, global_permit)
-        };
         // The token may have fired while the permit was being handed over: never spawn then.
         // Check the request token directly as well: the forwarder may not have run yet.
         if cancel.is_cancelled() || request_ct.is_cancelled() {
@@ -1733,6 +2113,7 @@ pub async fn serve() -> anyhow::Result<()> {
             SidekickServer::new(Config::default(), Some(msg))
         }
     };
+    let pull_server = server.clone();
     let snap = server.state.snapshot();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -1741,7 +2122,23 @@ pub async fn serve() -> anyhow::Result<()> {
         default_timeout_s = snap.config.default_timeout_s,
         "agent-sidekick MCP server starting on stdio"
     );
+    let pull_snap = snap.clone();
     drop(snap);
+    tokio::spawn(async move {
+        let wanted = pull_snap.config.data_name.is_some()
+            || crate::paths::data_dir().is_ok_and(|d| DataStore::checkout_exists(&d));
+        if !wanted {
+            return;
+        }
+        match pull_server.store(&pull_snap).await {
+            Ok(store) => match blocking(move || store.pull()).await {
+                Ok(Err(e)) => tracing::warn!("data pull failed, using local data: {e:#}"),
+                Err(e) => tracing::warn!("data pull failed: {e}"),
+                Ok(Ok(())) => {}
+            },
+            Err(e) => tracing::warn!("data store unavailable: {e}"),
+        }
+    });
 
     let state = server.state.clone();
     let service = server
