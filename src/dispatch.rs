@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::backends::{self, Backend, BackendKind, PermissionMode};
+use crate::backends::{self, Backend, BackendKind, OpencodeProvider, PermissionMode};
 use crate::data::{DataDir, ProtectedKind, ProtectedRow, SessionLog};
 use crate::harness::HarnessKind;
 use crate::runner::{self, Launch, RunRequest};
@@ -62,16 +62,22 @@ pub fn harness_name(backend: &Backend) -> &'static str {
     }
 }
 
+fn url_host(base_url: &str) -> String {
+    base_url
+        .split("://")
+        .last()
+        .and_then(|r| r.split(['/', ':']).next())
+        .filter(|h| !h.is_empty())
+        .unwrap_or("endpoint")
+        .into()
+}
+
 fn default_provider(backend: &Backend) -> String {
     match &backend.kind {
         BackendKind::ClaudeOauth { .. } => "anthropic".into(),
-        BackendKind::ClaudeEndpoint { base_url, .. } => base_url
-            .split("://")
-            .last()
-            .and_then(|r| r.split(['/', ':']).next())
-            .unwrap_or("endpoint")
-            .into(),
+        BackendKind::ClaudeEndpoint { base_url, .. } => url_host(base_url),
         BackendKind::Codex { .. } => "openai".into(),
+        BackendKind::OpenCode { provider: OpencodeProvider::OpenaiCompatible, base_url: Some(url), .. } => url_host(url),
         BackendKind::OpenCode { provider, .. } => provider.as_str().into(),
         BackendKind::Command { command, .. } => Path::new(&command[0])
             .file_name()
