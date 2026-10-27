@@ -1,6 +1,6 @@
 {
   "name": "agent-sidekick",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Registers the agent-sidekick MCP server (sidekick_run, sidekick_backends, sidekick_status) for an already installed agent-sidekick binary, plus a skill on when to delegate",
   "author": {
     "name": "AAPPHH",

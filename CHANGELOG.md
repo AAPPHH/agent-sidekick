@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-27
+
+### Added
+
+- Job-bound verdicts: every `sidekick_dispatch` appends one event to the own session log (outcome `note`, or the blocked/aborted event) with job_id, model_id, dimension, scope, repo, duration and the time the result was returned. `sidekick_record_experience` takes `job_id`: model, dimension, scope, repo, steps and duration come from that event, `review_s` is measured, the caller supplies only `accepted|rejected`, `conclusion` and `visibility`. One verdict per job, none for blocked jobs. The free-form path stays for seeds and notes.
+- Proposal mode: write-tests and write-code jobs below the write threshold still get no write tools, but are asked for the complete change as one unified diff between `<<<SIDEKICK-PATCH` and `SIDEKICK-PATCH>>>`. The sidekick checks (`git apply --check`) and applies it only in the job worktree, runs the same mechanical diff check and returns branch and patch for review, never applied to the target. No or invalid patch gives the new status `NoPatch` with the reason and no trust change.
+
+### Changed
+
+- `sidekick_run` on a backend and model with a registry row requires `dimension` (optional `scope`) and runs the dispatch path. Unregistered backends run as before, without trust effect.
+- `record_experience` says what was pushed (numbers only for private events); `sidekick_sync` likewise. The Steckbrief shows the last block as a UTC date, never prints `-0s`, and marks missing write right as "nein (Vorschlagsmodus)" for write-code and write-tests.
+
 ## [0.7.1] - 2026-10-27
 
 ### Fixed

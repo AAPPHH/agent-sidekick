@@ -608,6 +608,10 @@ pub struct Steckbrief {
     pub conclusions: Vec<Conclusion>,
 }
 
+fn utc(ts_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms).map_or_else(|| ts_ms.to_string(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+}
+
 impl Steckbrief {
     pub fn build(model: &ModelRow, events: &[Event], scope: &Scope, now_ms: i64) -> Self {
         let standing = Standing::compute(&model.key, model.sperre, events, now_ms);
@@ -658,6 +662,7 @@ impl Steckbrief {
     pub fn render(&self) -> String {
         let k = &self.model.key;
         let yes = |b: bool| if b { "ja" } else { "nein" };
+        let write = |b: bool| if b { "ja" } else { "nein (Vorschlagsmodus)" };
         let num = |v: Option<i64>| v.map_or("-".to_string(), |v| v.to_string());
         let mut out = format!(
             "Steckbrief {} ({}/{}, checkpoint {}, quant {}, harness {}){}\nScope: {}\nKosten: {}, Sperre: {}, max_steps {}, tool_output_lines {}, context_budget_tokens {}, context_tokens {}\n",
@@ -686,17 +691,17 @@ impl Steckbrief {
                 out.push_str(" [manuell gesetzt]");
             }
             if let Some(b) = &r.last_block {
-                out.push_str(&format!(" [letzter Block ts {} \"{}\"]", b.ts_ms, b.reason));
+                out.push_str(&format!(" [letzter Block {} \"{}\"]", utc(b.ts_ms), b.reason));
             }
             out.push('\n');
         }
         out.push_str(&format!(
-            "Schreibrecht write-code: {}, write-tests: {}, Entscheidungsrecht: {}\nKostenbilanz: Laufzeit {:.0}s, Review {:.0}s\n",
-            yes(self.write_right_code),
-            yes(self.write_right_tests),
+            "Schreibrecht write-code: {}, write-tests: {}, Entscheidungsrecht: {}\nKostenbilanz: Laufzeit {}s, Review {}s\n",
+            write(self.write_right_code),
+            write(self.write_right_tests),
             yes(self.decisions_right),
-            self.duration_s,
-            self.review_s
+            self.duration_s.round() as i64,
+            self.review_s.round() as i64
         ));
         for c in &self.conclusions {
             out.push_str(&format!("Fazit ({}, ts {}): {}\n", c.scope, c.ts_ms, c.text));
@@ -838,6 +843,9 @@ mod tests {
         assert!(text.contains("Validierung decided_by entfernt"));
         assert!(text.contains("Schreibrecht write-code: nein"));
         assert!(text.contains("Fazit (global"));
+        assert!(text.contains("write-tests: nein (Vorschlagsmodus)"));
+        assert!(text.contains(" UTC \"Validierung"), "{text}");
+        assert!(!text.contains("-0s"));
         assert_eq!(sb.duration_s, 142.0);
         assert!(!sb.write_right_code && !sb.decisions_right);
     }
