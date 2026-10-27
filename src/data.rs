@@ -152,18 +152,19 @@ pub struct Profile {
     pub benchmarks: Option<String>,
     pub sources: Option<String>,
     pub profile_as_of: Option<String>,
+    pub prompting: Option<String>,
 }
 
 impl Profile {
-    pub const COLUMNS: [&'static str; 7] = ["strengths", "weaknesses", "task_scope", "dims_prior", "benchmarks", "sources", "profile_as_of"];
+    pub const COLUMNS: [&'static str; 8] = ["strengths", "weaknesses", "task_scope", "dims_prior", "benchmarks", "sources", "profile_as_of", "prompting"];
 
-    pub fn fields(&self) -> [&Option<String>; 7] {
-        [&self.strengths, &self.weaknesses, &self.task_scope, &self.dims_prior, &self.benchmarks, &self.sources, &self.profile_as_of]
+    pub fn fields(&self) -> [&Option<String>; 8] {
+        [&self.strengths, &self.weaknesses, &self.task_scope, &self.dims_prior, &self.benchmarks, &self.sources, &self.profile_as_of, &self.prompting]
     }
 
     fn read(r: &Row) -> Self {
-        let [strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of] = Self::COLUMNS.map(|c| r.str(c));
-        Self { strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of }
+        let [strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of, prompting] = Self::COLUMNS.map(|c| r.str(c));
+        Self { strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of, prompting }
     }
 
     pub fn render(&self) -> String {
@@ -174,6 +175,7 @@ impl Profile {
             ("Einschätzung je Dimension (abgeleitet aus öffentlichen Daten, nicht gemessen)", &self.dims_prior),
             ("Benchmarks", &self.benchmarks),
             ("Quellen", &self.sources),
+            ("Formulierung", &self.prompting),
         ];
         if rows.iter().all(|(_, v)| v.is_none()) {
             return String::new();
@@ -219,6 +221,7 @@ impl ModelRow {
             ("benchmarks", DataType::Utf8, true),
             ("sources", DataType::Utf8, true),
             ("profile_as_of", DataType::Utf8, true),
+            ("prompting", DataType::Utf8, true),
         ])
     }
 
@@ -999,6 +1002,7 @@ mod tests {
             benchmarks: Some("X 1 (src, 2026-01-01, vendor)".into()),
             sources: Some("https://a ; https://b".into()),
             profile_as_of: Some("2026-10-27".into()),
+            prompting: Some("XML-Tags, Ziel zuerst".into()),
         }
     }
 
@@ -1043,6 +1047,7 @@ mod tests {
         assert!(fixed.contains("Kosten:") && !fixed.contains("search @"), "{text}");
         assert!(rest.contains("- Stärken: stark") && rest.contains("- Schwächen: schwach") && rest.contains("- Umfang: klein"));
         assert!(rest.contains("- Einschätzung je Dimension (abgeleitet aus öffentlichen Daten, nicht gemessen): search=mittel"));
+        assert!(rest.contains("- Formulierung: XML-Tags, Ziel zuerst"));
         assert!(rest.contains("- Benchmarks: X 1") && rest.contains("- Quellen: https://a ; https://b"));
         assert_eq!(text.replace(&with.profile.as_ref().unwrap().render(), ""), plain.render());
     }

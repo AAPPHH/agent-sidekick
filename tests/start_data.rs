@@ -107,6 +107,7 @@ fn load_profiles(path: &Path) -> HashMap<String, Profile> {
             benchmarks: text("benchmarks"),
             sources: text("sources"),
             profile_as_of: text("profile_as_of").or_else(|| default_as_of.clone()),
+            prompting: text("prompting"),
         };
         assert!(out.insert(id, profile).is_none(), "duplicate profile {provider}/{model}");
     }
