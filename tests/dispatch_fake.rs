@@ -338,3 +338,68 @@ async fn term_moved_between_non_ascii_files_is_a_removal() {
     assert_eq!(r.status, Status::Blocked);
     assert!(r.violations.iter().any(|v| v.contains("removed protected term `assert` in src/\u{e4}.rs")), "{:?}", r.violations);
 }
+
+fn proposal(body: &str) -> String {
+    format!("cat <<'PATCHEOF'\nI propose this.\n<<<SIDEKICK-PATCH\n{body}SIDEKICK-PATCH>>>\nPATCHEOF\n")
+}
+
+const NEW_FILE: &str = "diff --git a/src/b.rs b/src/b.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/b.rs\n@@ -0,0 +1 @@\n+fn b() {}\n";
+const NEW_TEST: &str = "diff --git a/tests/new.rs b/tests/new.rs\nnew file mode 100644\n--- /dev/null\n+++ b/tests/new.rs\n@@ -0,0 +1 @@\n+fn t() {}\n";
+const DROP_ASSERT: &str = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn a() { assert!(x); let decided_by = 1; }\n+fn a() { let decided_by = 1; }\n";
+
+#[tokio::test]
+async fn proposal_mode_returns_patch_without_applying_to_the_target() {
+    let mut e = env("m-p1", true, 0, &proposal(NEW_FILE));
+    let r = run(&mut e, "m-p1", Dimension::WriteCode, "p1").await;
+    assert!(!r.write_right && r.write_tools_withheld && r.proposal_mode);
+    assert_eq!(r.status, Status::Completed);
+    assert!(!r.applied);
+    assert_eq!(r.branch.as_deref(), Some("sidekick/p1"));
+    assert!(std::fs::read_to_string(r.patch_path.as_ref().unwrap()).unwrap().contains("+fn b() {}"));
+    assert!(!e.repo.join("src/b.rs").exists());
+    assert_eq!(e.log.events().len(), 1);
+    assert_eq!(e.log.events()[0].outcome, Outcome::Note);
+    let args = std::fs::read_to_string(e.dir.path().join("args.txt")).unwrap();
+    assert!(args.contains("<<<SIDEKICK-PATCH"));
+    assert!(args.lines().any(|l| l == "--disallowedTools"));
+}
+
+#[tokio::test]
+async fn proposal_touching_protected_paths_or_terms_is_blocked() {
+    let mut e = env("m-p2", true, 0, &proposal(NEW_TEST));
+    let r = run(&mut e, "m-p2", Dimension::WriteCode, "p2").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.violations.iter().any(|v| v.contains("protected path tests/new.rs")));
+    assert!(r.branch.is_none() && branches(&e.repo).is_empty());
+    assert_eq!(e.log.events()[0].outcome, Outcome::Blocked);
+
+    let mut e = env("m-p2", true, 0, &proposal(DROP_ASSERT));
+    let r = run(&mut e, "m-p2", Dimension::WriteCode, "p3").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.violations.iter().any(|v| v.contains("removed protected term `assert`")));
+    assert_eq!(std::fs::read_to_string(e.repo.join("src/lib.rs")).unwrap(), SRC);
+}
+
+#[tokio::test]
+async fn proposal_garbage_is_no_patch_without_trust_change() {
+    for (i, action) in ["echo 'no patch here'\n".to_string(), proposal("this is not a diff\n"), proposal("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-nope\n+nope2\n")]
+        .iter()
+        .enumerate()
+    {
+        let mut e = env("m-p4", true, 0, action);
+        let r = run(&mut e, "m-p4", Dimension::WriteCode, &format!("g{i}")).await;
+        assert_eq!(r.status, Status::NoPatch, "{i}");
+        assert!(r.reason.is_some() && r.branch.is_none());
+        assert!(branches(&e.repo).is_empty());
+        assert_eq!(e.log.events().len(), 1);
+        assert_eq!(e.log.events()[0].outcome, Outcome::Note);
+    }
+}
+
+#[tokio::test]
+async fn real_diff_without_write_right_stays_blocked_in_proposal_mode() {
+    let mut e = env("m-p5", true, 0, &format!("printf 'fn b() {{}}\\n' > src/b.rs\n{}", proposal(NEW_FILE)));
+    let r = run(&mut e, "m-p5", Dimension::WriteCode, "p5").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.diff_discarded);
+}

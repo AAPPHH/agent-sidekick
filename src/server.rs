@@ -1075,6 +1075,10 @@ fn format_dispatch(r: &DispatchResult) -> String {
     opt(&mut s, "branch", r.branch.clone());
     opt(&mut s, "patch", r.patch_path.as_ref().map(|p| p.display().to_string()));
     opt(&mut s, "block_reason", r.block_reason.clone());
+    opt(&mut s, "reason", r.reason.clone());
+    if r.proposal_mode {
+        s.push_str("mode: Vorschlagsmodus (no write right; the proposed diff was applied only in the job worktree)\n");
+    }
     opt(&mut s, "evidence_hash", r.evidence_hash.clone());
     opt(&mut s, "event_id", r.event_id.clone());
     let _ = writeln!(s, "applied: {}\ndiff_discarded: {}", r.applied, r.diff_discarded);

@@ -19,6 +19,9 @@ pub const TEST_GLOBS: [&str; 2] = ["tests/**", "spec/**"];
 pub const WRITE_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"];
 pub const READ_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
 pub const MAX_TURNS_MARKER: &str = "reached max turns";
+pub const PATCH_BEGIN: &str = "<<<SIDEKICK-PATCH";
+pub const PATCH_END: &str = "SIDEKICK-PATCH>>>";
+pub const PROPOSAL_INSTRUCTION: &str = "You have no write tools in this job. Do not try to modify files. Return the complete change as one unified diff (git format, paths relative to the repository root, a/ and b/ prefixes) in your final answer, between a line containing only <<<SIDEKICK-PATCH and a line containing only SIDEKICK-PATCH>>>. Nothing else may be inside the markers.";
 pub const BRANCH_PREFIX: &str = "sidekick/";
 pub(crate) const GIT_IDENT: [&str; 4] = ["-c", "user.name=agent-sidekick", "-c", "user.email=agent-sidekick@localhost"];
 
@@ -130,6 +133,28 @@ pub fn withhold_writes(backend: &Backend) -> Backend {
         BackendKind::Command { .. } => {}
     }
     b
+}
+
+pub fn extract_patch(text: &str) -> Result<String, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let end_after = |i: usize| lines[i + 1..].iter().position(|l| l.trim() == PATCH_END).map(|j| i + 1 + j);
+    let (begin, end) = (0..lines.len())
+        .rev()
+        .filter(|&i| lines[i].trim() == PATCH_BEGIN)
+        .find_map(|i| end_after(i).map(|j| (i, j)))
+        .ok_or("no complete patch between the SIDEKICK-PATCH markers")?;
+    let mut body = &lines[begin + 1..end];
+    while body.first().is_some_and(|l| l.trim_start().starts_with("```")) {
+        body = &body[1..];
+    }
+    while body.last().is_some_and(|l| l.trim_start().starts_with("```")) {
+        body = &body[..body.len() - 1];
+    }
+    let patch = body.join("\n");
+    if !patch.lines().any(|l| l.starts_with("--- ")) || !patch.lines().any(|l| l.starts_with("+++ ")) {
+        return Err("the text between the markers is not a unified diff".into());
+    }
+    Ok(format!("{patch}\n"))
 }
 
 pub fn glob_match_path(pattern: &str, path: &str) -> bool {
@@ -269,6 +294,7 @@ impl DiffChecker<'_> {
 pub enum Status {
     Completed,
     NoChange,
+    NoPatch,
     Blocked,
     Aborted,
 }
@@ -302,6 +328,8 @@ pub struct DispatchResult {
     pub violations: Vec<String>,
     pub warnings: Vec<String>,
     pub block_reason: Option<String>,
+    pub reason: Option<String>,
+    pub proposal_mode: bool,
     pub evidence_hash: Option<String>,
     pub event_id: Option<String>,
     pub exit_code: Option<i32>,
@@ -422,9 +450,10 @@ impl Dispatcher {
             (HarnessKind::Claude | HarnessKind::OpenCode, Some(m)) if m > 0 => req.max_turns.min(m as u32),
             _ => req.max_turns,
         };
+        let proposal = req.dimension.is_write() && !write_right;
         let wt = Worktree::create(&req.repo, &self.work_dir, &req.job_id)?;
         let run_req = RunRequest {
-            prompt: req.prompt.clone(),
+            prompt: if proposal { format!("{}\n\n{PROPOSAL_INSTRUCTION}", req.prompt) } else { req.prompt.clone() },
             cwd: wt.path.clone(),
             max_turns,
             model,
@@ -458,6 +487,8 @@ impl Dispatcher {
             violations: Vec::new(),
             warnings: Vec::new(),
             block_reason: None,
+            reason: None,
+            proposal_mode: proposal,
             evidence_hash: None,
             event_id: None,
             exit_code: outcome.exit_code,
@@ -472,7 +503,35 @@ impl Dispatcher {
         event.duration_s = Some(result.duration_s);
         let finished = (|| -> Result<()> {
             let aborted = outcome.timed_out || outcome.cancelled || outcome.output.to_lowercase().contains(MAX_TURNS_MARKER);
-            let files = wt.files()?;
+            let mut files = wt.files()?;
+            let mut proposed = false;
+            if proposal && files.is_empty() && !aborted {
+                let raw = runner::read_logged_output(&outcome.log_path, outcome.output_offset).unwrap_or_else(|| outcome.output.clone());
+                let text = backend.harness().normalize_output(&raw).map_or(raw, |n| n.text);
+                let applied = extract_patch(&text).and_then(|patch| {
+                    let proposal_path = self.work_dir.join("patches").join(format!("{}.proposal", req.job_id));
+                    std::fs::create_dir_all(proposal_path.parent().unwrap()).map_err(|e| e.to_string())?;
+                    std::fs::write(&proposal_path, patch).map_err(|e| e.to_string())?;
+                    let arg = proposal_path.to_string_lossy().into_owned();
+                    let done = git(&wt.path, &["apply", "--check", "--whitespace=nowarn", &arg])
+                        .and_then(|_| git(&wt.path, &["apply", "--whitespace=nowarn", &arg]))
+                        .map_err(|e| format!("proposed patch does not apply: {e:#}"));
+                    let _ = std::fs::remove_file(&proposal_path);
+                    done
+                });
+                match applied {
+                    Ok(_) => {
+                        files = wt.files()?;
+                        proposed = true;
+                    }
+                    Err(reason) => {
+                        result.status = Status::NoPatch;
+                        result.reason = Some(reason);
+                        wt.remove(true);
+                        return Ok(());
+                    }
+                }
+            }
             if files.is_empty() {
                 if aborted {
                     result.status = Status::Aborted;
@@ -484,7 +543,7 @@ impl Dispatcher {
                 return Ok(());
             }
             let patch = wt.diff("-U3")?;
-            if !write_right {
+            if !write_right && !proposed {
                 let reason = format!("diff without write right ({}): {}", req.dimension, files.join(", "));
                 result.status = Status::Blocked;
                 result.diff_discarded = true;
