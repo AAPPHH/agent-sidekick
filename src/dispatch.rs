@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backends::{self, Backend, BackendKind, OpencodeProvider, PermissionMode};
 use crate::data::{DataDir, ModelRow, ProtectedKind, ProtectedRow, SessionLog};
+use crate::harness::claude::{model_matches, parse_report};
 use crate::harness::HarnessKind;
 use crate::runner::{self, Launch, RunRequest};
 use crate::trust::{Dimension, Event, ModelKey, Outcome, Scope, Sperre, Standing};
@@ -19,6 +20,7 @@ pub const TEST_GLOBS: [&str; 2] = ["tests/**", "spec/**"];
 pub const WRITE_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"];
 pub const READ_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
 pub const MAX_TURNS_MARKER: &str = "reached max turns";
+pub const MAX_TURNS_SUBTYPE: &str = "error_max_turns";
 pub const PATCH_BEGIN: &str = "<<<SIDEKICK-PATCH";
 pub const PATCH_END: &str = "SIDEKICK-PATCH>>>";
 pub const PROPOSAL_INSTRUCTION: &str = "You have no write tools in this job. Do not try to modify files. Return the complete change as one unified diff (git format, paths relative to the repository root, a/ and b/ prefixes) in your final answer, between a line containing only <<<SIDEKICK-PATCH and a line containing only SIDEKICK-PATCH>>>. Nothing else may be inside the markers.";
@@ -47,10 +49,28 @@ pub struct Identity {
     pub quant: Option<String>,
 }
 
+pub const CLAUDE_ALIASES: [(&str, &str); 4] = [
+    ("opus", "claude-opus-5-5"),
+    ("sonnet", "claude-sonnet-5-5"),
+    ("haiku", "claude-haiku-5-5"),
+    ("fable", "claude-fable-5-1"),
+];
+
+pub fn resolve_claude_alias(model: &str) -> String {
+    CLAUDE_ALIASES.iter().find(|(alias, _)| *alias == model).map_or(model, |(_, id)| id).to_string()
+}
+
+pub fn expected_claude_model(backend: &Backend, model: Option<&str>) -> Option<String> {
+    matches!(backend.kind, BackendKind::ClaudeOauth { .. })
+        .then(|| model.or(backend.model.as_deref()).map(resolve_claude_alias))
+        .flatten()
+}
+
 impl Identity {
     pub fn key(&self, backend: &Backend, model: Option<&str>) -> ModelKey {
         let provider = default_provider(backend);
-        let model = model.unwrap_or("default");
+        let resolved = expected_claude_model(backend, model);
+        let model = resolved.as_deref().or(model).unwrap_or("default");
         let checkpoint = self.checkpoint.as_deref().unwrap_or(model);
         let quant = self.quant.as_deref().unwrap_or("none");
         ModelKey::new(&provider, model, checkpoint, quant, harness_name(backend))
@@ -446,6 +466,8 @@ impl Dispatcher {
         let protected = self.data.protected()?;
         let limited = with_registry_limits(backend, &row);
         let prepared = if write_right { limited } else { withhold_writes(&limited) };
+        let expected = expected_claude_model(backend, model.as_deref());
+        let model = expected.clone().or(model);
         let max_turns = match (backend.harness_kind(), row.max_steps) {
             (HarnessKind::Claude | HarnessKind::OpenCode, Some(m)) if m > 0 => req.max_turns.min(m as u32),
             _ => req.max_turns,
@@ -460,7 +482,14 @@ impl Dispatcher {
             allowed_tools: (!write_right).then(|| READ_TOOLS.map(String::from).to_vec()),
             timeout: req.timeout,
         };
-        let launched = (self.launcher)(&prepared, &run_req).map_err(|e| anyhow!(e));
+        let json_output = matches!(backend.kind, BackendKind::ClaudeOauth { .. });
+        let launched = (self.launcher)(&prepared, &run_req).map(|mut l| {
+            if json_output {
+                let at = if l.args.len() >= 2 && l.args[l.args.len() - 2] == "--" { l.args.len() - 2 } else { l.args.len() };
+                l.args.splice(at..at, ["--output-format".into(), "json".into()]);
+            }
+            l
+        }).map_err(|e| anyhow!(e));
         let outcome = match launched {
             Ok(launch) => runner::run_launch(launch, run_req, &self.logs_dir, cancel).await.map_err(anyhow::Error::from),
             Err(e) => Err(e),
@@ -496,13 +525,38 @@ impl Dispatcher {
             log_path: outcome.log_path.clone(),
             tail: outcome.tail.clone(),
         };
+        let model_verified = match &expected {
+            None => true,
+            Some(exp) => {
+                let raw = runner::read_logged_output(&outcome.log_path, outcome.output_offset).unwrap_or_else(|| outcome.output.clone());
+                let report = parse_report(&raw);
+                if let Some(r) = &report {
+                    result.tail = runner::truncate_tail(&r.text, runner::TAIL_CHARS);
+                }
+                let models = report.map(|r| r.models).unwrap_or_default();
+                match models.first() {
+                    None => {
+                        result.warnings.push(format!("model unverified: the claude CLI output exposes no model id (expected {exp})"));
+                        false
+                    }
+                    Some(m) if model_matches(m, exp) => true,
+                    Some(m) => {
+                        result.warnings.push(format!("model mismatch: expected {exp}, the claude CLI reported {m}"));
+                        false
+                    }
+                }
+            }
+        };
+        if !model_verified && standing.apply_without_review() {
+            result.warnings.push("gold not applied without a verified model: result returned as branch/patch".into());
+        }
         let mut event = Event::new(&model_id, req.dimension, req.scope.clone(), Outcome::Note, now_ms());
         event.machine_id = self.machine_id.clone();
         event.user_id = self.user_id.clone();
         event.job_id = Some(req.job_id.clone());
         event.duration_s = Some(result.duration_s);
         let finished = (|| -> Result<()> {
-            let aborted = outcome.timed_out || outcome.cancelled || outcome.output.to_lowercase().contains(MAX_TURNS_MARKER);
+            let aborted = outcome.timed_out || outcome.cancelled || outcome.output.to_lowercase().contains(MAX_TURNS_MARKER) || outcome.output.contains(MAX_TURNS_SUBTYPE);
             let mut files = wt.files()?;
             let mut proposed = false;
             if proposal && files.is_empty() && !aborted {
@@ -558,7 +612,7 @@ impl Dispatcher {
             }
             let checker = DiffChecker { protected: &protected, dimension: req.dimension, limits: Limits::for_scope(&req.scope), scope: &req.scope };
             let check = checker.check(&files, &wt.diff("-U0")?);
-            let gold = standing.apply_without_review() && matches!(backend.kind, BackendKind::ClaudeOauth { .. });
+            let gold = standing.apply_without_review() && matches!(backend.kind, BackendKind::ClaudeOauth { .. }) && model_verified;
             if !check.violations.is_empty() && (!gold || aborted) {
                 let reason = check.violations.join("; ");
                 result.status = Status::Blocked;
@@ -577,7 +631,7 @@ impl Dispatcher {
                 wt.remove(true);
                 return Ok(());
             }
-            result.warnings = check.violations;
+            result.warnings.extend(check.violations);
             let patches = self.work_dir.join("patches");
             std::fs::create_dir_all(&patches)?;
             let patch_path = patches.join(format!("{}.patch", req.job_id));

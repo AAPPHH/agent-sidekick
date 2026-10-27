@@ -106,6 +106,10 @@ fn env(model: &str, register: bool, accepted: usize, action: &str) -> Env {
     Env { dir, repo, dispatcher, log }
 }
 
+fn reports(model: &str) -> String {
+    format!("echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"modelUsage\":{{\"{model}\":{{\"inputTokens\":10,\"outputTokens\":5,\"costUSD\":0.5}},\"claude-haiku-5-5\":{{\"inputTokens\":1,\"outputTokens\":1,\"costUSD\":0.001}}}}}}'\n")
+}
+
 fn request(e: &Env, dimension: Dimension, job: &str) -> DispatchRequest {
     DispatchRequest {
         prompt: "do it".into(),
@@ -219,7 +223,7 @@ async fn no_write_right_withholds_tools_and_discards_diff() {
 
 #[tokio::test]
 async fn gold_applies_directly_and_only_warns() {
-    let mut e = env("claude-opus-5-5", true, 0, "printf 'fn a() { let decided_by = 1; }\\n' > src/lib.rs\n");
+    let mut e = env("claude-opus-5-5", true, 0, &format!("printf 'fn a() {{ let decided_by = 1; }}\\n' > src/lib.rs\n{}", reports("claude-opus-5-5-20261001")));
     let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "j9").await;
     assert_eq!(r.status, Status::Completed);
     assert!(r.applied && r.branch.is_none());
@@ -275,7 +279,7 @@ async fn gold_apply_conflict_keeps_branch_and_patch() {
         "claude-opus-5-5",
         true,
         0,
-        "printf 'fn a() { new }\\n' > src/lib.rs\nprintf 'fn a() { other }\\n' > ../../../repo/src/lib.rs\n",
+        &format!("printf 'fn a() {{ new }}\\n' > src/lib.rs\nprintf 'fn a() {{ other }}\\n' > ../../../repo/src/lib.rs\n{}", reports("claude-opus-5-5")),
     );
     let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "j14").await;
     assert_eq!(r.status, Status::Completed);
@@ -402,4 +406,64 @@ async fn real_diff_without_write_right_stays_blocked_in_proposal_mode() {
     let r = run(&mut e, "m-p5", Dimension::WriteCode, "p5").await;
     assert_eq!(r.status, Status::Blocked);
     assert!(r.diff_discarded);
+}
+
+const GOLD_EDIT: &str = "printf 'fn b() {}\\n' > src/b.rs\n";
+
+#[tokio::test]
+async fn gold_with_the_wrong_model_is_returned_as_branch() {
+    let mut e = env("claude-opus-5-5", true, 0, &format!("{GOLD_EDIT}{}", reports("claude-sonnet-5-5")));
+    let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "g1").await;
+    assert_eq!(r.status, Status::Completed);
+    assert!(!r.applied && r.branch.as_deref() == Some("sidekick/g1"));
+    assert!(r.warnings.iter().any(|w| w.contains("model mismatch") && w.contains("claude-sonnet-5-5")), "{:?}", r.warnings);
+    assert!(!e.repo.join("src/b.rs").exists());
+    assert_eq!(r.tail, "done");
+}
+
+#[tokio::test]
+async fn gold_without_a_reported_model_is_unverified_and_not_applied() {
+    let mut e = env("claude-opus-5-5", true, 0, GOLD_EDIT);
+    let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "g2").await;
+    assert!(!r.applied && r.branch.is_some());
+    assert!(r.warnings.iter().any(|w| w.contains("model unverified")), "{:?}", r.warnings);
+    assert!(!e.repo.join("src/b.rs").exists());
+}
+
+#[tokio::test]
+async fn gold_unverified_still_enforces_protected_paths() {
+    let mut e = env("claude-opus-5-5", true, 0, "printf 'x\\n' > tests/new.rs\n");
+    let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "g3").await;
+    assert_eq!(r.status, Status::Blocked);
+}
+
+#[tokio::test]
+async fn aliases_resolve_to_registry_ids_and_the_cli_gets_the_full_id() {
+    let mut e = env("claude-opus-5-5", true, 0, &format!("{GOLD_EDIT}{}", reports("claude-opus-5-5")));
+    let r = run(&mut e, "opus", Dimension::WriteCode, "g4").await;
+    assert_eq!(r.model_id, key("claude-opus-5-5").model_id());
+    assert!(r.applied, "{:?}", r.warnings);
+    let args = std::fs::read_to_string(e.dir.path().join("args.txt")).unwrap();
+    let lines: Vec<&str> = args.lines().collect();
+    let at = lines.iter().position(|l| *l == "--model").unwrap();
+    assert_eq!(lines[at + 1], "claude-opus-5-5");
+    assert!(lines.windows(2).any(|w| w == ["--output-format", "json"]));
+    assert_eq!(lines[lines.len() - 2], "--");
+}
+
+#[test]
+fn alias_table_and_default_model_resolution() {
+    use agent_sidekick::dispatch::resolve_claude_alias;
+    for (a, id) in [("opus", "claude-opus-5-5"), ("sonnet", "claude-sonnet-5-5"), ("haiku", "claude-haiku-5-5"), ("fable", "claude-fable-5-1")] {
+        assert_eq!(resolve_claude_alias(a), id);
+        assert_eq!(key(a).model, id);
+        assert_eq!(key(id).model_id(), key(a).model_id());
+    }
+    assert_eq!(resolve_claude_alias("claude-opus-5-5-20261001"), "claude-opus-5-5-20261001");
+    let mut b = backend("opus");
+    b.model = Some("sonnet".into());
+    assert_eq!(Identity::default().key(&b, None).model, "claude-sonnet-5-5");
+    b.model = None;
+    assert_eq!(Identity::default().key(&b, None).model, "default");
+    assert!(Identity::default().key(&backend("opus"), Some("opus")).is_gold());
 }
