@@ -22,9 +22,9 @@ Für Menschen und für das Steuermodell. Grundlage ist der Steckbrief des Modell
 
 ## Ablauf
 
-1. Steckbrief holen (`sidekick_steckbrief`), Scope passend zur Aufgabe wählen (`global`, `repo:<name>`, `module:<repo>/<pfad>`).
+1. Den kurzen Steckbrief lesen (`sidekick_steckbrief`; Scope `global`, `repo:<name>` oder `module:<repo>/<pfad>`; Tabellen und Zähler nur mit `detail=true`) und die Aufgabe danach formulieren: "Gut für", "So formulieren", "Nicht geben", "Aus Fehlern".
 2. Aufgabe auf die erlaubten Dimensionen zuschneiden, Entscheidungen vorab festlegen.
-3. `sidekick_dispatch` starten (oder `sidekick_run` mit `dimension`, wenn das Modell registriert ist), Ergebnis prüfen, dann mit `sidekick_record_experience` und der `job_id` bewerten (`accepted` oder `rejected`; Modell, Scope und Dauer kommen aus dem Job, die Review-Zeit misst der Sidekick). Blocks und Aborts trägt der Sidekick selbst ein, für Blocks gibt es kein Urteil.
+3. `sidekick_dispatch` starten (oder `sidekick_run` mit `dimension`, wenn das Modell registriert ist), Ergebnis prüfen, dann mit `sidekick_record_experience` und der `job_id` bewerten (`accepted` oder `rejected`; bei `rejected` die Lehre als Regel für die nächste Formulierung in `conclusion` schreiben, sonst Fehler; Modell, Scope und Dauer kommen aus dem Job, die Review-Zeit misst der Sidekick). Blocks und Aborts trägt der Sidekick selbst ein, für Blocks gibt es kein Urteil.
 4. Mit `sidekick_sync` Erfahrungen teilen. Neue Modelle ohne Registry-Zeile werden abgelehnt.
 
 Die Daten liegen im privaten Repo `AAPPHH/sidekick-data` (`data_repo`); Texte privater Einträge und Rohkennungen verlassen den Rechner nie.

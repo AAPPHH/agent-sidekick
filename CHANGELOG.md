@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-10-27
 
 ### Added
 
@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Outcome `rejected` requires a non-empty `conclusion` phrased as a formulation rule for next time (tool error otherwise). Blocked jobs store a mechanical lesson derived from the block reason as their conclusion; the newest three lessons (scope chain) appear under "Aus Fehlern", also in the shared view where private conclusion text is stripped.
 - Outcome `reset` (owners only, no job_id; `data validate` rejects it from other prefixes): trust of the model restarts from the start values at the reset time, only earlier blocked events are re-applied. The Steckbrief shows "zurückgesetzt am <date>". Files containing a reset row are written with schema_version 2, all other files stay version 1; this build reads 1 and 2. Older builds (0.7.x) reject version 2 files and the whole load fails, so release the binary used by the data workflows (validate, aggregate) before any reset row is pushed. The new models.parquet profile columns likewise need a validator that knows them.
 - Optional profile columns in models.parquet (strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of) and a Steckbrief section "Profil" that never influences trust. Old files without the columns still read and validate.
+- Job-bound verdicts: every `sidekick_dispatch` appends one event to the own session log (outcome `note`, or the blocked/aborted event) with job_id, model_id, dimension, scope, repo, duration and the time the result was returned. `sidekick_record_experience` takes `job_id`: model, dimension, scope, repo, steps and duration come from that event, `review_s` is measured, the caller supplies only `accepted|rejected`, `conclusion` and `visibility`. One verdict per job, none for blocked jobs. The free-form path stays for seeds and notes.
+- Proposal mode: write-tests and write-code jobs below the write threshold still get no write tools, but are asked for the complete change as one unified diff between `<<<SIDEKICK-PATCH` and `SIDEKICK-PATCH>>>`. The sidekick checks (`git apply --check`) and applies it only in the job worktree, runs the same mechanical diff check and returns branch and patch for review, never applied to the target. No or invalid patch gives the new status `NoPatch` with the reason and no trust change.
+
+### Changed
+
+- claude-oauth model aliases (opus, sonnet, haiku, fable) resolve to full ids for the model_id and the CLI call. Dispatch runs claude with `--output-format json`, compares the reported model with the expected id and warns on mismatch; Gold is applied only with a verified model, otherwise returned as branch/patch.
+- `sidekick_run` on a backend and model with a registry row requires `dimension` (optional `scope`) and runs the dispatch path. Unregistered backends run as before, without trust effect.
+- `record_experience` says what was pushed (numbers only for private events); `sidekick_sync` likewise. The Steckbrief shows the last block as a UTC date, never prints `-0s`, and marks missing write right as "nein (Vorschlagsmodus)" for write-code and write-tests.
 
 ### Fixed
 
@@ -24,22 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Note, aborted and reset events no longer create a scope cell (counters only on existing cells), so they cannot freeze a value against later changes of a coarser scope.
 - Dispatch events no longer carry the checkout directory name as `repo`; `repo` comes from the scope only.
 - `peers.toml`: the prefix key must match exactly; keys that differ only in case are rejected.
-
-### Changed
-
-- claude-oauth model aliases (opus, sonnet, haiku, fable) resolve to full ids for the model_id and the CLI call. Dispatch runs claude with `--output-format json`, compares the reported model with the expected id and warns on mismatch; Gold is applied only with a verified model, otherwise returned as branch/patch.
-
-## [0.8.0] - 2026-10-27
-
-### Added
-
-- Job-bound verdicts: every `sidekick_dispatch` appends one event to the own session log (outcome `note`, or the blocked/aborted event) with job_id, model_id, dimension, scope, repo, duration and the time the result was returned. `sidekick_record_experience` takes `job_id`: model, dimension, scope, repo, steps and duration come from that event, `review_s` is measured, the caller supplies only `accepted|rejected`, `conclusion` and `visibility`. One verdict per job, none for blocked jobs. The free-form path stays for seeds and notes.
-- Proposal mode: write-tests and write-code jobs below the write threshold still get no write tools, but are asked for the complete change as one unified diff between `<<<SIDEKICK-PATCH` and `SIDEKICK-PATCH>>>`. The sidekick checks (`git apply --check`) and applies it only in the job worktree, runs the same mechanical diff check and returns branch and patch for review, never applied to the target. No or invalid patch gives the new status `NoPatch` with the reason and no trust change.
-
-### Changed
-
-- `sidekick_run` on a backend and model with a registry row requires `dimension` (optional `scope`) and runs the dispatch path. Unregistered backends run as before, without trust effect.
-- `record_experience` says what was pushed (numbers only for private events); `sidekick_sync` likewise. The Steckbrief shows the last block as a UTC date, never prints `-0s`, and marks missing write right as "nein (Vorschlagsmodus)" for write-code and write-tests.
 
 ## [0.7.1] - 2026-10-27
 
