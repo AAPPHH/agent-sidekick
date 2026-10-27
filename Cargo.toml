@@ -12,10 +12,13 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.104"
+arrow = { version = "58.4.1", features = ["prettyprint"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
+datafusion = "54.1.0"
 directories = "6.0.0"
 keyring = "4.2.0"
+parquet = "58.4.1"
 rmcp = { version = "3.6.0", features = ["server", "transport-io", "macros"] }
 rpassword = "7.5.4"
 schemars = "1.2.3"

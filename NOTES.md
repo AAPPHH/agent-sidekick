@@ -6,6 +6,7 @@
 - `SHA256SUMS` lists bare file names (`<hash>  <file>`); both install scripts look up the line for their archive instead of running `sha256sum -c` on the whole file.
 - Windows on ARM64 uses the x86_64 build via emulation; no `aarch64-pc-windows-msvc` build is published.
 - `rust-version = "1.89"`: the highest `rust-version` among locked dependencies (`uuid` 1.28, `aes`). Local toolchain at the time: rustc 1.99.1. Declaring an MSRV enables clippy's `incompatible_msrv` lint, which will flag std APIs newer than 1.89 in our code; if that happens, bump `rust-version` rather than silencing the lint.
+- `arrow`/`parquet` are pinned to 58.x, not 60: `datafusion` 54.1 builds on arrow 58, and a second major would make `RecordBatch`/`Schema` types incompatible. After adding arrow, parquet, datafusion the highest dependency MSRV is still 1.89 (`cargo metadata`), so `rust-version` is unchanged; clippy `incompatible_msrv` is clean.
 - Linux keyring backend is pure Rust (`zbus`, `zbus-secret-service-keyring-store`): `Cargo.lock` contains no `dbus`/`libdbus-sys`, so CI and release builds need no system packages.
 - License: dual MIT OR Apache-2.0; copyright holder "The agent-sidekick contributors".
 
