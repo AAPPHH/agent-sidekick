@@ -9,8 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Outcome `reset` (owners only, no job_id; `data validate` rejects it from other prefixes): trust of the model restarts from the start values at the reset time, only earlier blocked events are re-applied. The Steckbrief shows "zurückgesetzt am <date>". Schema version stays 1 (readers accept the new value, old files unchanged).
+- Outcome `reset` (owners only, no job_id; `data validate` rejects it from other prefixes): trust of the model restarts from the start values at the reset time, only earlier blocked events are re-applied. The Steckbrief shows "zurückgesetzt am <date>". Files containing a reset row are written with schema_version 2, all other files stay version 1; this build reads 1 and 2. Older builds (0.7.x) reject version 2 files and the whole load fails, so release the binary used by the data workflows (validate, aggregate) before any reset row is pushed. The new models.parquet profile columns likewise need a validator that knows them.
 - Optional profile columns in models.parquet (strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of) and a Steckbrief section "Profil" that never influences trust. Old files without the columns still read and validate.
+
+### Fixed
+
+- `sidekick_run` registry gate: every attempted backend is checked, including the fallback. A registered fallback runs as dispatch with the caller's `dimension` (rejected without one), never the ungated path. The store is opened (created) for the check and a store error is a tool error instead of a plain run. Claude model strings are normalised before hashing (case-fold, `-YYYYMMDD` and `[..]` suffixes, aliases); on a backend that has any registered model, an unregistered model string is rejected.
+- Dispatch abort detection (`error_max_turns`) comes from the parsed claude result only, never from substrings of worker or tool text; the text marker is gone. Proposals are always extracted and checked first, so a violation is blocked even when the run hit the turn limit.
+- Claude error results (`is_error`, not max turns) give the new status `Failed` with the CLI's `errors` and subtype as tail, are tool errors, log no event and are no longer reported as NoChange/NoPatch. Plain `sidekick_run` output of the claude harness is not normalised any more.
+- Verdicts: check and append run under one lock (no double verdict); only jobs whose note records `status: completed` (in the note's summary) get a verdict. Verdict rows carry `review_s` only, no duration or steps, and the Steckbrief counts each job's duration once.
+- Note, aborted and reset events no longer create a scope cell (counters only on existing cells), so they cannot freeze a value against later changes of a coarser scope.
+- Dispatch events no longer carry the checkout directory name as `repo`; `repo` comes from the scope only.
+- `peers.toml`: the prefix key must match exactly; keys that differ only in case are rejected.
 
 ### Changed
 
