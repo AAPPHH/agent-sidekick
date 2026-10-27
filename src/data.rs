@@ -27,7 +27,9 @@ pub const RESET_SCHEMA_VERSION: i32 = 2;
 pub const READ_VERSIONS: [i32; 2] = [SCHEMA_VERSION, RESET_SCHEMA_VERSION];
 const VERSION_KEY: &str = "schema_version";
 const NEWEST_CONCLUSIONS: usize = 3;
-const NOT_FOR_BELOW: f64 = 0.30;
+const DEACTIVATED_MAX: f64 = 0.05;
+const READ_CHECK_MIN: f64 = 0.30;
+const EPSILON: f64 = 1e-9;
 const WRITE_FREE_MIN: f64 = 0.85;
 
 fn version_error(path: &Path, found: &str) -> anyhow::Error {
@@ -830,11 +832,39 @@ impl Steckbrief {
         self.effective.iter().find(|(d, _)| *d == dimension).map_or(0.0, |(_, t)| *t)
     }
 
+    fn at_least(&self, dimension: Dimension, min: f64) -> bool {
+        self.trust_of(dimension) >= min - EPSILON
+    }
+
+    fn deactivated(&self, dimension: Dimension) -> bool {
+        self.trust_of(dimension) <= DEACTIVATED_MAX + EPSILON
+    }
+
     fn write_rule(&self, dimension: Dimension) -> &'static str {
-        match self.trust_of(dimension) {
-            t if t < WRITE_RIGHT_MIN => "Diff als Vorschlag verlangen (Vorschlagsmodus)",
-            t if t < WRITE_FREE_MIN => "Test vorher fertig und unveränderlich, Diff wird ganz gelesen",
-            _ => "schreibt frei, Stichprobe",
+        if self.at_least(dimension, WRITE_FREE_MIN) {
+            "schreibt frei, Stichprobe"
+        } else if self.at_least(dimension, WRITE_RIGHT_MIN) {
+            "Test vorher fertig und unveränderlich, Diff ganz lesen"
+        } else {
+            "nur als Vorschlag (Diff als Text verlangen)"
+        }
+    }
+
+    fn read_rule(&self, dimension: Dimension) -> &'static str {
+        if self.at_least(dimension, WRITE_FREE_MIN) {
+            "Fundstellen und Schlüsse übernehmen (Stichprobe)"
+        } else if self.at_least(dimension, READ_CHECK_MIN) {
+            "Fundstellen übernehmen, Schlüsse prüfen"
+        } else {
+            "nur Fundstellen, alles nachprüfen"
+        }
+    }
+
+    fn rules(&self, dimensions: [Dimension; 2], label: &str, rule: impl Fn(&Self, Dimension) -> &'static str) -> Vec<String> {
+        let active: Vec<Dimension> = dimensions.into_iter().filter(|d| !self.deactivated(*d)).collect();
+        match active.as_slice() {
+            [a, b] if rule(self, *a) == rule(self, *b) => vec![format!("{label}: {}", rule(self, *a))],
+            _ => active.iter().map(|d| format!("{d}: {}", rule(self, *d))).collect(),
         }
     }
 
@@ -856,18 +886,16 @@ impl Steckbrief {
         if self.gold {
             how.push("keine Prüfung".to_string());
         } else {
-            if self.trust_of(Dimension::Decisions) < DECISIONS_RIGHT_MIN {
-                how.push("Entscheidungen im Auftrag vorgeben".to_string());
-            }
-            how.push(self.write_rule(Dimension::WriteCode).to_string());
-            if self.write_rule(Dimension::WriteTests) != self.write_rule(Dimension::WriteCode) {
-                how.push(format!("Tests: {}", self.write_rule(Dimension::WriteTests)));
+            how.extend(self.rules([Dimension::Search, Dimension::Inventory], "search/inventory", Self::read_rule));
+            how.extend(self.rules([Dimension::WriteTests, Dimension::WriteCode], "write", Self::write_rule));
+            if !self.deactivated(Dimension::Decisions) {
+                how.push(if self.at_least(Dimension::Decisions, DECISIONS_RIGHT_MIN) { "darf selbst entscheiden" } else { "Entscheidungen im Auftrag vorgeben" }.to_string());
             }
         }
         how.extend(part(&p.prompting));
         let mut avoid: Vec<String> = part(&p.weaknesses).into_iter().collect();
         if !self.gold {
-            avoid.extend(Dimension::ALL.iter().filter(|d| self.trust_of(**d) < NOT_FOR_BELOW).map(|d| format!("nicht für {d}")));
+            avoid.extend(Dimension::ALL.iter().filter(|d| self.deactivated(**d)).map(|d| format!("nicht für {d}")));
         }
         let good: Vec<String> = [&p.strengths, &p.task_scope].into_iter().filter_map(part).collect();
         let lessons: Vec<String> = self.lessons.iter().map(|l| condense(l, 90)).collect();
@@ -1195,39 +1223,43 @@ mod tests {
         Steckbrief::build(&qwen_row(), events, &Scope::Global, NOW).with_profile(profile).render_short(Some("dgx"))
     }
 
+    fn with_trust(model: &ModelRow, trust: &[(Dimension, f64)], gold: bool) -> String {
+        let mut sb = Steckbrief::build(model, &[], &Scope::Global, NOW);
+        sb.effective = Dimension::ALL.iter().map(|d| (*d, trust.iter().find(|(x, _)| x == d).map_or(0.0, |(_, t)| *t))).collect();
+        sb.gold = gold;
+        sb.render_short(None)
+    }
+
     #[test]
-    fn short_steckbrief_is_a_german_guide_derived_from_trust() {
-        let id = qwen_row().model_id();
+    fn short_steckbrief_fresh_model_is_not_deactivated() {
         let text = short_for(&[], Some(profile()));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 5, "{text}");
         assert!(lines[0].starts_with("qwen3-coder-next (dgx) – Vorschlagsgeber"), "{text}");
         assert_eq!(lines[1], "Gut für: stark; klein");
-        assert!(lines[2].starts_with("So formulieren: Entscheidungen im Auftrag vorgeben; Diff als Vorschlag verlangen (Vorschlagsmodus); XML-Tags, Ziel zuerst"), "{text}");
-        assert_eq!(lines[3], "Nicht geben: schwach; nicht für write-tests; nicht für write-code; nicht für decisions");
+        assert!(lines[2].starts_with("So formulieren: search/inventory: "), "{text}");
+        assert!(lines[2].contains("nur als Vorschlag (Diff als Text verlangen)") && lines[2].contains("Entscheidungen im Auftrag vorgeben"), "{text}");
+        assert!(lines[2].ends_with("; XML-Tags, Ziel zuerst"), "{text}");
+        assert_eq!(lines[3], "Nicht geben: schwach");
         assert_eq!(lines[4], "Aus Fehlern: -");
-        assert!(!text.contains("acc ") && !text.contains("Benchmarks"));
-        let mut seeds = Vec::new();
-        for d in [Dimension::Search, Dimension::WriteCode] {
-            let mut e = ev(&id, d, "global", Outcome::Rejected, 5);
-            e.conclusion = Some("x".into());
-            seeds.push(e);
-        }
-        let low = short_for(&seeds, None);
-        assert!(low.contains("Nicht geben: nicht für search"), "{low}");
-        assert!(low.contains("Gut für: -"));
+        assert!(!text.contains("nicht für") && !text.contains("Benchmarks"));
     }
 
     #[test]
-    fn short_steckbrief_write_tiers_and_gold() {
-        let id = qwen_row().model_id();
-        let accepted = |d, n: usize| (0..n).map(|i| ev(&id, d, "global", Outcome::Accepted, 10 + i as i64)).collect::<Vec<_>>();
-        let mid = short_for(&accepted(Dimension::WriteCode, 20), None);
-        assert!(mid.contains("Schreiber unter Prüfung") && mid.contains("Test vorher fertig und unveränderlich, Diff wird ganz gelesen"), "{mid}");
-        assert!(mid.contains("Tests: Diff als Vorschlag verlangen"), "{mid}");
+    fn short_steckbrief_tiers_epsilon_and_gold() {
+        let qwen = qwen_row();
+        let t = with_trust(&qwen, &[(Dimension::Search, 0.55), (Dimension::Inventory, 0.35), (Dimension::WriteCode, 0.10), (Dimension::WriteTests, 0.10), (Dimension::Decisions, 0.10)], false);
+        assert!(t.contains("search: Fundstellen übernehmen, Schlüsse prüfen") || t.contains("search/inventory: Fundstellen übernehmen, Schlüsse prüfen"), "{t}");
+        assert!(t.contains("write: nur als Vorschlag (Diff als Text verlangen)") && t.contains("Nicht geben: -"), "{t}");
+        let t = with_trust(&qwen, &[(Dimension::Search, 0.90), (Dimension::Inventory, 0.05), (Dimension::WriteCode, 0.60), (Dimension::WriteTests, 0.90), (Dimension::Decisions, 0.90)], false);
+        assert!(t.contains("search: Fundstellen und Schlüsse übernehmen (Stichprobe)") && !t.contains("inventory:"), "{t}");
+        assert!(t.contains("write-tests: schreibt frei, Stichprobe") && t.contains("write-code: Test vorher fertig und unveränderlich, Diff ganz lesen"), "{t}");
+        assert!(t.contains("darf selbst entscheiden") && t.contains("Nicht geben: nicht für inventory"), "{t}");
+        let t = with_trust(&qwen, &[(Dimension::Search, 0.0500000001), (Dimension::Inventory, 0.0501)], false);
+        assert!(t.contains("nicht für search") && !t.contains("nicht für inventory") && t.contains("inventory: nur Fundstellen, alles nachprüfen"), "{t}");
         let gold = ModelRow { key: ModelKey::new("anthropic", "claude-opus-5-5", "x", "-", "claude-code"), ..qwen_row() };
         let text = Steckbrief::build(&gold, &[], &Scope::Global, NOW).render_short(None);
-        assert!(text.contains("Gold, keine Prüfung") && text.contains("So formulieren: keine Prüfung") && text.contains("(anthropic)"), "{text}");
+        assert!(text.contains("Gold, keine Prüfung") && text.contains("So formulieren: keine Prüfung") && !text.contains("nicht für") && text.contains("(anthropic)"), "{text}");
     }
 
     #[test]
