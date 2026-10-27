@@ -77,6 +77,11 @@ fn read_batches(path: &Path) -> Result<Vec<RecordBatch>> {
     builder.build()?.map(|b| b.map_err(Into::into)).collect()
 }
 
+pub fn read_schema(path: &Path) -> Result<SchemaRef> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    Ok(ParquetRecordBatchReaderBuilder::try_new(file).with_context(|| format!("read {}", path.display()))?.schema().clone())
+}
+
 struct Row<'a> {
     batch: &'a RecordBatch,
     i: usize,

@@ -35,6 +35,8 @@ pub enum Command {
     Uninstall(commands::uninstall::UninstallArgs),
     /// Check for a newer release and print the command that installs it.
     Update,
+    /// Validate or aggregate the data/ directory of the code repository (used by its workflows).
+    Data(commands::data::DataArgs),
 }
 
 pub fn main() -> ExitCode {
@@ -63,6 +65,10 @@ pub fn main() -> ExitCode {
         Command::Uninstall(args) => {
             let _guard = logging::init(logging::Mode::Cli);
             commands::uninstall::run(args)
+        }
+        Command::Data(args) => {
+            let _guard = logging::init(logging::Mode::Cli);
+            commands::data::run(args)
         }
         Command::Update => {
             let _guard = logging::init(logging::Mode::Cli);
