@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-27
+
+### Added
+
+- `ask_orchestrator`: every dispatched worker harness gets an MCP tool through a small stdio bridge (hidden subcommand `agent-sidekick ask-bridge`) that talks to the running sidekick over a per-job private socket (Unix socket 0700/0600; loopback TCP with a per-job token on Windows). Wired into claude (`--mcp-config`, tool allowed also without write tools, per-server timeout), opencode (`mcp` entry with a 35 minute timeout, tool permission) and codex (`mcp_servers.*`, untested here: codex is not installed); command backends get `AGENT_SIDEKICK_ASK_*` variables. The call blocks the worker; the pending `sidekick_dispatch`/`sidekick_run` returns `status: question` with `job_id` and the question, `sidekick_answer(job_id, answer)` delivers the answer and returns the job's next event. Waiting does not count against `timeout_s`; after 30 minutes without an answer the worker is told to deliver its current state. The worker prompt gets one fixed line naming the tool.
+- Questions are logged per job as a shared count event and a private text event (no trust effect); the detail Steckbrief shows the number of questions, the short Steckbrief adds "Rückfragen erwünscht" under "So formulieren" when decisions are below 0.85.
+- `sidekick_workflow`: steps with dimension, scope, backend, model and `depends_on`; up-front rejection of the whole workflow with reasons (same registry, account and rate-limit gating as dispatch, unique ids, no cycles); topological execution with parallel independent steps; dependent prompts carry the dependencies' results; writing steps share one workflow branch with per-step trust, scope and proposal-mode checks; a blocked step skips its dependents; nothing reaches the working tree before the end (Gold-only writing steps are applied, otherwise branch, patch and per-step `job_id`s are returned).
+- Tool count 8 to 10 (`sidekick_answer`, `sidekick_workflow`).
+
 ## [0.8.0] - 2026-10-27
 
 ### Added

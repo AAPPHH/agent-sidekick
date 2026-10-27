@@ -1,6 +1,6 @@
 [package]
 name = "agent-sidekick"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Local MCP server that delegates prompts from Claude Code to a second, headless agent (Claude Code, OpenCode or another CLI) with its own credentials"
