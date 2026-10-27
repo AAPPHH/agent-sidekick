@@ -207,3 +207,17 @@ fn aggregate_ignores_the_previous_aggregate() {
     let ids: Vec<_> = read_events(&root.join("aggregate/latest.parquet")).unwrap().into_iter().map(|e| e.event_id).collect();
     assert_eq!(ids, ["live"]);
 }
+
+#[test]
+fn owners_may_change_root_files_but_not_foreign_prefixes() {
+    let (_d, root, base) = repo();
+    std::fs::write(root.join("README.md"), "x").unwrap();
+    commit(&root, "x");
+    assert!(violations(&root, &base, "owen").is_empty());
+    let v = violations(&root, &base, "alice");
+    assert!(v.iter().any(|m| m.starts_with("README.md") && m.contains("outside the prefixes")), "{v:?}");
+    write_events(&root.join("experiences/bob/s1.parquet"), &[event("a", Outcome::Seed, Dimension::Search)]).unwrap();
+    commit(&root, "y");
+    let v = violations(&root, &base, "owen");
+    assert!(v.iter().any(|m| m.starts_with("experiences/bob/") && m.contains("outside the prefixes")), "{v:?}");
+}
