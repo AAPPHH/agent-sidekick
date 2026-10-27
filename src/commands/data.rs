@@ -1,15 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use anyhow::{anyhow, Context, Result};
 use arrow::datatypes::SchemaRef;
 
 use crate::data::{experience_schema, read_events, read_schema, strip_private, write_events, DataDir, ModelRow, ProtectedRow};
-use crate::dispatch::git;
+use crate::dispatch::{git, glob_match};
 
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const BOT: &str = "github-actions[bot]";
-pub const EXEMPT: [&str; 3] = ["data/models.parquet", "data/protected.parquet", "data/peers.toml"];
+pub const SHARED_RULES: [&str; 3] = ["data/models.parquet", "data/protected.parquet", "data/peers.toml"];
+pub const SHARED_RULE_GLOBS: [&str; 2] = [".github/workflows/data-*.yml", ".github/CODEOWNERS"];
 const PEERS: &str = "data/peers.toml";
 const ZERO_REV: &str = "0000000000000000000000000000000000000000";
 
@@ -31,6 +32,9 @@ pub enum DataCommand {
         pusher: String,
         #[arg(long)]
         root: PathBuf,
+        /// Write the violating paths (one per line) here once validation has run.
+        #[arg(long)]
+        paths_out: Option<PathBuf>,
     },
     /// Union and dedup all experiences into data/aggregate/latest.parquet.
     Aggregate {
@@ -41,8 +45,14 @@ pub enum DataCommand {
 
 pub fn run(args: DataArgs) -> Result<ExitCode> {
     match args.command {
-        DataCommand::Validate { base, head, pusher, root } => {
-            let violations = Validator { root: &root, pusher: &pusher }.validate(&base, &head)?;
+        DataCommand::Validate { base, head, pusher, root, paths_out } => {
+            let found = Validator { root: &root, pusher: &pusher }.violations(&base, &head)?;
+            if let Some(out) = paths_out {
+                let mut paths: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
+                paths.dedup();
+                std::fs::write(out, paths.iter().map(|p| format!("{p}\n")).collect::<String>())?;
+            }
+            let violations: Vec<String> = found.into_iter().map(|(p, m)| format!("{p}: {m}")).collect();
             if violations.is_empty() {
                 return Ok(ExitCode::SUCCESS);
             }
@@ -60,7 +70,7 @@ pub fn run(args: DataArgs) -> Result<ExitCode> {
 
 pub fn aggregate(root: &Path) -> Result<usize> {
     let data = DataDir::new(root.join("data"));
-    let events: Vec<_> = data.events(None)?.iter().map(strip_private).collect();
+    let events: Vec<_> = data.experience_events()?.iter().map(strip_private).collect();
     let path = data.aggregate_path();
     if !path.exists() || read_events(&path)? != events {
         write_events(&path, &events)?;
@@ -77,59 +87,122 @@ pub struct Validator<'a> {
     pub pusher: &'a str,
 }
 
+type Violation = (String, String);
+
+fn git_z(root: &Path, args: &[&str]) -> Result<Vec<String>> {
+    let mut full = vec!["-c", "core.quotepath=false"];
+    full.extend(args);
+    Ok(git(root, &full)?.split('\0').filter(|p| !p.is_empty()).map(String::from).collect())
+}
+
+fn shared_rule(path: &str) -> bool {
+    SHARED_RULES.contains(&path) || SHARED_RULE_GLOBS.iter().any(|g| glob_match(g, path))
+}
+
+fn prefix_of(path: &str) -> Option<&str> {
+    path.strip_prefix("data/experiences/")?.split_once('/').map(|(p, _)| p)
+}
+
 impl Validator<'_> {
     pub fn validate(&self, base: &str, head: &str) -> Result<Vec<String>> {
-        let listing = if base == ZERO_REV {
-            git(self.root, &["-c", "core.quotepath=off", "ls-tree", "-r", "--name-only", head])?
+        Ok(self.violations(base, head)?.into_iter().map(|(p, m)| format!("{p}: {m}")).collect())
+    }
+
+    pub fn violations(&self, base: &str, head: &str) -> Result<Vec<Violation>> {
+        let zero = base == ZERO_REV;
+        let listing = if zero {
+            git_z(self.root, &["ls-tree", "-r", "--name-only", "-z", head])?
         } else {
-            git(self.root, &["-c", "core.quotepath=off", "diff", "--name-only", "--no-renames", base, head])?
+            git_z(self.root, &["diff", "--name-only", "-z", "--no-renames", base, head])?
         };
-        let changed: Vec<String> = listing
-            .lines()
-            .filter(|p| p.starts_with("data/"))
-            .map(String::from)
-            .collect();
-        let prefixes = self.prefixes(base)?;
+        let changed: Vec<String> = listing.into_iter().filter(|p| p.starts_with("data/") || (!zero && shared_rule(p))).collect();
+        let (prefixes, owners) = self.peers(base)?;
+        let is_owner = owners.iter().any(|o| o.eq_ignore_ascii_case(self.pusher));
+        let mut foreign: Option<Vec<(String, String)>> = None;
         let mut out = Vec::new();
         for path in &changed {
-            if let Some(v) = self.path_violation(path, &prefixes) {
-                out.push(v);
+            if shared_rule(path) {
+                if !is_owner {
+                    out.push((path.clone(), format!("shared rule file, only the owners may change it (pusher `{}`)", self.pusher)));
+                }
+            } else if let Some(v) = self.path_violation(path, &prefixes) {
+                out.push((path.clone(), v));
             }
             let full = self.root.join(path);
-            if full.is_file() {
-                out.extend(self.content_violations(path, &full));
+            if !path.starts_with("data/") || !full.is_file() {
+                continue;
+            }
+            out.extend(self.content_violations(path, &full).into_iter().map(|m| (path.clone(), m)));
+            if let Some(mine) = prefix_of(path).filter(|_| path.ends_with(".parquet")) {
+                if foreign.is_none() {
+                    foreign = Some(self.base_event_ids(if zero { head } else { base })?);
+                }
+                let ids: Vec<&(String, String)> = foreign.iter().flatten().filter(|(_, other)| other != mine).collect();
+                if let Ok(events) = read_events(&full) {
+                    for e in events {
+                        if let Some((_, other)) = ids.iter().find(|(id, _)| *id == e.event_id) {
+                            out.push((path.clone(), format!("event {}: event_id already exists under prefix `{other}`", e.event_id)));
+                        }
+                    }
+                }
             }
         }
         Ok(out)
     }
 
-    fn prefixes(&self, base: &str) -> Result<Vec<String>> {
+    fn base_event_ids(&self, rev: &str) -> Result<Vec<(String, String)>> {
+        let mut ids = Vec::new();
+        let files = git_z(self.root, &["ls-tree", "-r", "--name-only", "-z", rev, "--", "data/experiences"])?;
+        for (n, file) in files.iter().filter(|f| f.ends_with(".parquet")).enumerate() {
+            let Some(prefix) = prefix_of(file) else { continue };
+            let blob = Command::new("git").arg("-C").arg(self.root).args(["cat-file", "blob", &format!("{rev}:{file}")]).output()?;
+            if !blob.status.success() {
+                continue;
+            }
+            let tmp = std::env::temp_dir().join(format!("sidekick-validate-{}-{n}.parquet", std::process::id()));
+            std::fs::write(&tmp, &blob.stdout)?;
+            let events = read_events(&tmp);
+            let _ = std::fs::remove_file(&tmp);
+            if let Ok(events) = events {
+                ids.extend(events.into_iter().map(|e| (e.event_id, prefix.to_string())));
+            }
+        }
+        Ok(ids)
+    }
+
+    fn peers(&self, base: &str) -> Result<(Vec<String>, Vec<String>)> {
         let text = if base == ZERO_REV {
             std::fs::read_to_string(self.root.join(PEERS)).unwrap_or_default()
         } else {
             git(self.root, &["show", &format!("{base}:{PEERS}")]).unwrap_or_default()
         };
         let table: toml::Table = text.parse().with_context(|| format!("parse {PEERS}"))?;
-        Ok(table
+        let owners = table
+            .get("owners")
+            .and_then(|o| o.as_array())
+            .map(|a| a.iter().filter_map(|o| o.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let prefixes = table
             .iter()
             .filter(|(_, owner)| owner.as_str().is_some_and(|o| o.eq_ignore_ascii_case(self.pusher)))
             .map(|(prefix, _)| format!("data/experiences/{prefix}/"))
-            .collect())
+            .collect();
+        Ok((prefixes, owners))
     }
 
     fn path_violation(&self, path: &str, prefixes: &[String]) -> Option<String> {
-        if EXEMPT.contains(&path) || prefixes.iter().any(|p| path.starts_with(p.as_str()) && !path[p.len()..].is_empty()) {
+        if prefixes.iter().any(|p| path.starts_with(p.as_str()) && !path[p.len()..].is_empty()) {
             return None;
         }
         let owned = if prefixes.is_empty() { "no prefix".to_string() } else { prefixes.join(", ") };
-        Some(format!("{path}: outside the prefixes of `{}` ({owned})", self.pusher))
+        Some(format!("outside the prefixes of `{}` ({owned})", self.pusher))
     }
 
     fn content_violations(&self, rel: &str, full: &Path) -> Vec<String> {
         let mut out = Vec::new();
         let size = std::fs::metadata(full).map(|m| m.len()).unwrap_or(0);
         if size > MAX_FILE_BYTES {
-            out.push(format!("{rel}: {size} bytes exceeds the limit of {MAX_FILE_BYTES}"));
+            out.push(format!("{size} bytes exceeds the limit of {MAX_FILE_BYTES}"));
         }
         if full.extension().is_none_or(|e| e != "parquet") {
             return out;
@@ -145,8 +218,8 @@ impl Validator<'_> {
             Ok(vec!["unknown parquet location".to_string()])
         };
         match result {
-            Ok(v) => out.extend(v.into_iter().map(|m| format!("{rel}: {m}"))),
-            Err(e) => out.push(format!("{rel}: invalid ({e:#})")),
+            Ok(v) => out.extend(v),
+            Err(e) => out.push(format!("invalid ({e:#})")),
         }
         out
     }

@@ -192,3 +192,17 @@ fn hmac_matches_rfc4231() {
     let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 }
+
+#[test]
+fn pushed_copy_of_a_private_block_reason_has_no_file_paths() {
+    use agent_sidekick::data::shared_copy;
+    let mut e = Event::new("0123456789abcdef", Dimension::WriteCode, Scope::Global, Outcome::Blocked, 1);
+    e.visibility = Visibility::Private;
+    let full = "protected path src/secret/validate.rs (matches **/validate*); removed protected term `decided_by` in src/secret/a.rs; 20 changed lines exceed limit 10";
+    e.block_reason = Some(full.into());
+    let pushed = shared_copy(&e, None);
+    assert_eq!(pushed.block_reason.as_deref(), Some("protected path; removed term decided_by; 20 changed lines exceed limit 10"));
+    assert_eq!(e.block_reason.as_deref(), Some(full));
+    e.visibility = Visibility::Shared;
+    assert_eq!(shared_copy(&e, None).block_reason.as_deref(), Some(full));
+}

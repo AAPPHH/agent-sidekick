@@ -30,7 +30,7 @@ fn repo() -> (tempfile::TempDir, PathBuf, String) {
     let root = dir.path().to_path_buf();
     sh(&root, &["init", "-q"]);
     std::fs::create_dir_all(root.join("data")).unwrap();
-    std::fs::write(root.join("data/peers.toml"), "alice = \"Alice\"\nbob = \"bob\"\n").unwrap();
+    std::fs::write(root.join("data/peers.toml"), "owners = [\"Owen\"]\nalice = \"Alice\"\nbob = \"bob\"\nowen = \"owen\"\n").unwrap();
     let base = commit(&root, "base");
     (dir, root, base)
 }
@@ -61,18 +61,18 @@ fn foreign_prefix_aggregate_and_unknown_paths_fail() {
 }
 
 #[test]
-fn exempt_files_need_valid_schema_but_no_prefix() {
+fn shared_rule_files_need_valid_schema_and_an_owner() {
     let (_d, root, base) = repo();
     ProtectedRow::write_all(&root.join("data/protected.parquet"), &ProtectedRow::defaults()).unwrap();
     let key = ModelKey::new("p", "m", "c", "q", "h");
     let row = ModelRow { key, context_tokens: None, cost: "free".into(), max_steps: None, tool_output_lines: None, context_budget_tokens: None, sperre: Sperre::Technisch, added_at: 0, added_by: "x".into() };
     ModelRow::write_all(&root.join("data/models.parquet"), &[row]).unwrap();
     commit(&root, "x");
-    assert!(violations(&root, &base, "alice").is_empty());
+    assert!(violations(&root, &base, "owen").is_empty());
     std::fs::write(root.join("data/models.parquet"), b"garbage").unwrap();
     commit(&root, "y");
     let head = sh(&root, &["rev-parse", "HEAD"]);
-    let v = Validator { root: &root, pusher: "alice" }.validate(&base, &head).unwrap();
+    let v = Validator { root: &root, pusher: "OWEN" }.validate(&base, &head).unwrap();
     assert!(v.iter().any(|m| m.contains("models.parquet") && m.contains("invalid")), "{v:?}");
 }
 
@@ -137,9 +137,76 @@ fn cli_exit_codes_and_aggregate() {
 #[test]
 fn initial_push_with_zero_base_is_checked_against_head() {
     let (_d, root, _base) = repo();
-    write_events(&root.join("data/experiences/bob/s1.parquet"), &[event("a", Outcome::Seed, Dimension::Search)]).unwrap();
+    write_events(&root.join("data/experiences/owen/s1.parquet"), &[event("a", Outcome::Seed, Dimension::Search)]).unwrap();
     let head = commit(&root, "x");
     let zero = "0".repeat(40);
-    assert!(Validator { root: &root, pusher: "bob" }.validate(&zero, &head).unwrap().is_empty());
+    assert!(Validator { root: &root, pusher: "owen" }.validate(&zero, &head).unwrap().is_empty());
     assert!(!Validator { root: &root, pusher: "alice" }.validate(&zero, &head).unwrap().is_empty());
+}
+
+#[test]
+fn non_owner_cannot_change_shared_rules_or_workflows() {
+    let (_d, root, base) = repo();
+    ProtectedRow::write_all(&root.join("data/protected.parquet"), &ProtectedRow::defaults()).unwrap();
+    std::fs::write(root.join("data/peers.toml"), "owners = [\"alice\"]\nalice = \"alice\"\n").unwrap();
+    std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    std::fs::write(root.join(".github/workflows/data-validate.yml"), "name: x\n").unwrap();
+    std::fs::write(root.join(".github/workflows/ci.yml"), "name: y\n").unwrap();
+    std::fs::write(root.join(".github/CODEOWNERS"), "* @alice\n").unwrap();
+    commit(&root, "x");
+    let v = violations(&root, &base, "alice");
+    for p in ["data/protected.parquet", "data/peers.toml", ".github/workflows/data-validate.yml", ".github/CODEOWNERS"] {
+        assert!(v.iter().any(|m| m.starts_with(p) && m.contains("only the owners")), "{p}: {v:?}");
+    }
+    assert!(!v.iter().any(|m| m.contains("ci.yml")), "{v:?}");
+    assert!(violations(&root, &base, "owen").is_empty());
+}
+
+#[test]
+fn event_id_must_not_exist_under_another_prefix() {
+    let (_d, root, _base) = repo();
+    let mut shared = event("dup", Outcome::Accepted, Dimension::Search);
+    shared.visibility = Visibility::Shared;
+    write_events(&root.join("data/experiences/bob/s1.parquet"), &[shared.clone()]).unwrap();
+    let base = commit(&root, "bob");
+    write_events(&root.join("data/experiences/alice/s1.parquet"), &[shared, event("fresh", Outcome::Seed, Dimension::Search)]).unwrap();
+    commit(&root, "alice");
+    let v = violations(&root, &base, "alice");
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(v[0].contains("event dup") && v[0].contains("`bob`"));
+}
+
+#[test]
+fn non_ascii_paths_are_keyed_correctly_and_paths_out_lists_them() {
+    let (_d, root, base) = repo();
+    std::fs::write(root.join("data/ünï\"x.txt"), "x").unwrap();
+    commit(&root, "x");
+    let head = sh(&root, &["rev-parse", "HEAD"]);
+    let found = Validator { root: &root, pusher: "alice" }.violations(&base, &head).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].0, "data/ünï\"x.txt");
+    let out = root.join("paths.txt");
+    let status = Command::new(env!("CARGO_BIN_EXE_agent-sidekick"))
+        .args(["data", "validate", "--base", &base, "--head", &head, "--pusher", "alice", "--root"])
+        .arg(&root)
+        .arg("--paths-out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert_eq!(status.status.code(), Some(1));
+    assert_eq!(std::fs::read_to_string(out).unwrap(), "data/ünï\"x.txt\n");
+}
+
+#[test]
+fn aggregate_ignores_the_previous_aggregate() {
+    let (_d, root, _base) = repo();
+    let mut stale = event("stale", Outcome::Accepted, Dimension::Search);
+    stale.visibility = Visibility::Shared;
+    write_events(&root.join("data/aggregate/latest.parquet"), &[stale]).unwrap();
+    let mut live = event("live", Outcome::Accepted, Dimension::Search);
+    live.visibility = Visibility::Shared;
+    write_events(&root.join("data/experiences/alice/s1.parquet"), &[live]).unwrap();
+    assert_eq!(aggregate(&root).unwrap(), 1);
+    let ids: Vec<_> = read_events(&root.join("data/aggregate/latest.parquet")).unwrap().into_iter().map(|e| e.event_id).collect();
+    assert_eq!(ids, ["live"]);
 }

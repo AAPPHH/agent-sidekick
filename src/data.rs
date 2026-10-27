@@ -368,8 +368,31 @@ pub fn strip_private(event: &Event) -> Event {
     if event.visibility == Visibility::Private {
         shared.summary = None;
         shared.conclusion = None;
+        shared.block_reason = shared.block_reason.as_deref().map(redact_block_reason);
     }
     shared
+}
+
+pub fn redact_block_reason(reason: &str) -> String {
+    reason
+        .split("; ")
+        .map(|part| {
+            if part.starts_with("protected path ") {
+                "protected path".to_string()
+            } else if let Some(rest) = part.strip_prefix("removed protected term `") {
+                format!("removed term {}", rest.split('`').next().unwrap_or_default())
+            } else if part.starts_with("path ") && part.contains(" outside module path ") {
+                "path outside module path".to_string()
+            } else if part.starts_with("write-tests touches non-test path ") {
+                "write-tests touches non-test path".to_string()
+            } else if let Some(rest) = part.strip_prefix("diff without write right (") {
+                format!("diff without write right ({})", rest.split("):").next().unwrap_or_default())
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
@@ -504,12 +527,20 @@ impl DataDir {
     }
 
     pub fn events(&self, local_root: Option<&Path>) -> Result<Vec<Event>> {
+        self.collect_events(local_root, true)
+    }
+
+    pub fn experience_events(&self) -> Result<Vec<Event>> {
+        self.collect_events(None, false)
+    }
+
+    fn collect_events(&self, local_root: Option<&Path>, with_aggregate: bool) -> Result<Vec<Event>> {
         let mut files = Vec::new();
         if let Some(local) = local_root {
             files.extend(Self::experience_files(local)?);
         }
         files.extend(Self::experience_files(&self.root)?);
-        if self.aggregate_path().exists() {
+        if with_aggregate && self.aggregate_path().exists() {
             files.push(self.aggregate_path());
         }
         let mut all = Vec::new();
