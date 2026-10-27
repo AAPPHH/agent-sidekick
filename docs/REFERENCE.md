@@ -445,6 +445,8 @@ Sync: pull at server start (when `data_name` is set or a checkout exists; failur
 
 The data lives in the private repository `AAPPHH/sidekick-data` (config key `data_repo`). Its validation and aggregation workflows, the owner-only files and the branch and tag rulesets are described in the README of that repository.
 
+Open point: the `data-validated` tag in `AAPPHH/sidekick-data` is currently unprotected. GitHub rejects the Actions bot as a ruleset bypass actor on user-owned repositories, and push rules for `.github/**` need an organisation-owned repository. Intended solution: a write deploy key stored as a secret, which the workflows use to push the tag, plus a tag ruleset for `data-validated` (update, deletion and creation restricted; bypass: repository admin and deploy keys).
+
 ## CLI reference
 
 | Command | Purpose |
