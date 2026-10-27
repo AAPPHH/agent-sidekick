@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 
 /// Overrides the config directory (default: `<os config dir>/agent-sidekick`).
 pub const ENV_CONFIG_DIR: &str = "AGENT_SIDEKICK_CONFIG_DIR";
+/// Overrides the data directory (default: `<config dir>/data`).
+pub const ENV_DATA_DIR: &str = "AGENT_SIDEKICK_DATA_DIR";
 /// Overrides the Claude config dir used by the agent (default: `~/.claude-sidekick`).
 pub const ENV_CLAUDE_CONFIG_DIR: &str = "AGENT_SIDEKICK_CLAUDE_CONFIG_DIR";
 
@@ -39,6 +41,13 @@ pub fn config_file() -> Result<PathBuf> {
 
 pub fn token_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("token"))
+}
+
+pub fn data_dir() -> Result<PathBuf> {
+    if let Some(p) = env_path(ENV_DATA_DIR) {
+        return Ok(p);
+    }
+    Ok(config_dir()?.join("data"))
 }
 
 pub fn logs_dir() -> Result<PathBuf> {

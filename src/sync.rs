@@ -1,0 +1,241 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use anyhow::{anyhow, bail, Context, Result};
+
+use crate::data::{DataDir, SessionLog};
+use crate::dispatch::{git, GIT_IDENT};
+use crate::trust::{Dimension, Event, Outcome, Scope, Visibility};
+
+pub const BRANCH: &str = "main";
+pub const COMMIT_PREFIX: &str = "data: ";
+pub const PUSH_ATTEMPTS: usize = 3;
+const REMOTE: &str = "origin";
+
+#[derive(Clone, Debug)]
+pub struct ExperienceInput {
+    pub model_id: String,
+    pub dimension: Dimension,
+    pub scope: Scope,
+    pub outcome: Outcome,
+    pub job_id: Option<String>,
+    pub steps: Option<i64>,
+    pub duration_s: Option<f64>,
+    pub review_s: Option<f64>,
+    pub seed_value: Option<f64>,
+    pub summary: Option<String>,
+    pub conclusion: Option<String>,
+    pub visibility: Visibility,
+}
+
+#[derive(Debug)]
+pub struct DataStore {
+    pub base: PathBuf,
+    pub checkout: PathBuf,
+    pub local_root: PathBuf,
+    pub data: DataDir,
+    pub name: String,
+    pub push_enabled: bool,
+    pub machine_id: String,
+    pub user_id: String,
+    log: Mutex<SessionLog>,
+    git_lock: Mutex<()>,
+}
+
+fn read_or_create(path: &Path, make: impl FnOnce() -> String) -> Result<String> {
+    if let Ok(v) = fs::read_to_string(path) {
+        if !v.trim().is_empty() {
+            return Ok(v.trim().to_string());
+        }
+    }
+    let v = make();
+    fs::write(path, &v).with_context(|| format!("write {}", path.display()))?;
+    Ok(v)
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+impl DataStore {
+    pub fn checkout_exists(base: &Path) -> bool {
+        base.join("checkout").join(".git").exists()
+    }
+
+    pub fn open(base: &Path, remote: &str, name: Option<&str>) -> Result<Self> {
+        let name_ok = name.filter(|n| valid_name(n));
+        if let Some(n) = name {
+            if name_ok.is_none() {
+                bail!("invalid data_name `{n}`");
+            }
+        }
+        let checkout = base.join("checkout");
+        let local_root = base.join("local");
+        fs::create_dir_all(&checkout)?;
+        fs::create_dir_all(&local_root)?;
+        if !checkout.join(".git").exists() {
+            git(&checkout, &["init", "-q", "-b", BRANCH])?;
+            git(&checkout, &["remote", "add", REMOTE, remote])?;
+            git(&checkout, &["sparse-checkout", "set", "--no-cone", "/data/"])?;
+        } else if git(&checkout, &["remote", "get-url", REMOTE]).map(|u| u.trim() != remote).unwrap_or(true) {
+            git(&checkout, &["remote", "set-url", REMOTE, remote]).or_else(|_| git(&checkout, &["remote", "add", REMOTE, remote]))?;
+        }
+        let secret = read_or_create(&base.join("secret"), || {
+            format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+        })?;
+        let machine_id = read_or_create(&base.join("machine_id"), || uuid::Uuid::new_v4().to_string())?;
+        let user_id = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".into());
+        let own = name_ok.unwrap_or("local");
+        let data = DataDir::new(checkout.join("data"));
+        let log = SessionLog::open(&data.root, &local_root, own, &uuid::Uuid::new_v4().to_string())?.with_secret(secret.into_bytes());
+        Ok(Self {
+            base: base.to_path_buf(),
+            checkout,
+            local_root,
+            data,
+            name: own.to_string(),
+            push_enabled: name_ok.is_some(),
+            machine_id,
+            user_id,
+            log: Mutex::new(log),
+            git_lock: Mutex::new(()),
+        })
+    }
+
+    fn pending_path(&self) -> PathBuf {
+        self.base.join("pending")
+    }
+
+    pub fn pending(&self) -> bool {
+        self.pending_path().exists()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.git_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn own_prefix(&self) -> PathBuf {
+        Path::new("data").join("experiences").join(&self.name)
+    }
+
+    pub fn pull(&self) -> Result<()> {
+        let _g = self.lock();
+        self.pull_locked()
+    }
+
+    fn pull_locked(&self) -> Result<()> {
+        let r = git(&self.checkout, &["pull", "--rebase", "--autostash", "-q", REMOTE, BRANCH]);
+        if r.is_err() {
+            let _ = git(&self.checkout, &["rebase", "--abort"]);
+        }
+        r.map(|_| ())
+    }
+
+    fn push_locked(&self) -> bool {
+        for _ in 0..PUSH_ATTEMPTS {
+            if git(&self.checkout, &["push", "-q", REMOTE, &format!("HEAD:{BRANCH}")]).is_ok() {
+                let _ = fs::remove_file(self.pending_path());
+                return true;
+            }
+            if self.pull_locked().is_err() {
+                break;
+            }
+        }
+        let _ = fs::write(self.pending_path(), "1");
+        false
+    }
+
+    fn commit_own(&self, rel: &Path, message: &str) -> Result<()> {
+        if !rel.starts_with(self.own_prefix()) {
+            bail!("refusing to commit {} outside {}", rel.display(), self.own_prefix().display());
+        }
+        let rel = rel.to_string_lossy();
+        git(&self.checkout, &["add", "--", &rel])?;
+        if git(&self.checkout, &["status", "--porcelain", "--", &rel])?.trim().is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&str> = GIT_IDENT.to_vec();
+        args.extend(["commit", "-q", "-m", message, "--", &rel]);
+        git(&self.checkout, &args).map(|_| ())
+    }
+
+    pub fn append(&self, event: Event) -> Result<(String, bool)> {
+        let id = event.event_id.clone();
+        let (shared, session) = {
+            let mut log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            log.append(event)?;
+            let session = log.shared_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            (log.shared_path.clone(), session)
+        };
+        if !self.push_enabled {
+            return Ok((id, false));
+        }
+        let _g = self.lock();
+        let rel = shared.strip_prefix(&self.checkout).map_err(|_| anyhow!("session file outside the checkout"))?;
+        self.commit_own(rel, &format!("{COMMIT_PREFIX}{} {session} {id}", self.name))?;
+        Ok((id, self.push_locked()))
+    }
+
+    pub fn record(&self, input: ExperienceInput) -> Result<(String, bool)> {
+        match input.outcome {
+            Outcome::Blocked => bail!("outcome blocked is written by the sidekick after the diff check, not by record_experience"),
+            Outcome::Seed => {
+                if !input.dimension.seedable() {
+                    bail!("seed is only allowed for search and inventory, not {}", input.dimension);
+                }
+                match input.seed_value {
+                    Some(v) if (0.0..=1.0).contains(&v) => {}
+                    _ => bail!("seed needs seed_value between 0 and 1"),
+                }
+            }
+            _ => {}
+        }
+        if input.review_s.is_some_and(|v| v < 0.0) || input.duration_s.is_some_and(|v| v < 0.0) {
+            bail!("review_s and duration_s must not be negative");
+        }
+        self.data.model(&input.model_id)?;
+        let mut e = Event::new(&input.model_id, input.dimension, input.scope, input.outcome, chrono::Utc::now().timestamp_millis());
+        e.machine_id = self.machine_id.clone();
+        e.user_id = self.user_id.clone();
+        e.job_id = input.job_id;
+        e.steps = input.steps;
+        e.duration_s = input.duration_s;
+        e.review_s = input.review_s;
+        e.seed_value = (input.outcome == Outcome::Seed).then_some(input.seed_value).flatten();
+        e.summary = input.summary;
+        e.conclusion = input.conclusion;
+        e.visibility = input.visibility;
+        self.append(e)
+    }
+
+    pub fn sync(&self) -> Result<String> {
+        let _g = self.lock();
+        let pulled = match self.pull_locked() {
+            Ok(()) => "pull: ok".to_string(),
+            Err(e) => format!("pull failed: {e:#}"),
+        };
+        if !self.push_enabled {
+            return Ok(format!("{pulled}; push disabled (data_name not set)"));
+        }
+        let own = self.own_prefix();
+        let dirty = !git(&self.checkout, &["status", "--porcelain", "--", &own.to_string_lossy()])?.trim().is_empty();
+        if dirty {
+            self.commit_own(&own, &format!("{COMMIT_PREFIX}{} sync", self.name))?;
+        }
+        let remote_ref = format!("{REMOTE}/{BRANCH}");
+        let has_head = git(&self.checkout, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok();
+        let ahead = match git(&self.checkout, &["rev-list", "--count", &format!("{remote_ref}..HEAD")]) {
+            Ok(n) => n.trim().parse::<usize>().unwrap_or(0),
+            Err(_) => usize::from(has_head),
+        };
+        let push = if ahead == 0 && !self.pending() {
+            "nothing to push"
+        } else if self.push_locked() {
+            "pushed"
+        } else {
+            "push pending (offline or rejected)"
+        };
+        Ok(format!("{pulled}; {push}"))
+    }
+}

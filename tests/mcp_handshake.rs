@@ -51,7 +51,7 @@ fn handshake_as_sent_by_codex() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names.len(), 3, "{names:?}");
+    assert_eq!(names.len(), 8, "{names:?}");
     let res = server.request(
         "tools/call",
         json!({
@@ -533,7 +533,16 @@ fn handshake_unchanged_with_opencode_backend() {
     names.sort_unstable();
     assert_eq!(
         names,
-        ["sidekick_backends", "sidekick_run", "sidekick_status"]
+        [
+            "sidekick_backends",
+            "sidekick_dispatch",
+            "sidekick_query",
+            "sidekick_record_experience",
+            "sidekick_run",
+            "sidekick_status",
+            "sidekick_steckbrief",
+            "sidekick_sync"
+        ]
     );
     let run = list["tools"]
         .as_array()

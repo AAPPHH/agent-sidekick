@@ -6,6 +6,7 @@
 - `SHA256SUMS` lists bare file names (`<hash>  <file>`); both install scripts look up the line for their archive instead of running `sha256sum -c` on the whole file.
 - Windows on ARM64 uses the x86_64 build via emulation; no `aarch64-pc-windows-msvc` build is published.
 - `rust-version = "1.89"`: the highest `rust-version` among locked dependencies (`uuid` 1.28, `aes`). Local toolchain at the time: rustc 1.99.1. Declaring an MSRV enables clippy's `incompatible_msrv` lint, which will flag std APIs newer than 1.89 in our code; if that happens, bump `rust-version` rather than silencing the lint.
+- `arrow`/`parquet` are pinned to 58.x, not 60: `datafusion` 54.1 builds on arrow 58, and a second major would make `RecordBatch`/`Schema` types incompatible. After adding arrow, parquet, datafusion the highest dependency MSRV is still 1.89 (`cargo metadata`), so `rust-version` is unchanged; clippy `incompatible_msrv` is clean.
 - Linux keyring backend is pure Rust (`zbus`, `zbus-secret-service-keyring-store`): `Cargo.lock` contains no `dbus`/`libdbus-sys`, so CI and release builds need no system packages.
 - License: dual MIT OR Apache-2.0; copyright holder "The agent-sidekick contributors".
 
@@ -833,3 +834,16 @@ Practice test 2 (all with `max_turns` 100):
 | 5 | REFERENCE example + CHANGELOG [0.5.0] | kiconnect / gpt-oss-120b | 33 s, 9 steps | usable as is | none |
 
 Findings: with 100 turns no run hit the turn limit (0.4.0: 2 of 4 with 20). The explicit string-literal rule in the prompt cut the raw-line-break defects from 3 of 4 Rust results to 1 of 4. kiconnect stays reliable for doc edits with all facts in the prompt.
+
+## Dispatch (src/dispatch.rs)
+
+- Identity: provider from backend kind (claude-oauth anthropic, claude-endpoint host of base_url, codex openai, opencode provider, command basename), model = effective model, checkpoint = model unless `Identity.checkpoint` is given (CLI-reported name), quant `none` unless given, harness `claude-code|codex|opencode|command`. Overrides come per request via `Identity`, no new config fields.
+- Sperre per harness: claude technisch (allowedTools read-only + disallowedTools Edit/Write/MultiEdit/NotebookEdit/Bash, permission mode reset to default), codex technisch (read-only sandbox), opencode technisch (read_only: edit/bash/webfetch denied), command nur-diff. The registry sperre is downgraded to nur-diff if the harness cannot withhold.
+- Limits: only claude supports max_steps (`--max-turns`, min of request and registry). tool_output_lines and context_budget_tokens are supported by no harness; every result lists `unsupported_limits`.
+- Diff limits (files / changed lines): global 8/300, repo 15/600, module 25/1000 (broader scope = tighter). Gold gets the same check as warnings.
+- Write-tests: only `tests/**`, `spec/**` may be touched; removed_term still applies. No write right (or non-write dimension): any diff is discarded.
+- Non-Gold: commit on branch `sidekick/<job_id>` plus patch under `<work_dir>/patches`; Gold: `git apply` to the target tree. Blocked and aborted outcomes are appended to the SessionLog by the dispatcher; accepted/rejected come from the control model later.
+- Abort detection: timeout, cancel, or "reached max turns" in the output. Diff and write-right checks always run first; only a clean (or empty) diff may end as aborted. The claude harness runs in text mode and gives no structured turn-limit result, so the marker text is the only signal there.
+- Known limitation: a Bash tool call of a job with write right can write outside the worktree; the diff only sees the worktree. Not fixed.
+- Gold needs the `claude-oauth` backend type in addition to the registry key; the provider is derived from the backend only.
+- Not done: module scope does not restrict paths to the module; opencode/codex step limits.
