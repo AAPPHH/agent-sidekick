@@ -21,12 +21,14 @@ pub struct Server {
     next_id: u64,
     /// Responses that arrived while waiting for another request.
     stashed: HashMap<u64, Value>,
+    _data: tempfile::TempDir,
 }
 
 impl Server {
     /// Start `agent-sidekick serve` with `config_dir` as its config dir (keyring disabled,
     /// no inherited token or claude override).
     pub fn start(config_dir: &Path, extra_env: &[(&str, &str)]) -> Self {
+        let data = tempfile::tempdir().expect("data dir");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent-sidekick"));
         cmd.arg("serve")
             .env("AGENT_SIDEKICK_CONFIG_DIR", config_dir)
@@ -35,6 +37,7 @@ impl Server {
                 config_dir.join("claude"),
             )
             .env("AGENT_SIDEKICK_DISABLE_KEYRING", "1")
+            .env("AGENT_SIDEKICK_DATA_DIR", data.path())
             .env_remove("AGENT_SIDEKICK_TOKEN")
             .env_remove("AGENT_SIDEKICK_CLAUDE")
             .stdin(Stdio::piped())
@@ -61,6 +64,7 @@ impl Server {
             lines,
             next_id: 1,
             stashed: HashMap::new(),
+            _data: data,
         }
     }
 

@@ -1008,7 +1008,7 @@ struct State {
     shutdown: CancellationToken,
     /// Backend name -> end of its rate-limit cooldown.
     cooldowns: std::sync::Mutex<CooldownMap>,
-    data: std::sync::OnceLock<Arc<DataStore>>,
+    data: tokio::sync::OnceCell<Arc<DataStore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1123,7 +1123,7 @@ impl SidekickServer {
                 per_backend: std::sync::Mutex::default(),
                 shutdown: CancellationToken::new(),
                 cooldowns: std::sync::Mutex::default(),
-                data: std::sync::OnceLock::new(),
+                data: tokio::sync::OnceCell::new(),
             }),
         }
     }
@@ -1777,16 +1777,18 @@ impl SidekickServer {
     }
 
     async fn store(&self, snap: &Snapshot) -> Result<Arc<DataStore>, String> {
-        if let Some(s) = self.state.data.get() {
-            return Ok(s.clone());
-        }
-        let base = crate::paths::data_dir().map_err(|e| format!("{e:#}"))?;
-        let (repo, name) = (snap.config.data_repo.clone(), snap.config.data_name.clone());
-        let opened = blocking(move || {
-            DataStore::open(&base, &repo, name.as_deref()).map(Arc::new).map_err(|e| format!("data store: {e:#}"))
-        })
-        .await??;
-        Ok(self.state.data.get_or_init(|| opened).clone())
+        self.state
+            .data
+            .get_or_try_init(|| async {
+                let base = crate::paths::data_dir().map_err(|e| format!("{e:#}"))?;
+                let (repo, name) = (snap.config.data_repo.clone(), snap.config.data_name.clone());
+                blocking(move || {
+                    DataStore::open(&base, &repo, name.as_deref()).map(Arc::new).map_err(|e| format!("data store: {e:#}"))
+                })
+                .await?
+            })
+            .await
+            .cloned()
     }
 
     async fn registry_gate(&self, snap: &Snapshot, backend: &Backend, model: Option<&str>) -> Result<bool, String> {

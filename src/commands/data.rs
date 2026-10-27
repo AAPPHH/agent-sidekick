@@ -170,7 +170,9 @@ impl Validator<'_> {
             if !blob.status.success() {
                 continue;
             }
-            let tmp = std::env::temp_dir().join(format!("sidekick-validate-{}-{n}.parquet", std::process::id()));
+            static TMP_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = std::env::temp_dir().join(format!("sidekick-validate-{}-{n}-{seq}.parquet", std::process::id()));
             std::fs::write(&tmp, &blob.stdout)?;
             let events = read_events(&tmp);
             let _ = std::fs::remove_file(&tmp);

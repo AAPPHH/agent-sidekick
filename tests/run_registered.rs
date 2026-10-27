@@ -164,3 +164,14 @@ fn unregistered_model_on_a_backend_with_registered_models_is_rejected() {
     let res = s.call_tool("sidekick_run", json!({"prompt": "hi", "cwd": cwd, "backend": "cl", "model": "Sonnet[1m]"}));
     assert!(text_of(&res).contains("needs `dimension`"), "{}", text_of(&res));
 }
+
+#[test]
+fn concurrent_first_runs_open_the_store_once() {
+    let (_d, mut s, repo) = fixture(false);
+    let args = json!({"name": "sidekick_run", "arguments": {"prompt": "hi", "cwd": repo.to_string_lossy()}});
+    let ids: Vec<_> = (0..4).map(|_| s.send_request("tools/call", args.clone())).collect();
+    for id in ids {
+        let (res, _) = s.wait_response(id, std::time::Duration::from_secs(60));
+        assert!(res["isError"] != json!(true), "{res}");
+    }
+}
