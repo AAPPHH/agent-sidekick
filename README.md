@@ -264,6 +264,7 @@ Nutze Gemini deshalb nur in Projektordnern, denen du vertraust, zum Beispiel nic
 ## Weiterführende Dokumentation
 
 - [Technische Referenz](docs/REFERENCE.md): Backends, Konfiguration, Tools, Sicherheit (Englisch)
+- [Delegieren nach Vertrauen](docs/delegation.md): Regeln für Steuermodell und Menschen (Deutsch)
 - [Entwicklung](docs/DEVELOPMENT.md)
 - [Releases](docs/RELEASING.md)
 - [Anmeldung als Claude-Code-Plugin](plugin/README.md) (Alternative zur Anmeldung durch das Setup)

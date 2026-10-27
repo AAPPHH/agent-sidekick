@@ -1,0 +1,39 @@
+name: Data aggregate
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-main
+  cancel-in-progress: false
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download the latest agent-sidekick release
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern 'agent-sidekick-x86_64-unknown-linux-musl.tar.gz' --dir "$RUNNER_TEMP"
+          tar -xzf "$RUNNER_TEMP/agent-sidekick-x86_64-unknown-linux-musl.tar.gz" -C "$RUNNER_TEMP/bin" agent-sidekick
+
+      - name: Aggregate and commit
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/bin/agent-sidekick" data aggregate --root "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/aggregate/latest.parquet
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "data: aggregate"
+          git push origin HEAD:main || { git pull --rebase origin main && git push origin HEAD:main; }
