@@ -11,7 +11,6 @@ pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const BOT: &str = "github-actions[bot]";
 pub const EXEMPT: [&str; 3] = ["data/models.parquet", "data/protected.parquet", "data/peers.toml"];
 const PEERS: &str = "data/peers.toml";
-const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbc3c9bc";
 const ZERO_REV: &str = "0000000000000000000000000000000000000000";
 
 #[derive(Debug, clap::Args)]
@@ -80,8 +79,12 @@ pub struct Validator<'a> {
 
 impl Validator<'_> {
     pub fn validate(&self, base: &str, head: &str) -> Result<Vec<String>> {
-        let from = if base == ZERO_REV { EMPTY_TREE } else { base };
-        let changed: Vec<String> = git(self.root, &["-c", "core.quotepath=off", "diff", "--name-only", "--no-renames", from, head])?
+        let listing = if base == ZERO_REV {
+            git(self.root, &["-c", "core.quotepath=off", "ls-tree", "-r", "--name-only", head])?
+        } else {
+            git(self.root, &["-c", "core.quotepath=off", "diff", "--name-only", "--no-renames", base, head])?
+        };
+        let changed: Vec<String> = listing
             .lines()
             .filter(|p| p.starts_with("data/"))
             .map(String::from)

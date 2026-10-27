@@ -133,3 +133,13 @@ fn cli_exit_codes_and_aggregate() {
     assert_eq!(events.len(), 2);
     assert_eq!(aggregate(&root).unwrap(), 2);
 }
+
+#[test]
+fn initial_push_with_zero_base_is_checked_against_head() {
+    let (_d, root, _base) = repo();
+    write_events(&root.join("data/experiences/bob/s1.parquet"), &[event("a", Outcome::Seed, Dimension::Search)]).unwrap();
+    let head = commit(&root, "x");
+    let zero = "0".repeat(40);
+    assert!(Validator { root: &root, pusher: "bob" }.validate(&zero, &head).unwrap().is_empty());
+    assert!(!Validator { root: &root, pusher: "alice" }.validate(&zero, &head).unwrap().is_empty());
+}
