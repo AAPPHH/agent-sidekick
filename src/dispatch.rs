@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::backends::{self, Backend, BackendKind, OpencodeProvider, PermissionMode};
-use crate::data::{DataDir, ProtectedKind, ProtectedRow, SessionLog};
+use crate::data::{DataDir, ModelRow, ProtectedKind, ProtectedRow, SessionLog};
 use crate::harness::HarnessKind;
 use crate::runner::{self, Launch, RunRequest};
 use crate::trust::{Dimension, Event, ModelKey, Outcome, Scope, Sperre, Standing};
@@ -96,8 +96,20 @@ pub fn technical_sperre(backend: &Backend) -> Sperre {
 pub fn unsupported_limits(backend: &Backend) -> Vec<&'static str> {
     match backend.harness_kind() {
         HarnessKind::Claude => vec!["tool_output_lines", "context_budget_tokens"],
+        HarnessKind::OpenCode => Vec::new(),
         _ => vec!["max_steps", "tool_output_lines", "context_budget_tokens"],
     }
+}
+
+pub fn with_registry_limits(backend: &Backend, row: &ModelRow) -> Backend {
+    let mut b = backend.clone();
+    if let BackendKind::OpenCode { limits, .. } = &mut b.kind {
+        let positive = |v: Option<i64>| v.filter(|n| *n > 0).map(|n| n.min(u32::MAX as i64) as u32);
+        limits.tool_output_lines = positive(row.tool_output_lines);
+        limits.context_budget_tokens = positive(row.context_budget_tokens);
+        limits.context_tokens = limits.context_tokens.or(positive(row.context_tokens));
+    }
+    b
 }
 
 pub fn withhold_writes(backend: &Backend) -> Backend {
@@ -404,9 +416,10 @@ impl Dispatcher {
         let standing = Standing::compute(&key, sperre, &events, now_ms());
         let write_right = req.dimension.is_write() && standing.write_right(req.dimension, &req.scope);
         let protected = self.data.protected()?;
-        let prepared = if write_right { backend.clone() } else { withhold_writes(backend) };
+        let limited = with_registry_limits(backend, &row);
+        let prepared = if write_right { limited } else { withhold_writes(&limited) };
         let max_turns = match (backend.harness_kind(), row.max_steps) {
-            (HarnessKind::Claude, Some(m)) if m > 0 => req.max_turns.min(m as u32),
+            (HarnessKind::Claude | HarnessKind::OpenCode, Some(m)) if m > 0 => req.max_turns.min(m as u32),
             _ => req.max_turns,
         };
         let wt = Worktree::create(&req.repo, &self.work_dir, &req.job_id)?;

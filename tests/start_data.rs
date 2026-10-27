@@ -39,6 +39,7 @@ fn dgx() -> Backend {
         read_only: false,
         request_timeout_s: None,
         model_options: Default::default(),
+        limits: Default::default(),
         base_dir: PathBuf::from("/x"),
     })
 }

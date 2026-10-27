@@ -168,6 +168,7 @@ fn kiconnect_example_resolves() {
         read_only,
         request_timeout_s,
         model_options,
+        limits,
         base_dir,
     } = &b.kind
     else {
@@ -175,6 +176,7 @@ fn kiconnect_example_resolves() {
     };
     assert_eq!(*request_timeout_s, None);
     assert!(model_options.is_empty());
+    assert_eq!(*limits, OpencodeLimits::default());
     assert_eq!(*provider, OpencodeProvider::OpenaiCompatible);
     assert_eq!(
         base_url.as_deref(),
@@ -358,7 +360,7 @@ fn rendered_config_openai_compatible() {
     assert!(p["options"].get("timeout").is_none(), "{p}");
     assert_eq!(
         p["models"]["qwen-qwen3-8-27b"],
-        json!({"name": "qwen-qwen3-8-27b", "tool_call": true})
+        json!({"name": "qwen-qwen3-8-27b", "tool_call": true, "limit": {"context": 128000, "output": 8192}})
     );
     assert_eq!(
         p["models"].as_object().unwrap().len(),
@@ -431,7 +433,7 @@ temperature = 0.5
     let c = render_config(bs.get("x").unwrap()).unwrap();
     assert_eq!(
         c["provider"]["sidekick"]["models"]["m"],
-        json!({"name": "m", "tool_call": true, "reasoning": true, "temperature": 0.5})
+        json!({"name": "m", "tool_call": true, "reasoning": true, "temperature": 0.5, "limit": {"context": 128000, "output": 8192}})
     );
 }
 
@@ -537,7 +539,15 @@ fn permission_sets_never_ask() {
         text,
         r#"{"*":"allow","*.env":"deny","*.env.*":"deny","*.env.example":"allow"}"#
     );
-    assert_eq!(run_config(12), json!({"agent": {"build": {"steps": 12}}}));
+    assert_eq!(
+        run_config(&kiconnect(Path::new("/cfg")), "m", 12),
+        json!({
+            "agent": {"build": {"steps": 12}},
+            "compaction": {"auto": true, "prune": true},
+            "tool_output": {"max_bytes": 32000},
+            "provider": {"sidekick": {"models": {"m": {"limit": {"context": 128000, "output": 8192}}}}}
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -690,7 +700,7 @@ fn launch_argv_stdin_env_and_files() {
     let perm: Value = serde_json::from_str(&get("OPENCODE_PERMISSION").unwrap()).unwrap();
     assert_eq!(perm, permissions(false));
     let content: Value = serde_json::from_str(&get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
-    assert_eq!(content, run_config(7));
+    assert_eq!(content, run_config(&b, "qwen-qwen3-8-27b", 7));
 
     // Files: only the generated config, below the backend's dir; no key in it.
     let after = files_below(f.tmp.path());

@@ -17,8 +17,8 @@ use std::path::{Component, Path, PathBuf};
 
 use super::{
     command_uses_model, is_primary_oauth_name, Backend, BackendKind, BackendType, Backends,
-    ClaudePermissions, CodexAuth, Cost, EndpointAuth, OpencodeProvider, RawAuth, RawBackend,
-    IMPLICIT_BACKEND, OLD_IMPLICIT_BACKEND,
+    ClaudePermissions, CodexAuth, Cost, EndpointAuth, OpencodeLimits, OpencodeProvider, RawAuth,
+    RawBackend, IMPLICIT_BACKEND, OLD_IMPLICIT_BACKEND,
 };
 use crate::config::Config;
 use crate::harness::HarnessKind;
@@ -358,7 +358,7 @@ fn resolve_one(
 
     // Fields that are not allowed for this type.
     let claude: &[BackendType] = &[BackendType::ClaudeOauth, BackendType::ClaudeEndpoint];
-    let set_fields: [(&str, bool, &[BackendType]); 17] = [
+    let set_fields: [(&str, bool, &[BackendType]); 19] = [
         (
             "config_dir",
             raw.config_dir.is_some(),
@@ -401,6 +401,16 @@ fn resolve_one(
         (
             "model_options",
             raw.model_options.is_some(),
+            &[BackendType::OpenCode],
+        ),
+        (
+            "context_tokens",
+            raw.context_tokens.is_some(),
+            &[BackendType::OpenCode],
+        ),
+        (
+            "max_output_tokens",
+            raw.max_output_tokens.is_some(),
             &[BackendType::OpenCode],
         ),
         (
@@ -915,6 +925,14 @@ fn opencode_kind(
             "`request_timeout_s` must be between 1 and 3600 (got {t})"
         ));
     }
+    for (key, v) in [
+        ("context_tokens", raw.context_tokens),
+        ("max_output_tokens", raw.max_output_tokens),
+    ] {
+        if v == Some(0) {
+            errs.push(format!("`{key}` must be greater than 0"));
+        }
+    }
     let model_options = raw.model_options.clone().unwrap_or_default();
     if raw.model_options.is_some() && provider == OpencodeProvider::Openrouter {
         errs.push(
@@ -943,6 +961,11 @@ fn opencode_kind(
         read_only: raw.read_only.unwrap_or(false),
         request_timeout_s,
         model_options,
+        limits: OpencodeLimits {
+            context_tokens: raw.context_tokens,
+            max_output_tokens: raw.max_output_tokens,
+            ..Default::default()
+        },
         base_dir,
     })
 }
