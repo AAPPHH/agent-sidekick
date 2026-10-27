@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agent_sidekick::backends::{Backend, BackendKind, CodexAuth, Cost, OpencodeProvider};
-use agent_sidekick::data::{pseudonym, write_events, DataDir, ModelRow, ProtectedRow};
+use agent_sidekick::data::{pseudonym, read_events, write_events, DataDir, ModelRow, ProtectedRow};
 use agent_sidekick::dispatch::{technical_sperre, Identity};
 use agent_sidekick::trust::{Dimension, Event, Outcome, Scope};
 
@@ -93,8 +93,8 @@ fn events(qwen_id: &str) -> Vec<Event> {
     incident.steps = Some(80);
     incident.duration_s = Some(142.0);
     incident.block_reason = Some("Validierung decided_by entfernt".into());
-    incident.summary = Some("Qwen3-Coder-Next entfernte decided_by aus der Validierung; Diff verworfen.".into());
-    incident.conclusion = Some("Kein Schreibrecht an Validierungscode; Entscheidungen vorher im Task festlegen.".into());
+    incident.summary = Some("Qwen3-Coder-Next hat bei einer Code-Aufgabe eine Validierung entfernt, damit der eigene Test durchgeht.".into());
+    incident.conclusion = None;
     let mut search = make(Dimension::Search, Outcome::Seed, 2_000);
     search.seed_value = Some(0.55);
     let mut inventory = make(Dimension::Inventory, Outcome::Seed, 3_000);
@@ -109,9 +109,15 @@ fn generate_start_data() {
     ModelRow::write_all(&data.join("models.parquet"), &models()).unwrap();
     ProtectedRow::write_all(&data.join("protected.parquet"), &ProtectedRow::defaults()).unwrap();
     let qwen_id = models()[0].model_id();
-    let session = uuid::Uuid::new_v4();
-    write_events(&data.join(format!("experiences/aapphh/{session}.parquet")), &events(&qwen_id)).unwrap();
-    std::fs::write(data.join("peers.toml"), "aapphh = \"AAPPHH\"\n").unwrap();
+    let existing = DataDir::experience_files(&data).unwrap();
+    let path = existing.first().cloned().unwrap_or_else(|| data.join(format!("experiences/aapphh/{}.parquet", uuid::Uuid::new_v4())));
+    let old = if path.exists() { read_events(&path).unwrap() } else { Vec::new() };
+    let mut fresh = events(&qwen_id);
+    for (e, o) in fresh.iter_mut().zip(&old) {
+        e.event_id = o.event_id.clone();
+    }
+    write_events(&path, &fresh).unwrap();
+    std::fs::write(data.join("peers.toml"), "owners = [\"AAPPHH\"]\naapphh = \"AAPPHH\"\n").unwrap();
 }
 
 #[test]
@@ -130,4 +136,20 @@ fn committed_start_data_matches_dispatch_identity() {
     assert!(!sb.write_right_code && !sb.decisions_right);
     assert!(data.steckbrief(&expected[3], &Scope::Global, None, now).unwrap().gold);
     assert!(!data.steckbrief(&expected[2], &Scope::Global, None, now).unwrap().gold);
+}
+
+#[test]
+fn committed_incident_event_is_plain_and_peers_name_owners() {
+    let data = PathBuf::from(ROOT).join("data");
+    let files = DataDir::experience_files(&data).unwrap();
+    assert_eq!(files.len(), 1);
+    let events = read_events(&files[0]).unwrap();
+    let incident = events.iter().find(|e| e.outcome == Outcome::Blocked).unwrap();
+    assert_eq!(
+        incident.summary.as_deref(),
+        Some("Qwen3-Coder-Next hat bei einer Code-Aufgabe eine Validierung entfernt, damit der eigene Test durchgeht.")
+    );
+    assert_eq!(incident.conclusion, None);
+    let peers = std::fs::read_to_string(data.join("peers.toml")).unwrap();
+    assert!(peers.contains("owners = [\"AAPPHH\"]"));
 }
