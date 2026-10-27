@@ -1703,7 +1703,7 @@ impl SidekickServer {
                 }
             }
         }
-        Ok(text_result(redact_all(&text), result.status == dispatch::Status::Blocked))
+        Ok(text_result(redact_all(&text), matches!(result.status, dispatch::Status::Blocked | dispatch::Status::Failed)))
     }
 }
 

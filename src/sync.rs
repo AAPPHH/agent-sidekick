@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::data::{DataDir, SessionLog};
-use crate::dispatch::{git, GIT_IDENT};
+use crate::dispatch::{git, status_summary, Status, GIT_IDENT};
 use crate::trust::{Dimension, Event, Outcome, Scope, Visibility};
 
 pub const BRANCH: &str = "main";
@@ -196,12 +196,17 @@ impl DataStore {
     }
 
     pub fn append(&self, event: Event) -> Result<(String, bool)> {
-        let id = event.event_id.clone();
-        let (shared, session) = {
+        self.append_checked(|_| Ok(event))
+    }
+
+    fn append_checked(&self, make: impl FnOnce(&[Event]) -> Result<Event>) -> Result<(String, bool)> {
+        let (id, shared, session) = {
             let mut log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let event = make(log.events())?;
+            let id = event.event_id.clone();
             log.append(event)?;
             let session = log.shared_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            (log.shared_path.clone(), session)
+            (id, log.shared_path.clone(), session)
         };
         if !self.push_enabled {
             return Ok((id, false));
@@ -263,30 +268,32 @@ impl DataStore {
         if !matches!(outcome, Outcome::Accepted | Outcome::Rejected) {
             bail!("a verdict on a job is accepted or rejected");
         }
-        let base = {
-            let log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mine: Vec<&Event> = log.events().iter().filter(|e| e.job_id.as_deref() == Some(job_id)).collect();
+        self.append_checked(|events| {
+            let mine: Vec<&Event> = events.iter().filter(|e| e.job_id.as_deref() == Some(job_id)).collect();
             if mine.iter().any(|e| e.outcome == Outcome::Blocked) {
                 bail!("job {job_id} was blocked; blocked jobs get no verdict");
             }
             if mine.iter().any(|e| matches!(e.outcome, Outcome::Accepted | Outcome::Rejected)) {
                 bail!("job {job_id} already has a verdict");
             }
-            mine.into_iter().find(|e| matches!(e.outcome, Outcome::Note | Outcome::Aborted)).cloned()
-        };
-        let base = base.ok_or_else(|| anyhow!("unknown job_id {job_id} in the local log of this session"))?;
-        let now = chrono::Utc::now().timestamp_millis();
-        let mut e = Event::new(&base.model_id, base.dimension, base.scope.clone(), outcome, now);
-        e.machine_id = self.machine_id.clone();
-        e.user_id = self.user_id.clone();
-        e.repo = base.repo.clone();
-        e.job_id = base.job_id.clone();
-        e.steps = base.steps;
-        e.duration_s = base.duration_s;
-        e.review_s = Some(((now - base.ts_ms).max(0) as f64) / 1000.0);
-        e.conclusion = conclusion;
-        e.visibility = visibility;
-        self.append(e)
+            if mine.is_empty() {
+                bail!("unknown job_id {job_id} in the local log of this session");
+            }
+            let completed = status_summary(Status::Completed);
+            let base = mine
+                .into_iter()
+                .find(|e| e.outcome == Outcome::Note && e.summary.as_deref() == Some(completed.as_str()))
+                .ok_or_else(|| anyhow!("job {job_id} did not complete with a result; only completed jobs get a verdict"))?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut e = Event::new(&base.model_id, base.dimension, base.scope.clone(), outcome, now);
+            e.machine_id = self.machine_id.clone();
+            e.user_id = self.user_id.clone();
+            e.job_id = base.job_id.clone();
+            e.review_s = Some(((now - base.ts_ms).max(0) as f64) / 1000.0);
+            e.conclusion = conclusion;
+            e.visibility = visibility;
+            Ok(e)
+        })
     }
 
     pub fn sync(&self) -> Result<String> {

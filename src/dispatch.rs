@@ -19,7 +19,6 @@ pub const MODULE_LIMITS: Limits = Limits { max_files: 25, max_lines: 1000 };
 pub const TEST_GLOBS: [&str; 2] = ["tests/**", "spec/**"];
 pub const WRITE_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"];
 pub const READ_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
-pub const MAX_TURNS_MARKER: &str = "reached max turns";
 pub const MAX_TURNS_SUBTYPE: &str = "error_max_turns";
 pub const PATCH_BEGIN: &str = "<<<SIDEKICK-PATCH";
 pub const PATCH_END: &str = "SIDEKICK-PATCH>>>";
@@ -317,6 +316,24 @@ pub enum Status {
     NoPatch,
     Blocked,
     Aborted,
+    Failed,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Completed => "completed",
+            Status::NoChange => "nochange",
+            Status::NoPatch => "nopatch",
+            Status::Blocked => "blocked",
+            Status::Aborted => "aborted",
+            Status::Failed => "failed",
+        }
+    }
+}
+
+pub fn status_summary(status: Status) -> String {
+    format!("status: {}", status.as_str())
 }
 
 #[derive(Clone, Debug)]
@@ -525,27 +542,24 @@ impl Dispatcher {
             log_path: outcome.log_path.clone(),
             tail: outcome.tail.clone(),
         };
+        let raw = runner::read_logged_output(&outcome.log_path, outcome.output_offset).unwrap_or_else(|| outcome.output.clone());
+        let report = json_output.then(|| parse_report(&raw)).flatten();
+        if let Some(r) = &report {
+            result.tail = runner::truncate_tail(&r.text, runner::TAIL_CHARS);
+        }
         let model_verified = match &expected {
             None => true,
-            Some(exp) => {
-                let raw = runner::read_logged_output(&outcome.log_path, outcome.output_offset).unwrap_or_else(|| outcome.output.clone());
-                let report = parse_report(&raw);
-                if let Some(r) = &report {
-                    result.tail = runner::truncate_tail(&r.text, runner::TAIL_CHARS);
+            Some(exp) => match report.as_ref().and_then(|r| r.models.first()) {
+                None => {
+                    result.warnings.push(format!("model unverified: the claude CLI output exposes no model id (expected {exp})"));
+                    false
                 }
-                let models = report.map(|r| r.models).unwrap_or_default();
-                match models.first() {
-                    None => {
-                        result.warnings.push(format!("model unverified: the claude CLI output exposes no model id (expected {exp})"));
-                        false
-                    }
-                    Some(m) if model_matches(m, exp) => true,
-                    Some(m) => {
-                        result.warnings.push(format!("model mismatch: expected {exp}, the claude CLI reported {m}"));
-                        false
-                    }
+                Some(m) if model_matches(m, exp) => true,
+                Some(m) => {
+                    result.warnings.push(format!("model mismatch: expected {exp}, the claude CLI reported {m}"));
+                    false
                 }
-            }
+            },
         };
         if !model_verified && standing.apply_without_review() {
             result.warnings.push("gold not applied without a verified model: result returned as branch/patch".into());
@@ -556,12 +570,23 @@ impl Dispatcher {
         event.job_id = Some(req.job_id.clone());
         event.duration_s = Some(result.duration_s);
         let finished = (|| -> Result<()> {
-            let aborted = outcome.timed_out || outcome.cancelled || outcome.output.to_lowercase().contains(MAX_TURNS_MARKER) || outcome.output.contains(MAX_TURNS_SUBTYPE);
+            let max_turns_hit = report.as_ref().is_some_and(|r| r.subtype == MAX_TURNS_SUBTYPE);
+            if let Some(r) = report.as_ref().filter(|r| r.is_error && r.subtype != MAX_TURNS_SUBTYPE) {
+                result.status = Status::Failed;
+                let reason = format!("claude reported an error ({}): {}", r.subtype, r.text);
+                result.tail = runner::truncate_tail(&reason, runner::TAIL_CHARS);
+                result.reason = Some(reason);
+                wt.remove(true);
+                return Ok(());
+            }
+            let aborted = outcome.timed_out || outcome.cancelled || max_turns_hit;
             let mut files = wt.files()?;
             let mut proposed = false;
-            if proposal && files.is_empty() && !aborted {
-                let raw = runner::read_logged_output(&outcome.log_path, outcome.output_offset).unwrap_or_else(|| outcome.output.clone());
-                let text = backend.harness().normalize_output(&raw).map_or(raw, |n| n.text);
+            if proposal && files.is_empty() {
+                let text = match &report {
+                    Some(r) => r.text.clone(),
+                    None => backend.harness().normalize_output(&raw).map_or(raw.clone(), |n| n.text),
+                };
                 let applied = extract_patch(&text).and_then(|patch| {
                     let proposal_path = self.work_dir.join("patches").join(format!("{}.proposal", req.job_id));
                     std::fs::create_dir_all(proposal_path.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -578,6 +603,7 @@ impl Dispatcher {
                         files = wt.files()?;
                         proposed = true;
                     }
+                    Err(_) if aborted => {}
                     Err(reason) => {
                         result.status = Status::NoPatch;
                         result.reason = Some(reason);
@@ -657,8 +683,11 @@ impl Dispatcher {
             wt.remove(result.branch.is_none());
             return Err(e);
         }
+        if result.status == Status::Failed {
+            return Ok((result, None));
+        }
         event.ts_ms = now_ms();
-        event.repo = event.repo.or_else(|| req.repo.file_name().map(|n| n.to_string_lossy().into_owned()));
+        event.summary = Some(status_summary(result.status));
         result.event_id = Some(event.event_id.clone());
         Ok((result, Some(event)))
     }

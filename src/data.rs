@@ -745,7 +745,10 @@ impl Steckbrief {
             write_right_code: standing.write_right(Dimension::WriteCode, scope),
             write_right_tests: standing.write_right(Dimension::WriteTests, scope),
             decisions_right: standing.decisions_right(scope),
-            duration_s: own.iter().filter_map(|e| e.duration_s).sum(),
+            duration_s: {
+                let mut jobs = std::collections::HashSet::new();
+                own.iter().filter(|e| e.duration_s.is_some() && e.job_id.as_ref().is_none_or(|j| jobs.insert(j.clone()))).filter_map(|e| e.duration_s).sum()
+            },
             review_s: own.iter().filter_map(|e| e.review_s).sum(),
             conclusions,
             reset_at: standing.book.reset_at(),

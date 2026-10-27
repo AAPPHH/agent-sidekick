@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{wrong_harness, CheckDeps, Harness, HarnessKind, LaunchInput, Normalized, SecretLoader};
+use super::{wrong_harness, CheckDeps, Harness, HarnessKind, LaunchInput, SecretLoader};
 use crate::backends::launch::{child_env, eq_name, BASE_URL_ENV, BASE_URL_WARNING};
 use crate::backends::{is_primary_oauth_name, Backend, BackendKind, Credential, Reachability};
 use crate::redact::Secrets;
@@ -52,7 +52,12 @@ pub fn parse_report(raw: &str) -> Option<ClaudeReport> {
         .unwrap_or_default();
     usage.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Some(ClaudeReport {
-        text: json.get("result").and_then(|r| r.as_str()).unwrap_or_default().to_string(),
+        text: json.get("result").and_then(|r| r.as_str()).map(str::to_string).unwrap_or_else(|| {
+            json.get("errors")
+                .and_then(|e| e.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default()
+        }),
         is_error: json.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false),
         subtype: json.get("subtype").and_then(|e| e.as_str()).unwrap_or_default().to_string(),
         models: usage.into_iter().map(|(k, _)| k).collect(),
@@ -201,12 +206,6 @@ impl Harness for ClaudeHarness {
             header,
             &permissions,
         ))
-    }
-
-    fn normalize_output(&self, raw: &str) -> Option<Normalized> {
-        let r = parse_report(raw)?;
-        let failure = r.is_error.then(|| format!("claude reported an error ({})", r.subtype));
-        Some(Normalized { text: r.text, failure, rate_limit: None })
     }
 
     fn check(&self, backend: &Backend, deps: &CheckDeps<'_>) -> Reachability {

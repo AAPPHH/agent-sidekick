@@ -394,7 +394,20 @@ impl TrustBook {
         self.cells.get_mut(&(dimension, scope.clone())).expect("inserted above")
     }
 
+    fn count_only(&mut self, e: &Event) {
+        if let Some(cell) = self.cells.get_mut(&(e.dimension, e.scope.clone())) {
+            match e.outcome {
+                Outcome::Aborted => cell.counters.aborted += 1,
+                Outcome::Note => cell.counters.note += 1,
+                _ => {}
+            }
+        }
+    }
+
     fn apply(&mut self, e: &Event, now_ms: i64) {
+        if matches!(e.outcome, Outcome::Note | Outcome::Aborted | Outcome::Reset) {
+            return self.count_only(e);
+        }
         let weight = if now_ms - e.ts_ms > HALF_WEIGHT_AFTER_MS { 0.5 } else { 1.0 };
         let cell = self.entry(e.dimension, &e.scope);
         match e.outcome {
@@ -408,9 +421,7 @@ impl TrustBook {
                 cell.counters.rejected += 1;
                 cell.value -= cell.value * REJECT_RATE * weight;
             }
-            Outcome::Aborted => cell.counters.aborted += 1,
-            Outcome::Note => cell.counters.note += 1,
-            Outcome::Reset => {}
+            Outcome::Aborted | Outcome::Note | Outcome::Reset => {}
             Outcome::Blocked => {
                 cell.counters.blocked += 1;
                 cell.value -= cell.value * BLOCK_RATE * weight;
@@ -589,12 +600,28 @@ mod tests {
     }
 
     #[test]
-    fn aborted_and_note_are_noops_but_counted() {
-        let events = vec![ev("m", Dimension::Search, "global", Outcome::Aborted, 1), ev("m", Dimension::Search, "global", Outcome::Note, 2)];
+    fn aborted_and_note_are_noops_but_counted_on_existing_cells() {
+        let events = vec![seed("m", Dimension::Search, 0.30, 0), ev("m", Dimension::Search, "global", Outcome::Aborted, 1), ev("m", Dimension::Search, "global", Outcome::Note, 2)];
         let book = TrustBook::replay(&events, "m", NOW);
         near(book.value(Dimension::Search, &Scope::Global), 0.30);
         let c = &book.cell(Dimension::Search, &Scope::Global).unwrap().counters;
         assert_eq!((c.aborted, c.note), (1, 1));
+    }
+
+    #[test]
+    fn note_aborted_and_reset_never_create_a_cell_so_later_global_blocks_still_reach_the_scope() {
+        let mut events = vec![
+            seed("m", Dimension::WriteCode, 0.55, 0),
+            ev("m", Dimension::WriteCode, "module:r/src", Outcome::Note, 1),
+            ev("m", Dimension::WriteCode, "module:r/src", Outcome::Aborted, 2),
+            ev("m", Dimension::WriteCode, "repo:r", Outcome::Reset, 3),
+        ];
+        let book = TrustBook::replay(&events, "m", NOW);
+        assert!(book.cell(Dimension::WriteCode, &Scope::parse("module:r/src").unwrap()).is_none());
+        assert!(book.cell(Dimension::WriteCode, &Scope::parse("repo:r").unwrap()).is_none());
+        events.push(ev("m", Dimension::WriteCode, "repo:other", Outcome::Blocked, 4));
+        let book = TrustBook::replay(&events, "m", NOW);
+        assert!(book.value(Dimension::WriteCode, &Scope::parse("module:r/src").unwrap()) < 0.55);
     }
 
     #[test]
