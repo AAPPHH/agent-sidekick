@@ -24,6 +24,7 @@ case "$1" in
   echo "WORKER-GOT: $(cat "$out/ans")"
   echo "PROMPT: $1"
   ;;
+*ENVME*) echo "SOCKET-ENV: $AGENT_SIDEKICK_ASK_SOCKET"; env | grep -i token ;;
 *SLEEPME*) sleep 4; echo slept ;;
 *) echo plain ;;
 esac
@@ -94,8 +95,9 @@ fn question_blocks_the_worker_and_the_answer_resumes_it() {
     assert_eq!(field(&text, "status"), "question", "{text}");
     assert_eq!(field(&text, "question"), "Which database?", "{text}");
     let job = field(&text, "job_id").to_string();
+    let qid: u64 = field(&text, "question_id").parse().unwrap();
     std::thread::sleep(Duration::from_secs(5));
-    let done = s.call_tool_within("sidekick_answer", json!({"job_id": job, "answer": "Postgres"}), Duration::from_secs(30));
+    let done = s.call_tool_within("sidekick_answer", json!({"job_id": job, "answer": "Postgres", "question_id": qid}), Duration::from_secs(30));
     let text = text_of(&done);
     assert!(done["isError"] != json!(true), "{text}");
     assert!(text.contains("status: NoChange"), "{text}");
@@ -120,8 +122,9 @@ fn unanswered_question_tells_the_worker_to_deliver_what_it_has() {
     let cwd = repo.to_string_lossy().to_string();
     let first = s.call_tool_within("sidekick_dispatch", json!({"prompt": "ASKME", "cwd": cwd, "dimension": "search"}), Duration::from_secs(30));
     let job = field(&text_of(&first), "job_id").to_string();
+    let qid: u64 = field(&text_of(&first), "question_id").parse().unwrap();
     std::thread::sleep(Duration::from_secs(3));
-    let done = s.call_tool_within("sidekick_answer", json!({"job_id": job, "answer": "too late"}), Duration::from_secs(30));
+    let done = s.call_tool_within("sidekick_answer", json!({"job_id": job, "answer": "too late", "question_id": qid}), Duration::from_secs(30));
     let text = text_of(&done);
     assert!(text.contains("your answer was not delivered"), "{text}");
     assert!(text.contains("Keine Antwort vom Orchestrator: nichts entscheiden, aktuellen Stand abliefern und offene Punkte nennen."), "{text}");
@@ -131,7 +134,7 @@ fn unanswered_question_tells_the_worker_to_deliver_what_it_has() {
 #[test]
 fn answer_for_an_unknown_job_is_an_error() {
     let (_d, mut s, _repo, _cfg) = fixture();
-    let res = s.call_tool("sidekick_answer", json!({"job_id": "nope", "answer": "x"}));
+    let res = s.call_tool("sidekick_answer", json!({"job_id": "nope", "answer": "x", "question_id": 1}));
     assert_eq!(res["isError"], json!(true), "{res}");
 }
 
@@ -179,12 +182,30 @@ fn an_answer_for_another_question_is_not_delivered_and_names_the_open_one() {
 }
 
 #[test]
+fn an_answer_without_a_question_id_is_rejected_and_the_question_stays_open() {
+    let (_d, mut s, repo, _cfg) = fixture();
+    let first = text_of(&ask(&mut s, &repo, json!({"job_id": "noid"})));
+    let qid: u64 = field(&first, "question_id").parse().unwrap();
+    let bare = s.call_tool_within("sidekick_answer", json!({"job_id": "noid", "answer": "wrong"}), Duration::from_secs(10));
+    assert_eq!(bare["isError"], json!(true), "{bare}");
+    let done = text_of(&s.call_tool_within("sidekick_answer", json!({"job_id": "noid", "answer": "Right", "question_id": qid}), Duration::from_secs(30)));
+    assert!(done.contains("Right") && !done.contains("wrong"), "{done}");
+}
+
+#[test]
+fn the_ask_token_is_not_in_the_environment_the_worker_sees() {
+    let (_d, mut s, repo, _cfg) = fixture();
+    let first = text_of(&ask(&mut s, &repo, json!({"job_id": "envtok", "prompt": "ENVME"})));
+    assert!(first.contains("SOCKET-ENV: /") && !first.contains('#'), "{first}");
+}
+
+#[test]
 fn a_finished_job_nobody_collects_is_dropped_from_the_broker() {
     let (_d, mut s, repo, _cfg) = fixture_with(&[("AGENT_SIDEKICK_ASK_TIMEOUT_S", "1"), ("AGENT_SIDEKICK_RESULT_GRACE_S", "1")]);
     let first = text_of(&ask(&mut s, &repo, json!({"job_id": "leak"})));
     assert_eq!(field(&first, "status"), "question", "{first}");
     std::thread::sleep(Duration::from_secs(6));
-    let res = s.call_tool("sidekick_answer", json!({"job_id": "leak", "answer": "late"}));
+    let res = s.call_tool("sidekick_answer", json!({"job_id": "leak", "answer": "late", "question_id": 1}));
     assert_eq!(res["isError"], json!(true), "{res}");
     let again = ask(&mut s, &repo, json!({"job_id": "leak"}));
     assert!(text_of(&again).contains("status: question"), "{again}");

@@ -200,8 +200,8 @@ pub struct AnswerParams {
     pub job_id: String,
     /// Your answer; the blocked worker receives it as the result of ask_orchestrator.
     pub answer: String,
-    /// The question_id from the `question` result. Without it the answer goes to the currently open question; with it only to that question.
-    pub question_id: Option<u64>,
+    /// The question_id from the `question` result (required): the answer is delivered only to that question.
+    pub question_id: u64,
 }
 
 pub use crate::workflow::WorkflowParams;
@@ -1703,7 +1703,7 @@ impl SidekickServer {
             Answered::Unknown => tool_error(format!("no running job `{}` with a question (finished, cancelled or unknown)", p.job_id.trim())),
             Answered::Delivered(session) => self.wait_event(&session, &ctx).await,
             Answered::OtherQuestionOpen { open_id, text } => Ok(text_result(
-                redact_all(&format!("note: question {} is not open, your answer was not delivered\nstatus: question\nquestion_id: {open_id}\nquestion: {text}\nanswer it with sidekick_answer(job_id, answer, question_id={open_id})", p.question_id.map_or_else(String::new, |q| q.to_string()))),
+                redact_all(&format!("note: question {} is not open, your answer was not delivered\nstatus: question\nquestion_id: {open_id}\nquestion: {text}\nanswer it with sidekick_answer(job_id, answer, question_id={open_id})", p.question_id)),
                 false,
             )),
             Answered::NoOpenQuestion(session) => {
@@ -1929,13 +1929,19 @@ impl SidekickServer {
         let ticker = ctx.meta.get_progress_token().map(|token| {
             spawn_progress_ticker(ctx.peer.clone(), token, session.phase.clone(), session.timeout, progress_interval())
         });
-        let event = tokio::select! {
-            e = session.next() => e,
-            _ = ctx.ct.cancelled() => {
-                session.cancel.cancel();
-                self.state.broker.close(session);
-                drop(ticker);
-                return tool_error(CANCELLED_LINE);
+        let event = loop {
+            let event = tokio::select! {
+                e = session.next() => e,
+                _ = ctx.ct.cancelled() => {
+                    session.cancel.cancel();
+                    self.state.broker.close(session);
+                    drop(ticker);
+                    return tool_error(CANCELLED_LINE);
+                }
+            };
+            match &event {
+                Some(JobEvent::Question { job_id, question_id, .. }) if !self.state.broker.is_open(job_id, *question_id) => continue,
+                _ => break event,
             }
         };
         drop(ticker);

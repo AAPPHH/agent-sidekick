@@ -167,7 +167,12 @@ mod transport {
             }
         };
         let token = uuid::Uuid::new_v4().simple().to_string();
-        Ok((listener, format!("{}#{token}", path.to_string_lossy()), token))
+        write_token(&job_dir, &token)?;
+        Ok((listener, path.to_string_lossy().into_owned(), token))
+    }
+
+    fn token_dir(endpoint: &str) -> PathBuf {
+        Path::new(endpoint).parent().map(Path::to_path_buf).unwrap_or_default()
     }
 
     impl Listener {
@@ -182,9 +187,12 @@ mod transport {
         }
     }
 
-    pub async fn connect(endpoint: &str) -> std::io::Result<(Stream, String)> {
-        let (path, token) = endpoint.rsplit_once('#').unwrap_or((endpoint, ""));
-        Ok((tokio::net::UnixStream::connect(path).await?, token.to_string()))
+    pub async fn connect(endpoint: &str) -> std::io::Result<Stream> {
+        tokio::net::UnixStream::connect(endpoint).await
+    }
+
+    pub fn take_token(endpoint: &str) -> Result<String> {
+        take_token_file(&token_dir(endpoint))
     }
 }
 
@@ -192,14 +200,17 @@ mod transport {
 mod transport {
     use super::*;
     pub type Stream = tokio::net::TcpStream;
-    pub struct Listener(tokio::net::TcpListener);
+    pub struct Listener(tokio::net::TcpListener, PathBuf);
 
-    pub fn bind(_dir: &Path) -> Result<(Listener, String, String)> {
+    pub fn bind(dir: &Path) -> Result<(Listener, String, String)> {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         std_listener.set_nonblocking(true)?;
         let port = std_listener.local_addr()?.port();
+        let job_dir = dir.join(&uuid::Uuid::new_v4().simple().to_string()[..16]);
+        std::fs::create_dir_all(&job_dir)?;
         let token = uuid::Uuid::new_v4().simple().to_string();
-        Ok((Listener(tokio::net::TcpListener::from_std(std_listener)?), format!("127.0.0.1:{port}#{token}"), token))
+        write_token(&job_dir, &token)?;
+        Ok((Listener(tokio::net::TcpListener::from_std(std_listener)?, job_dir.clone()), format!("127.0.0.1:{port}|{}", job_dir.display()), token))
     }
 
     impl Listener {
@@ -208,10 +219,38 @@ mod transport {
         }
     }
 
-    pub async fn connect(endpoint: &str) -> std::io::Result<(Stream, String)> {
-        let (addr, token) = endpoint.split_once('#').unwrap_or((endpoint, ""));
-        Ok((tokio::net::TcpStream::connect(addr).await?, token.to_string()))
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
     }
+
+    pub async fn connect(endpoint: &str) -> std::io::Result<Stream> {
+        tokio::net::TcpStream::connect(endpoint.split_once('|').map_or(endpoint, |e| e.0)).await
+    }
+
+    pub fn take_token(endpoint: &str) -> Result<String> {
+        take_token_file(Path::new(endpoint.split_once('|').map_or("", |e| e.1)))
+    }
+}
+
+const TOKEN_FILE: &str = "t";
+
+fn write_token(dir: &Path, token: &str) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(dir.join(TOKEN_FILE))?.write_all(token.as_bytes())?;
+    Ok(())
+}
+
+fn take_token_file(dir: &Path) -> Result<String> {
+    let path = dir.join(TOKEN_FILE);
+    let token = std::fs::read_to_string(&path).context("the ask token was already consumed or is missing")?;
+    std::fs::remove_file(&path)?;
+    Ok(token.trim().to_string())
 }
 
 #[derive(Debug)]
@@ -303,11 +342,11 @@ impl Broker {
         st.job_session.get(job_id).and_then(|s| st.sessions.get(s)).cloned()
     }
 
-    pub fn answer(&self, job_id: &str, question_id: Option<u64>, answer: String) -> Answered {
-        let Some(session) = self.session_of(job_id) else { return Answered::Unknown };
+    pub fn answer(&self, job_id: &str, question_id: u64, answer: String) -> Answered {
         let mut st = self.st();
+        let Some(session) = st.job_session.get(job_id).and_then(|s| st.sessions.get(s)).cloned() else { return Answered::Unknown };
         let Some((open_id, text, _)) = st.pending.get(job_id) else { return Answered::NoOpenQuestion(session) };
-        if question_id.is_some_and(|w| w != *open_id) {
+        if question_id != *open_id {
             return Answered::OtherQuestionOpen { open_id: *open_id, text: text.clone() };
         }
         let (_, _, tx) = st.pending.remove(job_id).expect("checked");
@@ -316,6 +355,10 @@ impl Broker {
         } else {
             Answered::NoOpenQuestion(session)
         }
+    }
+
+    pub fn is_open(&self, job_id: &str, question_id: u64) -> bool {
+        self.st().pending.get(job_id).is_some_and(|(id, ..)| *id == question_id)
     }
 
     fn add_pending(&self, job_id: &str, question: &str) -> (u64, oneshot::Receiver<String>) {
@@ -407,14 +450,18 @@ impl AskJob {
             return self.give_up();
         }
         self.questions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(question.clone());
-        let (id, rx) = self.broker.add_pending(&self.job_id, &question);
+        let (id, mut rx) = self.broker.add_pending(&self.job_id, &question);
         let mut open = OpenQuestion { job: self, id, since: Instant::now(), answered: false };
         let _hold = self.pause.hold();
         self.session.send(JobEvent::Question { job_id: self.job_id.clone(), step: self.step.clone(), question_id: id, text: question });
-        let answer = tokio::select! {
-            a = tokio::time::timeout(limit, rx) => a.ok().and_then(Result::ok),
+        let mut answer = tokio::select! {
+            a = tokio::time::timeout(limit, &mut rx) => a.ok().and_then(Result::ok),
             _ = self.session.cancel.cancelled() => None,
         };
+        if answer.is_none() {
+            rx.close();
+            answer = rx.try_recv().ok();
+        }
         open.answered = answer.is_some();
         answer.unwrap_or_else(|| NO_ANSWER.to_string())
     }
@@ -485,13 +532,14 @@ pub struct AskParams {
 #[derive(Clone)]
 struct Bridge {
     endpoint: String,
+    token: String,
 }
 
 impl Bridge {
     async fn forward(&self, question: &str) -> Result<String> {
-        let (stream, token) = transport::connect(&self.endpoint).await.context("the orchestrator is not reachable")?;
+        let stream = transport::connect(&self.endpoint).await.context("the orchestrator is not reachable")?;
         let (read, mut write) = tokio::io::split(stream);
-        write.write_all(format!("{}\n", json!({"token": token, "question": question})).as_bytes()).await?;
+        write.write_all(format!("{}\n", json!({"token": self.token, "question": question})).as_bytes()).await?;
         let mut line = String::new();
         BufReader::new(read).read_line(&mut line).await?;
         if line.is_empty() {
@@ -538,7 +586,8 @@ impl ServerHandler for Bridge {
 }
 
 pub async fn run_bridge(_job: &str, endpoint: &str) -> Result<()> {
-    let service = Bridge { endpoint: endpoint.to_string() }.serve(rmcp::transport::stdio()).await.map_err(|e| anyhow::anyhow!("MCP initialization failed: {e}"))?;
+    let token = transport::take_token(endpoint)?;
+    let service = Bridge { endpoint: endpoint.to_string(), token }.serve(rmcp::transport::stdio()).await.map_err(|e| anyhow::anyhow!("MCP initialization failed: {e}"))?;
     service.waiting().await?;
     Ok(())
 }
@@ -653,10 +702,10 @@ mod tests {
         let (id, text) = next_question(&session).await;
         assert_eq!(text, "which?");
         assert!(job.pause.paused_total() < Duration::from_secs(5));
-        assert!(matches!(broker.answer("j1", Some(id), "this".into()), Answered::Delivered(_)));
+        assert!(matches!(broker.answer("j1", id, "this".into()), Answered::Delivered(_)));
         assert_eq!(asking.await.unwrap(), "this");
-        assert!(matches!(broker.answer("j1", None, "again".into()), Answered::NoOpenQuestion(_)));
-        assert!(matches!(broker.answer("nope", None, "x".into()), Answered::Unknown));
+        assert!(matches!(broker.answer("j1", id, "again".into()), Answered::NoOpenQuestion(_)));
+        assert!(matches!(broker.answer("nope", id, "x".into()), Answered::Unknown));
         assert_eq!(job.asked(), ["which?"]);
         assert!(!job.unanswered.load(Ordering::SeqCst));
     }
@@ -671,9 +720,9 @@ mod tests {
         let asking = { let long = long.clone(); tokio::spawn(async move { long.ask("q2".into()).await }) };
         let (q2, _) = next_question(&session).await;
         assert_ne!(q1, q2);
-        assert!(matches!(broker.answer("j1", Some(q1), "for q1".into()), Answered::OtherQuestionOpen { open_id, ref text } if open_id == q2 && text == "q2"));
+        assert!(matches!(broker.answer("j1", q1, "for q1".into()), Answered::OtherQuestionOpen { open_id, ref text } if open_id == q2 && text == "q2"));
         assert!(!asking.is_finished());
-        assert!(matches!(broker.answer("j1", Some(q2), "for q2".into()), Answered::Delivered(_)));
+        assert!(matches!(broker.answer("j1", q2, "for q2".into()), Answered::Delivered(_)));
         assert_eq!(asking.await.unwrap(), "for q2");
     }
 
@@ -685,10 +734,10 @@ mod tests {
         let (id1, t1) = next_question(&session).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(tokio::time::timeout(Duration::from_millis(100), session.next()).await.is_err());
-        assert!(matches!(broker.answer("j1", Some(id1), format!("re {t1}")), Answered::Delivered(_)));
+        assert!(matches!(broker.answer("j1", id1, format!("re {t1}")), Answered::Delivered(_)));
         let (id2, t2) = next_question(&session).await;
         assert_ne!(t1, t2);
-        assert!(matches!(broker.answer("j1", Some(id2), "ok".into()), Answered::Delivered(_)));
+        assert!(matches!(broker.answer("j1", id2, "ok".into()), Answered::Delivered(_)));
         let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
         assert!(ra.starts_with("re ") != rb.starts_with("re "));
     }
@@ -733,21 +782,37 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_socket_lives_in_a_private_dir_with_a_token_and_a_wrong_token_is_ignored() {
+    async fn the_token_is_never_in_the_endpoint_but_in_a_one_shot_0600_file_next_to_the_private_socket() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let (_broker, session, job) = job(Duration::from_millis(300));
         let server = AskServer::start(&dir.path().join("ask"), job).unwrap();
-        let (path, token) = server.endpoint.rsplit_once('#').unwrap();
-        assert!(!token.is_empty() && !path.contains("j1"));
-        assert_eq!(std::fs::metadata(Path::new(path).parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
-        let (mut bad, _) = transport::connect(&server.endpoint).await.unwrap();
+        let path = server.endpoint.clone();
+        assert!(!path.contains('#') && !path.contains("j1"));
+        let sock_dir = Path::new(&path).parent().unwrap().to_path_buf();
+        assert_eq!(std::fs::metadata(&sock_dir).unwrap().permissions().mode() & 0o777, 0o700);
+        let token_file = sock_dir.join("t");
+        assert_eq!(std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777, 0o600);
+        let mut bad = transport::connect(&server.endpoint).await.unwrap();
         bad.write_all(format!("{}\n", json!({"token": "nope", "question": "x"})).as_bytes()).await.unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(200), session.next()).await.is_err());
-        let sock_dir = Path::new(path).parent().unwrap().to_path_buf();
+        let token = transport::take_token(&server.endpoint).unwrap();
+        assert!(!token_file.exists() && transport::take_token(&server.endpoint).is_err());
+        let mut good = transport::connect(&server.endpoint).await.unwrap();
+        good.write_all(format!("{}\n", json!({"token": token, "question": "y"})).as_bytes()).await.unwrap();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(2), session.next()).await, Ok(Some(JobEvent::Question { .. }))));
         drop(server);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!sock_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn an_answer_arriving_after_the_timeout_is_not_reported_as_delivered_and_a_stale_event_is_not_open() {
+        let (broker, session, job) = job(Duration::from_millis(100));
+        assert_eq!(job.ask("q1".into()).await, NO_ANSWER);
+        let (q1, _) = next_question(&session).await;
+        assert!(!broker.is_open("j1", q1));
+        assert!(matches!(broker.answer("j1", q1, "late".into()), Answered::NoOpenQuestion(_)));
     }
 
     #[cfg(unix)]
@@ -757,7 +822,7 @@ mod tests {
         let long = dir.path().join("a".repeat(60)).join("b".repeat(60));
         let (_broker, _session, job) = job(Duration::from_millis(300));
         let server = AskServer::start(&long, job).unwrap();
-        let path = server.endpoint.rsplit_once('#').unwrap().0.to_string();
+        let path = server.endpoint.clone();
         assert!(path.len() <= 100 && Path::new(&path).exists(), "{path}");
         drop(server);
     }

@@ -127,6 +127,7 @@ async fn real_opencode_blocks_in_ask_orchestrator_for_over_a_minute_and_continue
     let base = vec![("PATH".into(), std::env::var_os("PATH").unwrap_or_default()), ("SHELL".into(), "/bin/sh".into())];
     let mut launch = build_launch(backend, &req, &Credential::None, &program, base, &[]).unwrap();
     let sock = tmp.path().join("ask.sock");
+    std::fs::write(tmp.path().join("t"), "tok").unwrap();
     let listener = UnixListener::bind(&sock).unwrap();
     let asked = Arc::new(Mutex::new(None::<(String, Instant)>));
     let seen = asked.clone();
