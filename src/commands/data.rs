@@ -155,6 +155,12 @@ impl Validator<'_> {
         Ok(out)
     }
 
+    fn reset_allowed(&self, rel: &str) -> bool {
+        let Some(prefix) = prefix_of(rel) else { return rel.starts_with("aggregate/") };
+        let text = std::fs::read_to_string(self.root.join(PEERS)).unwrap_or_default();
+        text.parse::<toml::Table>().is_ok_and(|t| crate::sync::peers_owner(&t, prefix))
+    }
+
     fn base_event_ids(&self, rev: &str) -> Result<Vec<(String, String)>> {
         let mut ids = Vec::new();
         let files = git_z(self.root, &["ls-tree", "-r", "--name-only", "-z", rev, "--", "experiences"])?;
@@ -222,7 +228,8 @@ impl Validator<'_> {
         } else if name == "protected.parquet" {
             check_schema(full, ProtectedRow::schema()).and_then(|_| ProtectedRow::read_all(full).map(|_| Vec::new()))
         } else if name.starts_with("experiences/") || name.starts_with("aggregate/") {
-            check_schema(full, experience_schema()).and_then(|_| event_violations(full))
+            let reset_ok = self.reset_allowed(rel);
+            check_schema(full, experience_schema()).and_then(|_| event_violations(full, reset_ok))
         } else {
             Ok(Vec::new())
         };
@@ -243,7 +250,7 @@ fn check_schema(path: &Path, expected: SchemaRef) -> Result<()> {
     Ok(())
 }
 
-fn event_violations(path: &Path) -> Result<Vec<String>> {
+fn event_violations(path: &Path, reset_ok: bool) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for e in read_events(path)? {
         let id = &e.event_id;
@@ -257,6 +264,9 @@ fn event_violations(path: &Path) -> Result<Vec<String>> {
         }
         if e.outcome == crate::trust::Outcome::Seed && !e.dimension.seedable() {
             out.push(format!("event {id}: seed for dimension {} (only search/inventory)", e.dimension));
+        }
+        if e.outcome == crate::trust::Outcome::Reset && !reset_ok {
+            out.push(format!("event {id}: reset row from a prefix whose owner is not listed in peers.toml owners"));
         }
     }
     Ok(out)

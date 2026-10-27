@@ -178,6 +178,7 @@ pub enum Outcome {
     Blocked,
     Note,
     Seed,
+    Reset,
 }
 
 impl Outcome {
@@ -189,6 +190,7 @@ impl Outcome {
             Outcome::Blocked => "blocked",
             Outcome::Note => "note",
             Outcome::Seed => "seed",
+            Outcome::Reset => "reset",
         }
     }
 
@@ -200,6 +202,7 @@ impl Outcome {
             Outcome::Blocked,
             Outcome::Note,
             Outcome::Seed,
+            Outcome::Reset,
         ]
         .into_iter()
         .find(|o| o.as_str() == s)
@@ -341,16 +344,30 @@ pub fn dedup_sorted(events: impl IntoIterator<Item = Event>) -> Vec<Event> {
 #[derive(Clone, Debug, Default)]
 pub struct TrustBook {
     cells: HashMap<(Dimension, Scope), Cell>,
+    reset_at: Option<i64>,
 }
 
 impl TrustBook {
     pub fn replay(events: &[Event], model_id: &str, now_ms: i64) -> Self {
         let mut book = Self::default();
         let own = events.iter().filter(|e| e.model_id == model_id).cloned();
-        for e in dedup_sorted(own) {
-            book.apply(&e, now_ms);
+        let sorted = dedup_sorted(own);
+        let cut = sorted.iter().rposition(|e| e.outcome == Outcome::Reset);
+        let (kept, rest) = match cut {
+            Some(i) => {
+                book.reset_at = Some(sorted[i].ts_ms);
+                (sorted[..i].iter().filter(|e| e.outcome == Outcome::Blocked).collect::<Vec<_>>(), &sorted[i + 1..])
+            }
+            None => (Vec::new(), &sorted[..]),
+        };
+        for e in kept.into_iter().chain(rest.iter()) {
+            book.apply(e, now_ms);
         }
         book
+    }
+
+    pub fn reset_at(&self) -> Option<i64> {
+        self.reset_at
     }
 
     pub fn value(&self, dimension: Dimension, scope: &Scope) -> f64 {
@@ -393,6 +410,7 @@ impl TrustBook {
             }
             Outcome::Aborted => cell.counters.aborted += 1,
             Outcome::Note => cell.counters.note += 1,
+            Outcome::Reset => {}
             Outcome::Blocked => {
                 cell.counters.blocked += 1;
                 cell.value -= cell.value * BLOCK_RATE * weight;
@@ -669,5 +687,42 @@ mod tests {
         near(nd.effective_trust(Dimension::Decisions, &g), 0.95);
         let low = Standing::compute(&key, Sperre::Technisch, &[], NOW);
         assert!(!low.write_right(Dimension::WriteCode, &g) && !low.decisions_right(&g));
+    }
+
+    #[test]
+    fn reset_neutralises_all_but_blocks() {
+        let key = qwen();
+        let id = key.model_id();
+        let mut blocked = ev(&id, Dimension::WriteCode, "global", Outcome::Blocked, 1000);
+        blocked.block_reason = Some("Validierung decided_by entfernt".into());
+        let mut events = vec![seed(&id, Dimension::Search, 0.55, 3), seed(&id, Dimension::Inventory, 0.35, 2), blocked];
+        events.push(ev(&id, Dimension::Inventory, "global", Outcome::Accepted, 1500));
+        events.push(ev(&id, Dimension::Search, "global", Outcome::Rejected, 1600));
+        events.push(ev(&id, Dimension::Decisions, "repo:r", Outcome::Rejected, 1700));
+        events.push(ev(&id, Dimension::Search, "global", Outcome::Reset, 2000));
+        let s = Standing::compute(&key, Sperre::Technisch, &events, NOW);
+        let g = Scope::Global;
+        near(s.trust(Dimension::Search, &g), 0.30);
+        near(s.trust(Dimension::Inventory, &g), 0.30);
+        near(s.trust(Dimension::WriteTests, &g), 0.20);
+        near(s.trust(Dimension::WriteCode, &g), 0.10);
+        near(s.trust(Dimension::Decisions, &g), 0.10);
+        assert!(!s.manual(Dimension::Search, &g) && !s.manual(Dimension::Inventory, &g));
+        assert_eq!(s.book.reset_at(), Some(BASE + 2000));
+        assert_eq!(s.book.cell(Dimension::WriteCode, &g).unwrap().counters.blocked, 1);
+        assert!(s.book.cell(Dimension::Search, &g).is_none());
+        events.push(ev(&id, Dimension::Search, "global", Outcome::Rejected, 3000));
+        let later = Standing::compute(&key, Sperre::Technisch, &events, NOW);
+        near(later.trust(Dimension::Search, &g), 0.30 * 0.85);
+        let mut again = events.clone();
+        again.push(ev(&id, Dimension::Search, "global", Outcome::Reset, 4000));
+        near(Standing::compute(&key, Sperre::Technisch, &again, NOW).trust(Dimension::WriteCode, &g), 0.10);
+        near(Standing::compute(&key, Sperre::Technisch, &again, NOW).trust(Dimension::Search, &g), 0.30);
+    }
+
+    #[test]
+    fn reset_of_other_model_is_ignored() {
+        let events = vec![ev("other", Dimension::Search, "global", Outcome::Reset, 5), ev("m", Dimension::Search, "global", Outcome::Rejected, 1)];
+        near(TrustBook::replay(&events, "m", NOW).value(Dimension::Search, &Scope::Global), 0.30 * 0.85);
     }
 }

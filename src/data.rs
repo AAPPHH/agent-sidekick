@@ -606,6 +606,7 @@ pub struct Steckbrief {
     pub duration_s: f64,
     pub review_s: f64,
     pub conclusions: Vec<Conclusion>,
+    pub reset_at: Option<i64>,
 }
 
 fn utc(ts_ms: i64) -> String {
@@ -656,6 +657,7 @@ impl Steckbrief {
             duration_s: own.iter().filter_map(|e| e.duration_s).sum(),
             review_s: own.iter().filter_map(|e| e.review_s).sum(),
             conclusions,
+            reset_at: standing.book.reset_at(),
         }
     }
 
@@ -703,6 +705,9 @@ impl Steckbrief {
             self.duration_s.round() as i64,
             self.review_s.round() as i64
         ));
+        if let Some(t) = self.reset_at {
+            out.push_str(&format!("zurückgesetzt am {}\n", utc(t).split(' ').next().unwrap_or_default()));
+        }
         for c in &self.conclusions {
             out.push_str(&format!("Fazit ({}, ts {}): {}\n", c.scope, c.ts_ms, c.text));
         }

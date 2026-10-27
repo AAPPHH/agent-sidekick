@@ -132,10 +132,12 @@ pub struct RecordParams {
     pub model_id: Option<String>,
     pub backend: Option<String>,
     pub model: Option<String>,
-    /// search | inventory | write-tests | write-code | decisions. Required without `job_id`.
+    /// search | inventory | write-tests | write-code | decisions. Required without `job_id` (not for reset).
     pub dimension: Option<String>,
     /// With `job_id`: accepted | rejected. Otherwise accepted | rejected | aborted | note | seed.
-    /// `blocked` is written by the sidekick only. seed sets the trust value directly: only for
+    /// `blocked` is written by the sidekick only. reset (no job_id; dimension and scope are
+    /// ignored; only for data_name prefixes whose owner is listed in peers.toml) starts the
+    /// model's trust over except for earlier blocks. seed sets the trust value directly: only for
     /// search and inventory, needs `seed_value`.
     pub outcome: String,
     /// global (default) | repo:<name> | module:<repo>/<path>.
@@ -1528,7 +1530,11 @@ impl SidekickServer {
         let input = (|| -> anyhow::Result<ExperienceInput> {
             Ok(ExperienceInput {
                 model_id,
-                dimension: Dimension::parse(p.dimension.as_deref().ok_or_else(|| anyhow::anyhow!("dimension is required without job_id"))?)?,
+                dimension: match (p.dimension.as_deref(), p.outcome.as_str()) {
+                    (Some(d), _) => Dimension::parse(d)?,
+                    (None, "reset") => Dimension::Search,
+                    (None, _) => anyhow::bail!("dimension is required without job_id"),
+                },
                 scope: p.scope.as_deref().map(Scope::parse).transpose()?.unwrap_or(Scope::Global),
                 outcome: Outcome::parse(&p.outcome)?,
                 job_id: p.job_id,

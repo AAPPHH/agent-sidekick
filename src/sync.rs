@@ -73,6 +73,12 @@ pub fn remote_url(repo: &str) -> String {
     }
 }
 
+pub fn peers_owner(table: &toml::Table, prefix: &str) -> bool {
+    let owner = table.iter().find(|(k, _)| k.as_str() != "owners" && k.eq_ignore_ascii_case(prefix)).and_then(|(_, v)| v.as_str());
+    let owners = table.get("owners").and_then(|o| o.as_array());
+    matches!((owner, owners), (Some(o), Some(a)) if a.iter().filter_map(|x| x.as_str()).any(|x| x.eq_ignore_ascii_case(o)))
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
@@ -196,6 +202,12 @@ impl DataStore {
         Ok((id, self.push_locked()))
     }
 
+    pub fn is_owner(&self) -> bool {
+        let Ok(text) = fs::read_to_string(self.checkout.join("peers.toml")) else { return false };
+        let Ok(table) = text.parse::<toml::Table>() else { return false };
+        peers_owner(&table, &self.name)
+    }
+
     pub fn record(&self, input: ExperienceInput) -> Result<(String, bool)> {
         match input.outcome {
             Outcome::Blocked => bail!("outcome blocked is written by the sidekick after the diff check, not by record_experience"),
@@ -208,13 +220,22 @@ impl DataStore {
                     _ => bail!("seed needs seed_value between 0 and 1"),
                 }
             }
+            Outcome::Reset => {
+                if input.job_id.is_some() {
+                    bail!("reset takes no job_id");
+                }
+                if !self.is_owner() {
+                    bail!("reset is only allowed for owners listed in peers.toml (prefix `{}`)", self.name);
+                }
+            }
             _ => {}
         }
         if input.review_s.is_some_and(|v| v < 0.0) || input.duration_s.is_some_and(|v| v < 0.0) {
             bail!("review_s and duration_s must not be negative");
         }
         self.data.model(&input.model_id)?;
-        let mut e = Event::new(&input.model_id, input.dimension, input.scope, input.outcome, chrono::Utc::now().timestamp_millis());
+        let scope = if input.outcome == Outcome::Reset { Scope::Global } else { input.scope };
+        let mut e = Event::new(&input.model_id, input.dimension, scope, input.outcome, chrono::Utc::now().timestamp_millis());
         e.machine_id = self.machine_id.clone();
         e.user_id = self.user_id.clone();
         e.job_id = input.job_id;
