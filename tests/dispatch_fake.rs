@@ -610,4 +610,7 @@ fn ids_share_one_rule_and_taken_names_are_found() {
     assert!(name_taken(&e.repo, &work, "old").unwrap().contains("branch"));
     std::fs::create_dir_all(work.join("worktrees/wt")).unwrap();
     assert!(name_taken(&e.repo, &work, "wt").unwrap().contains("worktree"));
+    std::fs::create_dir_all(work.join("patches")).unwrap();
+    std::fs::write(work.join("patches/other.patch"), "x").unwrap();
+    assert!(name_taken(&e.repo, &work, "other").unwrap().contains("earlier job"));
 }

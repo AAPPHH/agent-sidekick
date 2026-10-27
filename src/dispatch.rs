@@ -443,7 +443,10 @@ pub fn name_taken(repo: &Path, work_dir: &Path, id: &str) -> Option<String> {
     if exists {
         return Some(format!("branch {BRANCH_PREFIX}{id} already exists"));
     }
-    work_dir.join("worktrees").join(id).exists().then(|| format!("worktree for `{id}` already exists"))
+    if work_dir.join("worktrees").join(id).exists() {
+        return Some(format!("worktree for `{id}` already exists"));
+    }
+    ["patches/{}.patch", "patches/{}.proposal", "index/{}"].iter().map(|t| work_dir.join(t.replace("{}", id))).find(|p| p.exists()).map(|p| format!("artefact {} of an earlier job `{id}` already exists (another repository?)", p.display()))
 }
 
 fn no_hooks() -> &'static Path {
