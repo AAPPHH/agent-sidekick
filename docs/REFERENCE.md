@@ -434,12 +434,22 @@ Without a `[backends]` section it also shows the global `default model` and the 
 Experience data lives in the public code repo under `data/`. The sidekick keeps a sparse checkout (`data/` only) in `<config-dir>/data/checkout` (override: `AGENT_SIDEKICK_DATA_DIR`) and full local copies of its own session files in `<data>/local`. `secret` (HMAC key, never pushed), `machine_id` and a `pending` flag sit next to them.
 
 - `sidekick_steckbrief(model_id | backend[+model], scope?)`: rendered profile (registry, trust per dimension and scope, counters, last block, review share, write and decisions right, cost balance, newest conclusions).
-- `sidekick_dispatch(prompt, dimension, scope?, backend?, model?, cwd?, job_id?, max_turns?, timeout_s?, provider?, checkpoint?, quant?)`: job in its own git worktree, same queues and progress as `sidekick_run`. No write right: no write tools, any diff is a block. Diff checks: protected paths and terms, module path bound, file and line limits. Result as branch `sidekick/<job_id>` plus patch; applied only for the Gold model (on a conflict branch and patch are kept). Blocked and aborted outcomes are recorded automatically.
+- `sidekick_dispatch(prompt, dimension, scope?, backend?, model?, cwd?, job_id?, max_turns?, timeout_s?, checkpoint?, quant?)`: job in its own git worktree, same queues and progress as `sidekick_run`. No write right: no write tools, any diff is a block. Diff checks: protected paths and terms, module path bound, file and line limits. Result as branch `sidekick/<job_id>` plus patch; applied only for the Gold model (provider `anthropic`, model `claude-opus-5-5`, harness `claude-code` and a `claude-oauth` backend; the provider is always derived from the backend, never from the caller; on a conflict branch and patch are kept). Blocked and aborted outcomes are recorded automatically.
 - `sidekick_record_experience(model_id | backend[+model], dimension, outcome, scope?, review_s?, conclusion?, visibility?, ...)`: outcome `accepted|rejected|aborted|note|seed`. `seed` only for search and inventory with `seed_value`. `visibility` defaults to `private`.
 - `sidekick_query(sql)`: read-only SQL over `models`, `protected`, `experiences`.
 - `sidekick_sync()`: pull, then push pending commits.
 
 Sync: pull at server start (when `data_name` is set or a checkout exists; failure keeps the local state). Each recorded event rewrites the own session file, `git add`s only that path, commits as `data: ...` and pushes; a rejection triggers `pull --rebase` and a bounded retry, offline leaves the pending flag for the next `sidekick_sync`. Nothing outside `data/experiences/<data_name>/` is ever committed. In the pushed copy `user_id` and `machine_id` are the first 16 hex of HMAC-SHA256(local secret, raw value); `summary` and `conclusion` are pushed only for `visibility = shared`.
+
+### Data repository protection
+
+`.github/workflows/data-validate.yml` validates every push that touches `data/**`, `.github/workflows/data-*.yml` or `.github/CODEOWNERS` from the bot-maintained tag `data-validated` up to the pushed commit and moves the tag after a clean run. A violating path is restored to its state at the tag by a bot commit and an issue is opened; validation that cannot run opens an issue and leaves the tag where it is. The files `data/models.parquet`, `data/protected.parquet`, `data/peers.toml`, `.github/workflows/data-*.yml` and `.github/CODEOWNERS` may only be changed by the `owners` listed in `data/peers.toml` (read from the base revision). Bootstrap: create the tag `data-validated` on a reviewed commit by hand; without it the first run validates all of `data/` against the head revision.
+
+A push-triggered workflow cannot stop a push that edits the workflow itself, so the branch needs a ruleset (Settings > Rules > Rulesets > New branch ruleset):
+
+- Name `protect-ci`, Enforcement status `Active`, Target branches: `Include default branch`.
+- Rules: `Restrict file paths` with `.github/**`, `Restrict pushes` with a bypass list holding only the repository owner (or require a pull request with `Require review from Code Owners` and `.github/CODEOWNERS` listing the owner for `/.github/`).
+- Bypass list: the repository owner only (add the `github-actions` app only if the bot must change files under `.github/`; it does not).
 
 ## CLI reference
 

@@ -843,5 +843,7 @@ Findings: with 100 turns no run hit the turn limit (0.4.0: 2 of 4 with 20). The 
 - Diff limits (files / changed lines): global 8/300, repo 15/600, module 25/1000 (broader scope = tighter). Gold gets the same check as warnings.
 - Write-tests: only `tests/**`, `spec/**` may be touched; removed_term still applies. No write right (or non-write dimension): any diff is discarded.
 - Non-Gold: commit on branch `sidekick/<job_id>` plus patch under `<work_dir>/patches`; Gold: `git apply` to the target tree. Blocked and aborted outcomes are appended to the SessionLog by the dispatcher; accepted/rejected come from the control model later.
-- Abort detection: timeout, cancel, or "reached max turns" in the output.
+- Abort detection: timeout, cancel, or "reached max turns" in the output. Diff and write-right checks always run first; only a clean (or empty) diff may end as aborted. The claude harness runs in text mode and gives no structured turn-limit result, so the marker text is the only signal there.
+- Known limitation: a Bash tool call of a job with write right can write outside the worktree; the diff only sees the worktree. Not fixed.
+- Gold needs the `claude-oauth` backend type in addition to the registry key; the provider is derived from the backend only.
 - Not done: module scope does not restrict paths to the module; opencode/codex step limits.
