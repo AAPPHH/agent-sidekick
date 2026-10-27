@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixListener;
