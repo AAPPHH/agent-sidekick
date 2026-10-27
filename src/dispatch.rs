@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -446,10 +446,22 @@ pub fn name_taken(repo: &Path, work_dir: &Path, id: &str) -> Option<String> {
     work_dir.join("worktrees").join(id).exists().then(|| format!("worktree for `{id}` already exists"))
 }
 
-const HARDEN: [&str; 4] = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+fn no_hooks() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("sidekick-nohooks-{}", uuid::Uuid::new_v4().simple()));
+        let _ = std::fs::create_dir_all(&dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500));
+        }
+        dir
+    })
+}
 
 fn run_git(mut cmd: Command, args: &[&str]) -> Result<String> {
-    let out = cmd.env("GIT_TERMINAL_PROMPT", "0").args(HARDEN).args(args).output().context("running git")?;
+    let out = cmd.env("GIT_TERMINAL_PROMPT", "0").arg("-c").arg(format!("core.hooksPath={}", no_hooks().display())).args(["-c", "core.fsmonitor=false"]).args(args).output().context("running git")?;
     if !out.status.success() {
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -496,29 +508,79 @@ fn scan_files(path: &Path, out: &mut BTreeMap<PathBuf, (Vec<u8>, u32)>) {
     }
 }
 
-struct Guard {
-    repo: PathBuf,
-    watched: Vec<PathBuf>,
+struct Watch {
+    paths: Vec<PathBuf>,
     files: BTreeMap<PathBuf, (Vec<u8>, u32)>,
-    refs: BTreeMap<String, String>,
-    head: (String, String),
 }
 
-impl Guard {
-    fn capture(repo: &Path, admin: &Path) -> Result<Self> {
-        let common = admin_common(admin);
-        let watched = vec![common.join("hooks"), common.join("config"), common.join("info/attributes"), admin.join("config.worktree"), admin.join("info/attributes"), admin.join("hooks")];
-        let mut guard = Self { repo: repo.to_path_buf(), watched, files: BTreeMap::new(), refs: BTreeMap::new(), head: Default::default() };
-        guard.files = guard.scan();
-        guard.refs = guard.read_refs()?;
-        guard.head = guard.read_head()?;
-        Ok(guard)
+impl Watch {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        let mut w = Self { paths, files: BTreeMap::new() };
+        w.files = w.scan();
+        w
     }
 
     fn scan(&self) -> BTreeMap<PathBuf, (Vec<u8>, u32)> {
         let mut out = BTreeMap::new();
-        self.watched.iter().for_each(|w| scan_files(w, &mut out));
+        self.paths.iter().for_each(|p| scan_files(p, &mut out));
         out
+    }
+
+    fn restore(&self) -> bool {
+        let now = self.scan();
+        if now == self.files {
+            return false;
+        }
+        for p in now.keys().filter(|p| !self.files.contains_key(*p)) {
+            let _ = std::fs::remove_file(p);
+        }
+        for (p, (bytes, mode)) in self.files.iter().filter(|(p, v)| now.get(*p) != Some(v)) {
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(p, bytes);
+            set_file_mode(p, *mode);
+        }
+        true
+    }
+}
+
+struct Guard {
+    repo: PathBuf,
+    git: Watch,
+    own: Watch,
+    exe: Option<(PathBuf, String)>,
+    refs: BTreeMap<String, String>,
+    head: (String, String),
+}
+
+fn fingerprint(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos()).unwrap_or(0);
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.ctime(), meta.ctime_nsec(), meta.ino())
+    };
+    #[cfg(not(unix))]
+    let changed = (0, 0, 0);
+    Some(format!("{}:{modified}:{changed:?}", meta.len()))
+}
+
+fn exe_print() -> Option<(PathBuf, String)> {
+    let path = std::env::current_exe().ok()?;
+    let print = fingerprint(&path)?;
+    Some((path, print))
+}
+
+impl Guard {
+    fn capture(repo: &Path, admin: &Path, own: Vec<PathBuf>) -> Result<Self> {
+        let common = admin_common(admin);
+        let git = Watch::new(vec![common.join("hooks"), common.join("config"), common.join("info/attributes"), admin.join("config.worktree"), admin.join("info/attributes"), admin.join("hooks")]);
+        let mut guard = Self { repo: repo.to_path_buf(), git, own: Watch::new(own), exe: exe_print(), refs: BTreeMap::new(), head: Default::default() };
+        guard.refs = guard.read_refs()?;
+        guard.head = guard.read_head()?;
+        Ok(guard)
     }
 
     fn read_refs(&self) -> Result<BTreeMap<String, String>> {
@@ -533,19 +595,13 @@ impl Guard {
 
     fn check_and_restore(&self) -> Option<String> {
         let mut found = Vec::new();
-        let now = self.scan();
-        if now != self.files {
+        if self.git.restore() {
             found.push("Git-Hooks/Config verändert");
-            for p in now.keys().filter(|p| !self.files.contains_key(*p)) {
-                let _ = std::fs::remove_file(p);
-            }
-            for (p, (bytes, mode)) in self.files.iter().filter(|(p, v)| now.get(*p) != Some(v)) {
-                if let Some(dir) = p.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let _ = std::fs::write(p, bytes);
-                set_file_mode(p, *mode);
-            }
+        }
+        let own_changed = self.own.restore();
+        let exe_changed = self.exe.as_ref().is_some_and(|(p, h)| fingerprint(p).as_ref() != Some(h));
+        if own_changed || exe_changed {
+            found.push("Sidekick-Dateien verändert");
         }
         let refs = self.read_refs().unwrap_or_default();
         let head = self.read_head().unwrap_or_default();
@@ -651,6 +707,14 @@ fn now_ms() -> i64 {
 }
 
 impl Dispatcher {
+    fn own_files(&self) -> Vec<PathBuf> {
+        let base = self.work_dir.parent().map(Path::to_path_buf).unwrap_or_default();
+        let checkout = base.join("checkout");
+        let mut paths = vec![base.join("secret"), base.join("machine_id"), checkout.join("models.parquet"), checkout.join("protected.parquet"), checkout.join(".git/hooks"), checkout.join(".git/config")];
+        paths.extend(crate::paths::config_file().ok());
+        paths
+    }
+
     pub async fn dispatch(&self, backend: &Backend, req: &DispatchRequest, log: &mut SessionLog) -> Result<DispatchResult> {
         let (result, event) = self.run(backend, req, CancellationToken::new()).await?;
         if let Some(event) = event {
@@ -692,7 +756,7 @@ impl Dispatcher {
         };
         let proposal = req.dimension.is_write() && !write_right;
         let wt = Worktree::create(&req.repo, &self.work_dir, &req.job_id, extras.base.as_deref())?;
-        let guard = match Guard::capture(&req.repo, &wt.admin) {
+        let guard = match Guard::capture(&req.repo, &wt.admin, self.own_files()) {
             Ok(g) => g,
             Err(e) => {
                 wt.remove(true);

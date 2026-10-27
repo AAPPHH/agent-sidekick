@@ -86,6 +86,11 @@ case "$last" in
   git config core.hooksPath /nonexistent-hooks
   echo "doc" > docs.txt
   ;;
+*GOLD-OWN*)
+  t=$(printf '%s\n' "${last#*GOLD-OWN }" | head -n1)
+  echo tamper >> "$t"
+  echo "doc" > docs.txt
+  ;;
 *GOLD-REF*)
   git branch evil
   echo "doc" > docs.txt
@@ -329,8 +334,9 @@ fn a_question_from_a_step_surfaces_and_the_answer_resumes_the_workflow() {
     assert_eq!(field(&text, "status"), "question", "{text}");
     assert_eq!((field(&text, "step"), field(&text, "question")), ("ask", "Which flavor?"), "{text}");
     let job = field(&text, "job_id").to_string();
+    let qid: u64 = field(&text, "question_id").parse().unwrap();
     assert!(job.ends_with("-ask"), "{job}");
-    let done = fx.server.call_tool_within("sidekick_answer", json!({"job_id": job, "answer": "vanilla"}), Duration::from_secs(60));
+    let done = fx.server.call_tool_within("sidekick_answer", json!({"job_id": job, "answer": "vanilla", "question_id": qid}), Duration::from_secs(60));
     let text = text_of(&done);
     assert_eq!(field(&text, "status"), "workflow completed", "{text}");
     assert!(text.contains("ASK-ANSWER") && text.contains("vanilla"), "{text}");
@@ -432,7 +438,7 @@ fn a_kept_branch_or_a_running_workflow_id_is_rejected_up_front() {
     assert_eq!(field(&q, "status"), "question", "{q}");
     let (res, text) = call(&mut fx, vec![step("other", "STEP-EXTRA", "search", &[])]);
     assert!(res["isError"] == json!(true) && text.contains("already running"), "{text}");
-    let done = text_of(&fx.server.call_tool_within("sidekick_answer", json!({"job_id": field(&q, "job_id"), "answer": "mint"}), Duration::from_secs(60)));
+    let done = text_of(&fx.server.call_tool_within("sidekick_answer", json!({"job_id": field(&q, "job_id"), "answer": "mint", "question_id": field(&q, "question_id").parse::<u64>().unwrap()}), Duration::from_secs(60)));
     assert!(done.contains("ASK-ANSWER") && done.contains("mint"), "{done}");
 }
 
@@ -459,4 +465,30 @@ fn git_hooks_config_and_foreign_refs_touched_by_a_worker_block_the_step_and_are_
         }
         assert_eq!(std::fs::read_to_string(fx.repo.join("src/lib.rs")).unwrap(), "fn a() { assert!(x); }\n");
     }
+}
+
+#[test]
+fn a_worker_touching_the_sidekicks_own_files_blocks_the_step_and_they_are_restored() {
+    let mut fx = fixture();
+    let hello = run(&mut fx, vec![step("s", "STEP-SEARCH", "search", &[])]).1;
+    assert!(hello.contains("workflow"), "{hello}");
+    let id = find(&fx._dir.path().join("data"), "machine_id").expect("machine_id");
+    let before = std::fs::read_to_string(&id).unwrap();
+    let (_res, text) = run(&mut fx, vec![gold("code", &format!("GOLD-OWN {}", id.display()), "write-code", &[])]);
+    assert!(text.contains("Blocked") && text.contains("Sidekick-Dateien verändert"), "{text}");
+    assert_eq!(std::fs::read_to_string(&id).unwrap(), before);
+    assert!(!fx.repo.join("docs.txt").exists());
+}
+
+fn find(dir: &Path, name: &str) -> Option<PathBuf> {
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        let p = e.path();
+        if p.file_name().is_some_and(|n| n == name) {
+            Some(p)
+        } else if p.is_dir() && !p.ends_with(".git") {
+            find(&p, name)
+        } else {
+            None
+        }
+    })
 }
