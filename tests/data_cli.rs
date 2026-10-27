@@ -29,7 +29,6 @@ fn repo() -> (tempfile::TempDir, PathBuf, String) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     sh(&root, &["init", "-q"]);
-    std::fs::create_dir_all(root.to_path_buf()).unwrap();
     std::fs::write(root.join("peers.toml"), "owners = [\"Owen\"]\nalice = \"Alice\"\nbob = \"bob\"\nowen = \"owen\"\n").unwrap();
     let base = commit(&root, "base");
     (dir, root, base)
