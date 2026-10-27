@@ -188,6 +188,7 @@ impl Validator<'_> {
             git(self.root, &["show", &format!("{base}:{PEERS}")]).unwrap_or_default()
         };
         let table: toml::Table = text.parse().with_context(|| format!("parse {PEERS}"))?;
+        crate::sync::peers_check(&table)?;
         let owners = table
             .get("owners")
             .and_then(|o| o.as_array())

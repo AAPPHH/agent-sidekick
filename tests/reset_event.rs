@@ -104,3 +104,43 @@ fn record_reset_needs_an_owner_prefix_and_resets_the_steckbrief() {
     let (_d3, none) = store("owen", "");
     assert!(none.record(input(&id, Outcome::Reset)).is_err());
 }
+
+#[test]
+fn peers_prefix_is_exact_and_case_colliding_keys_are_rejected() {
+    let table: toml::Table = "owners = [\"mallory\"]\nzed = \"mallory\"\n".parse().unwrap();
+    assert!(agent_sidekick::sync::peers_owner(&table, "zed"));
+    assert!(!agent_sidekick::sync::peers_owner(&table, "Zed"));
+    assert!(!agent_sidekick::sync::peers_owner(&table, "owners"));
+    let clash: toml::Table = "owners = [\"owen\"]\nZed = \"owen\"\nzed = \"mallory\"\n".parse().unwrap();
+    assert!(agent_sidekick::sync::peers_check(&clash).is_err());
+    assert!(!agent_sidekick::sync::peers_owner(&clash, "Zed"));
+    assert!(!agent_sidekick::sync::peers_owner(&clash, "zed"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    sh(root, &["init", "-q"]);
+    std::fs::write(root.join("peers.toml"), "owners = [\"owen\"]\nZed = \"owen\"\nzed = \"mallory\"\n").unwrap();
+    let base = commit(root);
+    std::fs::write(root.join("README"), "x").unwrap();
+    let head = commit(root);
+    assert!(Validator { root, pusher: "mallory" }.validate(&base, &head).is_err());
+}
+
+#[test]
+fn reset_files_carry_schema_version_2_and_both_versions_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("plain.parquet");
+    let with_reset = dir.path().join("reset.parquet");
+    let note = Event::new("0123456789abcdef", Dimension::Search, Scope::Global, Outcome::Note, 1);
+    write_events(&plain, &[note.clone()]).unwrap();
+    write_events(&with_reset, &[note, reset_event("a")]).unwrap();
+    let version = |p: &Path| {
+        let f = std::fs::File::open(p).unwrap();
+        let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f).unwrap();
+        b.metadata().file_metadata().key_value_metadata().unwrap().iter().find(|k| k.key == "schema_version").unwrap().value.clone().unwrap()
+    };
+    assert_eq!(version(&plain), "1");
+    assert_eq!(version(&with_reset), "2");
+    assert_eq!(agent_sidekick::data::read_events(&plain).unwrap().len(), 1);
+    assert_eq!(agent_sidekick::data::read_events(&with_reset).unwrap().len(), 2);
+}

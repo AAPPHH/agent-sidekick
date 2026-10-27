@@ -73,10 +73,20 @@ pub fn remote_url(repo: &str) -> String {
     }
 }
 
+pub fn peers_check(table: &toml::Table) -> Result<()> {
+    let mut seen = std::collections::BTreeMap::new();
+    for key in table.keys() {
+        if let Some(other) = seen.insert(key.to_ascii_lowercase(), key) {
+            bail!("peers.toml: keys `{other}` and `{key}` differ only in case");
+        }
+    }
+    Ok(())
+}
+
 pub fn peers_owner(table: &toml::Table, prefix: &str) -> bool {
-    let owner = table.iter().find(|(k, _)| k.as_str() != "owners" && k.eq_ignore_ascii_case(prefix)).and_then(|(_, v)| v.as_str());
+    let owner = table.get(prefix).filter(|_| prefix != "owners").and_then(|v| v.as_str());
     let owners = table.get("owners").and_then(|o| o.as_array());
-    matches!((owner, owners), (Some(o), Some(a)) if a.iter().filter_map(|x| x.as_str()).any(|x| x.eq_ignore_ascii_case(o)))
+    peers_check(table).is_ok() && matches!((owner, owners), (Some(o), Some(a)) if a.iter().filter_map(|x| x.as_str()).any(|x| x.eq_ignore_ascii_case(o)))
 }
 
 fn valid_name(name: &str) -> bool {

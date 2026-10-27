@@ -22,11 +22,13 @@ use crate::trust::{
 };
 
 pub const SCHEMA_VERSION: i32 = 1;
+pub const RESET_SCHEMA_VERSION: i32 = 2;
+pub const READ_VERSIONS: [i32; 2] = [SCHEMA_VERSION, RESET_SCHEMA_VERSION];
 const VERSION_KEY: &str = "schema_version";
 const NEWEST_CONCLUSIONS: usize = 3;
 
 fn version_error(path: &Path, found: &str) -> anyhow::Error {
-    anyhow!("{}: unsupported schema_version `{found}` (this build reads {SCHEMA_VERSION})", path.display())
+    anyhow!("{}: unsupported schema_version `{found}` (this build reads {READ_VERSIONS:?})", path.display())
 }
 
 fn ts_type() -> DataType {
@@ -45,13 +47,13 @@ fn ts_array(v: Vec<i64>) -> ArrayRef {
     Arc::new(TimestampMillisecondArray::from(v).with_timezone("UTC"))
 }
 
-fn write_batch(path: &Path, batch: &RecordBatch) -> Result<()> {
+fn write_batch(path: &Path, batch: &RecordBatch, version: i32) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
     let tmp = path.with_extension("parquet.tmp");
     let props = WriterProperties::builder()
-        .set_key_value_metadata(Some(vec![KeyValue::new(VERSION_KEY.to_string(), SCHEMA_VERSION.to_string())]))
+        .set_key_value_metadata(Some(vec![KeyValue::new(VERSION_KEY.to_string(), version.to_string())]))
         .build();
     let file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
@@ -71,7 +73,7 @@ fn read_batches(path: &Path) -> Result<Vec<RecordBatch>> {
         .and_then(|kv| kv.iter().find(|k| k.key == VERSION_KEY))
         .and_then(|k| k.value.clone())
         .ok_or_else(|| anyhow!("{}: missing {VERSION_KEY}", path.display()))?;
-    if found != SCHEMA_VERSION.to_string() {
+    if !READ_VERSIONS.iter().any(|v| v.to_string() == found) {
         return Err(version_error(path, &found));
     }
     builder.build()?.map(|b| b.map_err(Into::into)).collect()
@@ -118,7 +120,7 @@ impl Row<'_> {
     fn version(&self) -> Result<()> {
         let v = self.col(VERSION_KEY).and_then(|c| c.as_primitive_opt::<arrow::datatypes::Int32Type>()).map(|a| a.value(self.i));
         match v {
-            Some(v) if v == SCHEMA_VERSION => Ok(()),
+            Some(v) if READ_VERSIONS.contains(&v) => Ok(()),
             other => bail!("row {}: unsupported schema_version {other:?}", self.i),
         }
     }
@@ -255,7 +257,7 @@ impl ModelRow {
     }
 
     pub fn write_all_with(path: &Path, models: &[ModelRow], profiles: &HashMap<String, Profile>) -> Result<()> {
-        write_batch(path, &Self::to_batch_with(models, profiles)?)
+        write_batch(path, &Self::to_batch_with(models, profiles)?, SCHEMA_VERSION)
     }
 
     pub fn read_profiles(path: &Path) -> Result<HashMap<String, Profile>> {
@@ -337,7 +339,7 @@ impl ProtectedRow {
     }
 
     pub fn write_all(path: &Path, protected: &[ProtectedRow]) -> Result<()> {
-        write_batch(path, &Self::to_batch(protected)?)
+        write_batch(path, &Self::to_batch(protected)?, SCHEMA_VERSION)
     }
 
     pub fn read_all(path: &Path) -> Result<Vec<ProtectedRow>> {
@@ -373,6 +375,14 @@ pub fn experience_schema() -> SchemaRef {
     ])
 }
 
+pub fn events_version(events: &[Event]) -> i32 {
+    if events.iter().any(|e| e.outcome == Outcome::Reset) {
+        RESET_SCHEMA_VERSION
+    } else {
+        SCHEMA_VERSION
+    }
+}
+
 pub fn events_to_batch(events: &[Event]) -> Result<RecordBatch> {
     let s = |f: fn(&Event) -> String| strs(events.iter().map(|e| Some(f(e))));
     let o = |f: fn(&Event) -> Option<String>| strs(events.iter().map(f));
@@ -396,13 +406,13 @@ pub fn events_to_batch(events: &[Event]) -> Result<RecordBatch> {
         o(|e| e.summary.clone()),
         o(|e| e.conclusion.clone()),
         s(|e| e.visibility.as_str().into()),
-        Arc::new(Int32Array::from(vec![SCHEMA_VERSION; events.len()])),
+        Arc::new(Int32Array::from(vec![events_version(events); events.len()])),
     ];
     Ok(RecordBatch::try_new(experience_schema(), cols)?)
 }
 
 pub fn write_events(path: &Path, events: &[Event]) -> Result<()> {
-    write_batch(path, &events_to_batch(events)?)
+    write_batch(path, &events_to_batch(events)?, events_version(events))
 }
 
 pub fn read_events(path: &Path) -> Result<Vec<Event>> {
@@ -1001,7 +1011,7 @@ mod tests {
         let old_cols = ModelRow::schema().fields().len() - Profile::COLUMNS.len();
         let old = full.project(&(0..old_cols).collect::<Vec<_>>()).unwrap();
         let q = dir.path().join("old.parquet");
-        write_batch(&q, &old).unwrap();
+        write_batch(&q, &old, SCHEMA_VERSION).unwrap();
         assert_eq!(ModelRow::read_all(&q).unwrap(), vec![qwen_row()]);
         assert_eq!(ModelRow::read_profiles(&q).unwrap()[&id], Profile::default());
     }
