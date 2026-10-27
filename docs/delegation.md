@@ -12,6 +12,7 @@ Für Menschen und für das Steuermodell. Grundlage ist der Steckbrief des Modell
 
 ## Mechanik
 
+- Konto-Sperre: Backends mit `account` in `config.toml` werden abgelehnt, wenn das Konto dem des Aufrufers gleicht ("gleiches Konto wie der Aufrufer"); kontogebundene Backends ohne `account` ebenso ("Konto unbekannt"). Das Konto steht in `sidekick_backends` und in der Modellzeile des Steckbriefs.
 - Prüfanteil = 1 − Vertrauen. Schreibrecht gibt es ab write-code ≥ 0,50 (write-tests ≥ 0,50 für Testaufgaben); darunter bekommt das Harness keine Schreibwerkzeuge.
 - Geschützt für alles unter 1,00: `tests/**`, `spec/**`, `**/validate*` sowie das Entfernen von `decided_by` und `assert`.
 - Vorschlagsmodus: unter der Schreibschwelle bekommt das Modell keine Schreibwerkzeuge, liefert aber den Diff als Text. Der Sidekick prüft und wendet ihn nur im Job-Worktree an und gibt Branch und Patch zurück. So steigt Vertrauen: gute, akzeptierte Vorschläge heben write-code/write-tests über 0,50, erst dann schreibt das Modell selbst.

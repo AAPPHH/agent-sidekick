@@ -128,6 +128,16 @@ agent-sidekick does no routing of its own, so write descriptions for that reader
 - An unknown backend name is a tool error that lists the configured names.
 - If `config.toml` cannot be parsed or validated, `sidekick_run` fails with a tool error that names the problem; it never silently falls back to the implicit backend. `sidekick_backends` and `sidekick_status` show the error too.
 
+### Account guard
+
+`account = "name@example.com"` (optional, not a secret) names the account a backend runs under. It is required for account-bound backends (claude-oauth, codex with `auth = "chatgpt"`; the implicit `claude` backend is exempt). Before every launch (`sidekick_run` incl. `fallback`, `sidekick_dispatch`) the account is compared, case-insensitively, with the caller's:
+
+- same account: refused with "gleiches Konto wie der Aufrufer" (no delegating to your own quota);
+- account-bound backend without `account`: refused with "Konto unbekannt – `account` in config.toml setzen";
+- caller account unknown: allowed.
+
+The caller's account is read from `$CLAUDE_CONFIG_DIR/.claude.json` or `~/.claude.json` (`oauthAccount.emailAddress`), else from the Codex login (`$CODEX_HOME/auth.json` or `~/.codex/auth.json`, e-mail claim of the id token). `agent-sidekick setup [--backend X]` asks for the account after the key and writes it into config.toml. It is prefilled from the backend's config dir (`.claude.json`), the OAuth profile endpoint (works only for tokens with profile scope, not for `claude setup-token` tokens: HTTP 403) or the Codex login. `sidekick_backends` shows `account`.
+
 ### Fallback
 
 `sidekick_run` accepts `fallback`, the name of a second backend that is used when the primary one fails:
@@ -421,7 +431,7 @@ No parameters. Returns a JSON object:
 ```
 
 - `config_error`: `null`, or the problem with `config.toml`. Then `backends` is empty and `sidekick_run` fails until the file is fixed.
-- Per backend: `name`, `type`, `description`, `cost`, `default`, `models` (the allowlist for `sidekick_run`'s `model`; `null`: a claude-* backend accepts any model, a command backend without `{model}` takes none), `default_model` (used when `model` is omitted; `null`: the account's/endpoint's default, or no model), `reachable`, `detail` (why it is or is not reachable), `max_concurrent` (`null` without a per-backend limit), `running` and `queued`.
+- Per backend: `name`, `type`, `description`, `account` (`null` when not set), `cost`, `default`, `models` (the allowlist for `sidekick_run`'s `model`; `null`: a claude-* backend accepts any model, a command backend without `{model}` takes none), `default_model` (used when `model` is omitted; `null`: the account's/endpoint's default, or no model), `reachable`, `detail` (why it is or is not reachable), `max_concurrent` (`null` without a per-backend limit), `running` and `queued`.
 - Pick the backend by `description` and `cost`, and the model from its `models`.
 
 It never contains secrets or environment values.

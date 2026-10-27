@@ -28,7 +28,7 @@ pub mod launch;
 pub mod reach;
 pub mod resolve;
 
-pub use launch::{build_launch, load_credential, resolve_program, Credential};
+pub use launch::{build_launch, detect_account, load_credential, resolve_program, Credential};
 pub use reach::{check_backend, probe_http, Reachability};
 pub use resolve::{resolve, resolve_with, ResolveDefaults};
 
