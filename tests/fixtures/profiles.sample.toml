@@ -1,0 +1,18 @@
+[defaults]
+profile_as_of = "2026-01-01"
+
+[[profile]]
+provider = "dgx.mv.intern.hs-duesseldorf.de"
+model = "Qwen3-Coder-Next"
+strengths = "Platzhalter Stärken"
+weaknesses = "Platzhalter Schwächen"
+task_scope = "Platzhalter Umfang"
+dims_prior = "search=mittel;inventory=mittel;write-tests=unbekannt;write-code=mittel;decisions=schwach"
+benchmarks = "Beispiel 1.0 (Platzhalter, 2026-01-01, vendor)"
+sources = "https://example.org/a ; https://example.org/b"
+
+[[profile]]
+provider = "anthropic"
+model = "claude-opus-5-5"
+strengths = "Platzhalter Stärken"
+dims_prior = "search=gut;inventory=gut;write-tests=gut;write-code=gut;decisions=gut"

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Outcome `reset` (owners only, no job_id; `data validate` rejects it from other prefixes): trust of the model restarts from the start values at the reset time, only earlier blocked events are re-applied. The Steckbrief shows "zurückgesetzt am <date>". Schema version stays 1 (readers accept the new value, old files unchanged).
+- Optional profile columns in models.parquet (strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of) and a Steckbrief section "Profil" that never influences trust. Old files without the columns still read and validate.
+
+### Changed
+
+- claude-oauth model aliases (opus, sonnet, haiku, fable) resolve to full ids for the model_id and the CLI call. Dispatch runs claude with `--output-format json`, compares the reported model with the expected id and warns on mismatch; Gold is applied only with a verified model, otherwise returned as branch/patch.
+
 ## [0.8.0] - 2026-10-27
 
 ### Added
