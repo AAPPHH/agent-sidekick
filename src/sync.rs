@@ -54,6 +54,13 @@ fn read_or_create(path: &Path, make: impl FnOnce() -> String) -> Result<String> 
     Ok(v)
 }
 
+fn add_remote(checkout: &Path, remote: &str) -> Result<()> {
+    git(checkout, &["remote", "add", REMOTE, remote]).map(|_| ()).or_else(|e| match git(checkout, &["remote", "get-url", REMOTE]) {
+        Ok(u) if u.trim() == remote => Ok(()),
+        _ => Err(e),
+    })
+}
+
 pub fn remote_url(repo: &str) -> String {
     let slug = repo.split_once('/').is_some_and(|(o, n)| {
         let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
@@ -89,9 +96,9 @@ impl DataStore {
         fs::create_dir_all(&local_root)?;
         if !checkout.join(".git").exists() {
             git(&checkout, &["init", "-q", "-b", BRANCH])?;
-            git(&checkout, &["remote", "add", REMOTE, remote])?;
+            add_remote(&checkout, remote)?;
         } else if git(&checkout, &["remote", "get-url", REMOTE]).map(|u| u.trim() != remote).unwrap_or(true) {
-            git(&checkout, &["remote", "set-url", REMOTE, remote]).or_else(|_| git(&checkout, &["remote", "add", REMOTE, remote]))?;
+            git(&checkout, &["remote", "set-url", REMOTE, remote]).map(|_| ()).or_else(|_| add_remote(&checkout, remote))?;
         }
         let secret = read_or_create(&base.join("secret"), || {
             format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
