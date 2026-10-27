@@ -294,7 +294,12 @@ fn event_id_must_not_exist_under_another_prefix() {
 #[test]
 fn non_ascii_paths_are_keyed_correctly_and_paths_out_lists_them() {
     let (_d, root, base) = repo();
-    std::fs::write(root.join("ünï\"x.txt"), "x").unwrap();
+    let name = if cfg!(windows) {
+        "ünï'x.txt"
+    } else {
+        "ünï\"x.txt"
+    };
+    std::fs::write(root.join(name), "x").unwrap();
     commit(&root, "x");
     let head = sh(&root, &["rev-parse", "HEAD"]);
     let found = Validator {
@@ -304,7 +309,7 @@ fn non_ascii_paths_are_keyed_correctly_and_paths_out_lists_them() {
     .violations(&base, &head)
     .unwrap();
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].0, "ünï\"x.txt");
+    assert_eq!(found[0].0, name);
     let out = root.join("paths.txt");
     let status = Command::new(env!("CARGO_BIN_EXE_agent-sidekick"))
         .args([
@@ -316,7 +321,7 @@ fn non_ascii_paths_are_keyed_correctly_and_paths_out_lists_them() {
         .output()
         .unwrap();
     assert_eq!(status.status.code(), Some(1));
-    assert_eq!(std::fs::read_to_string(out).unwrap(), "ünï\"x.txt\n");
+    assert_eq!(std::fs::read_to_string(out).unwrap(), format!("{name}\n"));
 }
 
 #[test]
