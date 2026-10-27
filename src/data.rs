@@ -18,6 +18,7 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::metadata::KeyValue;
 
 use crate::trust::{
+    DECISIONS_RIGHT_MIN, WRITE_RIGHT_MIN,
     dedup_sorted, Counters, Dimension, Event, LastBlock, ModelKey, Outcome, Scope, Sperre, Standing, Visibility,
 };
 
@@ -26,6 +27,8 @@ pub const RESET_SCHEMA_VERSION: i32 = 2;
 pub const READ_VERSIONS: [i32; 2] = [SCHEMA_VERSION, RESET_SCHEMA_VERSION];
 const VERSION_KEY: &str = "schema_version";
 const NEWEST_CONCLUSIONS: usize = 3;
+const NOT_FOR_BELOW: f64 = 0.30;
+const WRITE_FREE_MIN: f64 = 0.85;
 
 fn version_error(path: &Path, found: &str) -> anyhow::Error {
     anyhow!("{}: unsupported schema_version `{found}` (this build reads {READ_VERSIONS:?})", path.display())
@@ -480,6 +483,46 @@ pub fn redact_block_reason(reason: &str) -> String {
         .join("; ")
 }
 
+fn condense(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max).collect();
+    let end = cut.rfind([' ', ';', ',']).filter(|i| *i > max / 2).unwrap_or(cut.len());
+    format!("{}…", cut[..end].trim_end_matches([' ', ';', ',', '.']))
+}
+
+pub fn block_lesson(reason: &str, scope: &Scope) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in reason.split("; ") {
+        let lesson = if part.starts_with("protected path") {
+            Some("geschützte Pfade im Auftrag nennen; Tests sind unveränderlich".to_string())
+        } else if let Some(rest) = part.strip_prefix("removed protected term `").or_else(|| part.strip_prefix("removed term ")) {
+            Some(format!("Begriff {} darf nicht entfernt werden – im Auftrag nennen", rest.split(['`', ' ']).next().unwrap_or_default()))
+        } else if part.starts_with("write-tests touches non-test path") {
+            Some("Auftrag auf Testdateien begrenzen".to_string())
+        } else if part.starts_with("path ") && part.contains("outside module path") {
+            let module = match (scope, part.split_once("outside module path ")) {
+                (Scope::Module(_, path), _) => path.trim_matches('/'),
+                (_, Some((_, m))) if !m.is_empty() => m,
+                _ => "den Scope",
+            };
+            Some(format!("Auftrag auf {module} begrenzen"))
+        } else if part.starts_with("diff without write right") {
+            Some("ohne Schreibrecht nur Vorschlag verlangen".to_string())
+        } else if part.contains("exceed limit") {
+            Some("Auftrag kleiner schneiden".to_string())
+        } else {
+            None
+        };
+        if let Some(l) = lesson.filter(|l| !out.contains(l)) {
+            out.push(l);
+        }
+    }
+    (!out.is_empty()).then(|| out.join("; "))
+}
+
 pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut block = [0u8; 64];
@@ -701,6 +744,8 @@ pub struct Steckbrief {
     pub conclusions: Vec<Conclusion>,
     pub reset_at: Option<i64>,
     pub profile: Option<Profile>,
+    pub effective: Vec<(Dimension, f64)>,
+    pub lessons: Vec<String>,
 }
 
 fn utc(ts_ms: i64) -> String {
@@ -738,6 +783,21 @@ impl Steckbrief {
             .filter_map(|e| e.conclusion.as_ref().map(|t| Conclusion { ts_ms: e.ts_ms, scope: e.scope.clone(), text: t.clone() }))
             .collect();
         conclusions.sort_by_key(|c| std::cmp::Reverse(c.ts_ms));
+        let mut lesson_events: Vec<(i64, String)> = own
+            .iter()
+            .filter(|e| matches!(e.outcome, Outcome::Rejected | Outcome::Blocked) && chain.contains(&e.scope))
+            .filter_map(|e| {
+                let derived = || e.block_reason.as_deref().filter(|_| e.outcome == Outcome::Blocked).and_then(|r| block_lesson(r, &e.scope));
+                e.conclusion.clone().filter(|c| !c.trim().is_empty()).or_else(derived).map(|t| (e.ts_ms, t))
+            })
+            .collect();
+        lesson_events.sort_by_key(|l| std::cmp::Reverse(l.0));
+        let mut lessons: Vec<String> = Vec::new();
+        for (_, t) in lesson_events {
+            if lessons.len() < NEWEST_CONCLUSIONS && !lessons.contains(&t) {
+                lessons.push(t);
+            }
+        }
         conclusions.truncate(NEWEST_CONCLUSIONS);
         Self {
             model: model.clone(),
@@ -756,12 +816,71 @@ impl Steckbrief {
             conclusions,
             reset_at: standing.book.reset_at(),
             profile: None,
+            effective: Dimension::ALL.iter().map(|d| (*d, standing.effective_trust(*d, scope))).collect(),
+            lessons,
         }
     }
 
     pub fn with_profile(mut self, profile: Option<Profile>) -> Self {
         self.profile = profile;
         self
+    }
+
+    fn trust_of(&self, dimension: Dimension) -> f64 {
+        self.effective.iter().find(|(d, _)| *d == dimension).map_or(0.0, |(_, t)| *t)
+    }
+
+    fn write_rule(&self, dimension: Dimension) -> &'static str {
+        match self.trust_of(dimension) {
+            t if t < WRITE_RIGHT_MIN => "Diff als Vorschlag verlangen (Vorschlagsmodus)",
+            t if t < WRITE_FREE_MIN => "Test vorher fertig und unveränderlich, Diff wird ganz gelesen",
+            _ => "schreibt frei, Stichprobe",
+        }
+    }
+
+    pub fn render_short(&self, backend: Option<&str>) -> String {
+        let k = &self.model.key;
+        let role = if self.gold {
+            "Gold, keine Prüfung"
+        } else {
+            match self.trust_of(Dimension::WriteCode) {
+                t if t < WRITE_RIGHT_MIN => "Vorschlagsgeber",
+                t if t < WRITE_FREE_MIN => "Schreiber unter Prüfung",
+                _ => "freier Schreiber",
+            }
+        };
+        let p = self.profile.clone().unwrap_or_default();
+        let part = |v: &Option<String>| v.as_deref().map(|t| condense(t, 70));
+        let join = |v: Vec<String>| if v.is_empty() { "-".to_string() } else { v.join("; ") };
+        let mut how = Vec::new();
+        if self.gold {
+            how.push("keine Prüfung".to_string());
+        } else {
+            if self.trust_of(Dimension::Decisions) < DECISIONS_RIGHT_MIN {
+                how.push("Entscheidungen im Auftrag vorgeben".to_string());
+            }
+            how.push(self.write_rule(Dimension::WriteCode).to_string());
+            if self.write_rule(Dimension::WriteTests) != self.write_rule(Dimension::WriteCode) {
+                how.push(format!("Tests: {}", self.write_rule(Dimension::WriteTests)));
+            }
+        }
+        how.extend(part(&p.prompting));
+        let mut avoid: Vec<String> = part(&p.weaknesses).into_iter().collect();
+        if !self.gold {
+            avoid.extend(Dimension::ALL.iter().filter(|d| self.trust_of(**d) < NOT_FOR_BELOW).map(|d| format!("nicht für {d}")));
+        }
+        let good: Vec<String> = [&p.strengths, &p.task_scope].into_iter().filter_map(part).collect();
+        let lessons: Vec<String> = self.lessons.iter().map(|l| condense(l, 90)).collect();
+        format!(
+            "{} ({}) – {}\nGut für: {}\nSo formulieren: {}\nNicht geben: {}\nAus Fehlern: {}\n",
+            k.model,
+            backend.unwrap_or(&k.provider),
+            role,
+            join(good),
+            join(how),
+            join(avoid),
+            join(lessons)
+        )
     }
 
     pub fn render(&self) -> String {
@@ -1050,5 +1169,87 @@ mod tests {
         assert!(rest.contains("- Formulierung: XML-Tags, Ziel zuerst"));
         assert!(rest.contains("- Benchmarks: X 1") && rest.contains("- Quellen: https://a ; https://b"));
         assert_eq!(text.replace(&with.profile.as_ref().unwrap().render(), ""), plain.render());
+    }
+
+    #[test]
+    fn block_lessons_are_mechanical() {
+        let m = Scope::parse("module:r/src/a").unwrap();
+        let g = Scope::Global;
+        assert_eq!(block_lesson("protected path tests/x (matches tests/**)", &g).unwrap(), "geschützte Pfade im Auftrag nennen; Tests sind unveränderlich");
+        assert_eq!(block_lesson("removed term assert", &g).unwrap(), "Begriff assert darf nicht entfernt werden – im Auftrag nennen");
+        assert_eq!(block_lesson("removed protected term `decided_by` in f.rs", &g).unwrap(), "Begriff decided_by darf nicht entfernt werden – im Auftrag nennen");
+        assert_eq!(block_lesson("path b.rs outside module path src/a", &g).unwrap(), "Auftrag auf src/a begrenzen");
+        assert_eq!(block_lesson("path outside module path", &m).unwrap(), "Auftrag auf src/a begrenzen");
+        assert_eq!(block_lesson("diff without write right (write-code): a", &g).unwrap(), "ohne Schreibrecht nur Vorschlag verlangen");
+        assert_eq!(block_lesson("9 files exceed limit 5; 900 changed lines exceed limit 500", &g).unwrap(), "Auftrag kleiner schneiden");
+        assert!(block_lesson("claude reported an error", &g).is_none());
+    }
+
+    #[test]
+    fn condense_truncates_cleanly() {
+        assert_eq!(condense("kurz", 10), "kurz");
+        assert_eq!(condense("eins zwei drei vier fünf", 14), "eins zwei…");
+    }
+
+    fn short_for(events: &[Event], profile: Option<Profile>) -> String {
+        Steckbrief::build(&qwen_row(), events, &Scope::Global, NOW).with_profile(profile).render_short(Some("dgx"))
+    }
+
+    #[test]
+    fn short_steckbrief_is_a_german_guide_derived_from_trust() {
+        let id = qwen_row().model_id();
+        let text = short_for(&[], Some(profile()));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 5, "{text}");
+        assert!(lines[0].starts_with("qwen3-coder-next (dgx) – Vorschlagsgeber"), "{text}");
+        assert_eq!(lines[1], "Gut für: stark; klein");
+        assert!(lines[2].starts_with("So formulieren: Entscheidungen im Auftrag vorgeben; Diff als Vorschlag verlangen (Vorschlagsmodus); XML-Tags, Ziel zuerst"), "{text}");
+        assert_eq!(lines[3], "Nicht geben: schwach; nicht für write-tests; nicht für write-code; nicht für decisions");
+        assert_eq!(lines[4], "Aus Fehlern: -");
+        assert!(!text.contains("acc ") && !text.contains("Benchmarks"));
+        let mut seeds = Vec::new();
+        for d in [Dimension::Search, Dimension::WriteCode] {
+            let mut e = ev(&id, d, "global", Outcome::Rejected, 5);
+            e.conclusion = Some("x".into());
+            seeds.push(e);
+        }
+        let low = short_for(&seeds, None);
+        assert!(low.contains("Nicht geben: nicht für search"), "{low}");
+        assert!(low.contains("Gut für: -"));
+    }
+
+    #[test]
+    fn short_steckbrief_write_tiers_and_gold() {
+        let id = qwen_row().model_id();
+        let accepted = |d, n: usize| (0..n).map(|i| ev(&id, d, "global", Outcome::Accepted, 10 + i as i64)).collect::<Vec<_>>();
+        let mid = short_for(&accepted(Dimension::WriteCode, 20), None);
+        assert!(mid.contains("Schreiber unter Prüfung") && mid.contains("Test vorher fertig und unveränderlich, Diff wird ganz gelesen"), "{mid}");
+        assert!(mid.contains("Tests: Diff als Vorschlag verlangen"), "{mid}");
+        let gold = ModelRow { key: ModelKey::new("anthropic", "claude-opus-5-5", "x", "-", "claude-code"), ..qwen_row() };
+        let text = Steckbrief::build(&gold, &[], &Scope::Global, NOW).render_short(None);
+        assert!(text.contains("Gold, keine Prüfung") && text.contains("So formulieren: keine Prüfung") && text.contains("(anthropic)"), "{text}");
+    }
+
+    #[test]
+    fn lessons_come_from_rejected_and_blocked_newest_first_even_when_private_text_is_stripped() {
+        let id = qwen_row().model_id();
+        let mut rej = ev(&id, Dimension::WriteCode, "global", Outcome::Rejected, 1);
+        rej.conclusion = Some("Dateinamen nennen".into());
+        let mut old_blk = ev(&id, Dimension::WriteCode, "global", Outcome::Blocked, 2);
+        old_blk.block_reason = Some("removed term assert".into());
+        let mut blk = ev(&id, Dimension::WriteCode, "global", Outcome::Blocked, 3);
+        blk.block_reason = Some("protected path".into());
+        let mut other_scope = ev(&id, Dimension::WriteCode, "repo:other", Outcome::Rejected, 9);
+        other_scope.conclusion = Some("fremd".into());
+        let mut accepted = ev(&id, Dimension::WriteCode, "global", Outcome::Accepted, 8);
+        accepted.conclusion = Some("kein Fehler".into());
+        let mut events = [rej, old_blk, blk, other_scope, accepted];
+        events.iter_mut().for_each(|e| e.visibility = Visibility::Private);
+        let sb = Steckbrief::build(&qwen_row(), &events, &Scope::parse("repo:r").unwrap(), NOW);
+        assert_eq!(sb.lessons, vec!["geschützte Pfade im Auftrag nennen; Tests sind unveränderlich", "Begriff assert darf nicht entfernt werden – im Auftrag nennen", "Dateinamen nennen"]);
+        let stripped: Vec<Event> = events.iter().map(strip_private).collect();
+        let sb = Steckbrief::build(&qwen_row(), &stripped, &Scope::parse("repo:r").unwrap(), NOW);
+        assert_eq!(sb.lessons.len(), 2);
+        assert!(!sb.render_short(None).contains("Dateinamen"));
     }
 }

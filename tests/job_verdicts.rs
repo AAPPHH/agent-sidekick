@@ -38,7 +38,7 @@ fn verdict_rejects_unknown_double_blocked_and_wrong_outcome() {
     assert!(s.record_verdict("nope", Outcome::Accepted, None, Visibility::Private).unwrap_err().to_string().contains("unknown job_id"));
     s.append(job_event("j2", Outcome::Note, 1000)).unwrap();
     assert!(s.record_verdict("j2", Outcome::Note, None, Visibility::Private).is_err());
-    s.record_verdict("j2", Outcome::Rejected, None, Visibility::Private).unwrap();
+    s.record_verdict("j2", Outcome::Rejected, Some("Datei nennen".into()), Visibility::Private).unwrap();
     assert!(s.record_verdict("j2", Outcome::Accepted, None, Visibility::Private).unwrap_err().to_string().contains("already has a verdict"));
     s.append(job_event("j3", Outcome::Blocked, 1000)).unwrap();
     assert!(s.record_verdict("j3", Outcome::Accepted, None, Visibility::Private).unwrap_err().to_string().contains("blocked"));
@@ -107,4 +107,16 @@ fn cost_balance_counts_a_job_runtime_once() {
     agent_sidekick::data::write_events(&dir.path().join("experiences/a/s.parquet"), &all).unwrap();
     let sb = data.steckbrief(&id, &Scope::Global, None, chrono::Utc::now().timestamp_millis()).unwrap();
     assert_eq!(sb.duration_s, 12.5);
+}
+
+#[test]
+fn rejection_needs_a_formulation_rule() {
+    let (_d, s) = store();
+    s.append(job_event("jr", Outcome::Note, 1000)).unwrap();
+    for c in [None, Some(String::new()), Some("  ".to_string())] {
+        let err = s.record_verdict("jr", Outcome::Rejected, c, Visibility::Private).unwrap_err().to_string();
+        assert!(err.contains("non-empty `conclusion`"), "{err}");
+    }
+    assert!(own(&s).iter().all(|e| e.outcome != Outcome::Rejected));
+    s.record_verdict("jr", Outcome::Rejected, Some("Zielmodul nennen".into()), Visibility::Private).unwrap();
 }

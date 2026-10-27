@@ -540,3 +540,16 @@ async fn dispatch_event_never_carries_the_checkout_directory_name() {
     e.dispatcher.dispatch(&backend("m-t5"), &req, &mut e.log).await.unwrap();
     assert_eq!(e.log.events()[1].repo.as_deref(), Some("named"));
 }
+
+#[tokio::test]
+async fn blocked_events_carry_a_mechanical_lesson_as_conclusion() {
+    let mut e = env("m-l1", true, 40, "printf 'fn a() { let decided_by = 1; }\\n' > src/lib.rs\n");
+    run(&mut e, "m-l1", Dimension::WriteCode, "jl1").await;
+    assert_eq!(e.log.events()[0].conclusion.as_deref(), Some("Begriff assert darf nicht entfernt werden – im Auftrag nennen"));
+    let mut e = env("m-l2", true, 40, "printf 'x\\n' > tests/new.rs\n");
+    run(&mut e, "m-l2", Dimension::WriteCode, "jl2").await;
+    assert_eq!(e.log.events()[0].conclusion.as_deref(), Some("geschützte Pfade im Auftrag nennen; Tests sind unveränderlich"));
+    let mut e = env("m-l3", true, 0, "printf 'fn b() {}\\n' > src/b.rs\n");
+    run(&mut e, "m-l3", Dimension::WriteCode, "jl3").await;
+    assert_eq!(e.log.events()[0].conclusion.as_deref(), Some("ohne Schreibrecht nur Vorschlag verlangen"));
+}

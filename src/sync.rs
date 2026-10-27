@@ -93,6 +93,13 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+fn require_rejection_rule(conclusion: &Option<String>) -> Result<()> {
+    if conclusion.as_deref().is_none_or(|c| c.trim().is_empty()) {
+        bail!("outcome rejected needs a non-empty `conclusion`: the formulation rule for next time (what the task must say so the result is accepted)");
+    }
+    Ok(())
+}
+
 impl DataStore {
     pub fn checkout_exists(base: &Path) -> bool {
         base.join("checkout").join(".git").exists()
@@ -245,6 +252,9 @@ impl DataStore {
             }
             _ => {}
         }
+        if input.outcome == Outcome::Rejected {
+            require_rejection_rule(&input.conclusion)?;
+        }
         if input.review_s.is_some_and(|v| v < 0.0) || input.duration_s.is_some_and(|v| v < 0.0) {
             bail!("review_s and duration_s must not be negative");
         }
@@ -267,6 +277,9 @@ impl DataStore {
     pub fn record_verdict(&self, job_id: &str, outcome: Outcome, conclusion: Option<String>, visibility: Visibility) -> Result<(String, bool)> {
         if !matches!(outcome, Outcome::Accepted | Outcome::Rejected) {
             bail!("a verdict on a job is accepted or rejected");
+        }
+        if outcome == Outcome::Rejected {
+            require_rejection_rule(&conclusion)?;
         }
         self.append_checked(|events| {
             let mine: Vec<&Event> = events.iter().filter(|e| e.job_id.as_deref() == Some(job_id)).collect();

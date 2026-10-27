@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::backends::{self, Backend, BackendKind, OpencodeProvider, PermissionMode};
-use crate::data::{DataDir, ModelRow, ProtectedKind, ProtectedRow, SessionLog};
+use crate::data::{block_lesson, DataDir, ModelRow, ProtectedKind, ProtectedRow, SessionLog};
 use crate::harness::claude::{model_matches, parse_report};
 use crate::harness::HarnessKind;
 use crate::runner::{self, Launch, RunRequest};
@@ -646,6 +646,7 @@ impl Dispatcher {
                 result.evidence_hash = Some(sha256_hex(patch.as_bytes()));
                 event.outcome = Outcome::Blocked;
                 event.block_reason = Some(reason.clone());
+                event.conclusion = block_lesson(&reason, &req.scope);
                 event.evidence_hash = result.evidence_hash.clone();
                 result.violations = vec![reason.clone()];
                 result.block_reason = Some(reason);
@@ -661,6 +662,7 @@ impl Dispatcher {
                 result.evidence_hash = Some(sha256_hex(patch.as_bytes()));
                 event.outcome = Outcome::Blocked;
                 event.block_reason = Some(reason.clone());
+                event.conclusion = block_lesson(&reason, &req.scope);
                 event.evidence_hash = result.evidence_hash.clone();
                 result.block_reason = Some(reason);
                 result.violations = check.violations;

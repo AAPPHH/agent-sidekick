@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sidekick_steckbrief` returns a short German delegation guide by default (role, "Gut für", "So formulieren", "Nicht geben", "Aus Fehlern"), derived mechanically from trust and the profile; the full table, counters and benchmarks need `detail=true`. New nullable profile column `prompting` (vendor formulation hints, shown under "So formulieren"; appended to models.parquet, validators must know it).
+- Outcome `rejected` requires a non-empty `conclusion` phrased as a formulation rule for next time (tool error otherwise). Blocked jobs store a mechanical lesson derived from the block reason as their conclusion; the newest three lessons (scope chain) appear under "Aus Fehlern", also in the shared view where private conclusion text is stripped.
 - Outcome `reset` (owners only, no job_id; `data validate` rejects it from other prefixes): trust of the model restarts from the start values at the reset time, only earlier blocked events are re-applied. The Steckbrief shows "zurückgesetzt am <date>". Files containing a reset row are written with schema_version 2, all other files stay version 1; this build reads 1 and 2. Older builds (0.7.x) reject version 2 files and the whole load fails, so release the binary used by the data workflows (validate, aggregate) before any reset row is pushed. The new models.parquet profile columns likewise need a validator that knows them.
 - Optional profile columns in models.parquet (strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of) and a Steckbrief section "Profil" that never influences trust. Old files without the columns still read and validate.
 

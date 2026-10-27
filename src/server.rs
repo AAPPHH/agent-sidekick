@@ -124,6 +124,8 @@ pub struct SteckbriefParams {
     pub model: Option<String>,
     /// global (default) | repo:<name> | module:<repo>/<path>.
     pub scope: Option<String>,
+    /// true: full table with counters, limits, profile and benchmarks instead of the short delegation guide.
+    pub detail: Option<bool>,
 }
 
 /// Parameters of `sidekick_record_experience`.
@@ -154,6 +156,7 @@ pub struct RecordParams {
     /// 0..1, only for outcome seed.
     pub seed_value: Option<f64>,
     pub summary: Option<String>,
+    /// Required and non-empty for outcome rejected: the formulation rule for next time.
     pub conclusion: Option<String>,
     /// private (default; summary and conclusion never leave this machine) | shared.
     pub visibility: Option<String>,
@@ -1479,9 +1482,12 @@ impl SidekickServer {
         Ok(text_result(redact_all(&text), false))
     }
 
-    /// Steckbrief (profile) of a model: registry data, harness limits not enforced, trust per
+    /// Short Steckbrief (about 6 lines, German) of a model as delegation guide: role, what it is
+    /// good for, how to word the task, what not to give it, lessons from earlier rejections and
+    /// blocks. Read this before choosing what to delegate and how to phrase the task. With
+    /// detail=true the full table: registry data, harness limits not enforced, trust per
     /// dimension and scope with counters, last block, review share, write and decisions right,
-    /// cost balance and the newest conclusions. Read this before choosing what to delegate.
+    /// cost balance, newest conclusions, profile and benchmarks.
     #[tool]
     async fn sidekick_steckbrief(
         &self,
@@ -1501,13 +1507,19 @@ impl SidekickServer {
             Err(e) => return tool_error_with(&snap, e),
         };
         let now = chrono::Utc::now().timestamp_millis();
+        let detail = p.detail.unwrap_or(false);
+        let label = backend.as_ref().map(|b| b.name.clone());
         let built = blocking(move || {
-            store.data.steckbrief(&id, &scope, Some(&store.local_root), now).map(|s| s.render()).map_err(|e| format!("{e:#}"))
+            store
+                .data
+                .steckbrief(&id, &scope, Some(&store.local_root), now)
+                .map(|s| if detail { s.render() } else { s.render_short(label.as_deref()) })
+                .map_err(|e| format!("{e:#}"))
         })
         .await;
         match built {
             Ok(Ok(mut text)) => {
-                if let Some(b) = backend {
+                if let Some(b) = backend.filter(|_| detail) {
                     let unsupported = dispatch::unsupported_limits(&b);
                     if !unsupported.is_empty() {
                         let _ = write!(text, "\nharness limits not enforced: {}", unsupported.join(", "));
@@ -1521,7 +1533,8 @@ impl SidekickServer {
 
     /// Write one experience event about a delegated job: outcome accepted | rejected | aborted |
     /// note | seed, with review_s (your review time), conclusion and visibility (private by
-    /// default). Trust is computed from these events; seed (search/inventory only) sets a value
+    /// default). Outcome rejected REQUIRES a non-empty conclusion phrased as a formulation rule
+    /// for next time (what the task must say); it shows up in the Steckbrief under "Aus Fehlern". Trust is computed from these events; seed (search/inventory only) sets a value
     /// directly. Pushes the event to the shared data repository when data_name is configured.
     #[tool]
     async fn sidekick_record_experience(

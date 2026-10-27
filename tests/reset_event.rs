@@ -87,7 +87,9 @@ fn input(model_id: &str, outcome: Outcome) -> ExperienceInput {
 fn record_reset_needs_an_owner_prefix_and_resets_the_steckbrief() {
     let id = qwen().model_id();
     let (_d, owner) = store("owen", PEERS);
-    owner.record(input(&id, Outcome::Rejected)).unwrap();
+    let mut rejected = input(&id, Outcome::Rejected);
+    rejected.conclusion = Some("Datei nennen".into());
+    owner.record(rejected).unwrap();
     let mut with_job = input(&id, Outcome::Reset);
     with_job.job_id = Some("j".into());
     assert!(owner.record(with_job).is_err());
