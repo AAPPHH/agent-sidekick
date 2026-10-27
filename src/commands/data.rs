@@ -9,9 +9,9 @@ use crate::dispatch::{git, glob_match};
 
 pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const BOT: &str = "github-actions[bot]";
-pub const SHARED_RULES: [&str; 3] = ["data/models.parquet", "data/protected.parquet", "data/peers.toml"];
-pub const SHARED_RULE_GLOBS: [&str; 2] = [".github/workflows/data-*.yml", ".github/CODEOWNERS"];
-const PEERS: &str = "data/peers.toml";
+pub const SHARED_RULES: [&str; 3] = ["models.parquet", "protected.parquet", "peers.toml"];
+pub const SHARED_RULE_GLOBS: [&str; 1] = [".github/**"];
+const PEERS: &str = "peers.toml";
 const ZERO_REV: &str = "0000000000000000000000000000000000000000";
 
 #[derive(Debug, clap::Args)]
@@ -22,7 +22,7 @@ pub struct DataArgs {
 
 #[derive(Debug, clap::Subcommand)]
 pub enum DataCommand {
-    /// Check the data/ changes between two revisions against the pusher's prefixes and the data rules.
+    /// Check the changes between two revisions against the pusher's prefixes and the data rules.
     Validate {
         #[arg(long)]
         base: String,
@@ -36,7 +36,7 @@ pub enum DataCommand {
         #[arg(long)]
         paths_out: Option<PathBuf>,
     },
-    /// Union and dedup all experiences into data/aggregate/latest.parquet.
+    /// Union and dedup all experiences into aggregate/latest.parquet.
     Aggregate {
         #[arg(long)]
         root: PathBuf,
@@ -69,7 +69,7 @@ pub fn run(args: DataArgs) -> Result<ExitCode> {
 }
 
 pub fn aggregate(root: &Path) -> Result<usize> {
-    let data = DataDir::new(root.join("data"));
+    let data = DataDir::new(root.to_path_buf());
     let events: Vec<_> = data.experience_events()?.iter().map(strip_private).collect();
     let path = data.aggregate_path();
     if !path.exists() || read_events(&path)? != events {
@@ -100,7 +100,7 @@ fn shared_rule(path: &str) -> bool {
 }
 
 fn prefix_of(path: &str) -> Option<&str> {
-    path.strip_prefix("data/experiences/")?.split_once('/').map(|(p, _)| p)
+    path.strip_prefix("experiences/")?.split_once('/').map(|(p, _)| p)
 }
 
 impl Validator<'_> {
@@ -115,7 +115,7 @@ impl Validator<'_> {
         } else {
             git_z(self.root, &["diff", "--name-only", "-z", "--no-renames", base, head])?
         };
-        let changed: Vec<String> = listing.into_iter().filter(|p| p.starts_with("data/") || (!zero && shared_rule(p))).collect();
+        let changed: Vec<String> = listing.into_iter().filter(|p| !zero || !p.starts_with(".github/")).collect();
         let (prefixes, owners) = self.peers(base)?;
         let is_owner = owners.iter().any(|o| o.eq_ignore_ascii_case(self.pusher));
         let mut foreign: Option<Vec<(String, String)>> = None;
@@ -129,7 +129,7 @@ impl Validator<'_> {
                 out.push((path.clone(), v));
             }
             let full = self.root.join(path);
-            if !path.starts_with("data/") || !full.is_file() {
+            if !full.is_file() {
                 continue;
             }
             out.extend(self.content_violations(path, &full).into_iter().map(|m| (path.clone(), m)));
@@ -152,7 +152,7 @@ impl Validator<'_> {
 
     fn base_event_ids(&self, rev: &str) -> Result<Vec<(String, String)>> {
         let mut ids = Vec::new();
-        let files = git_z(self.root, &["ls-tree", "-r", "--name-only", "-z", rev, "--", "data/experiences"])?;
+        let files = git_z(self.root, &["ls-tree", "-r", "--name-only", "-z", rev, "--", "experiences"])?;
         for (n, file) in files.iter().filter(|f| f.ends_with(".parquet")).enumerate() {
             let Some(prefix) = prefix_of(file) else { continue };
             let blob = Command::new("git").arg("-C").arg(self.root).args(["cat-file", "blob", &format!("{rev}:{file}")]).output()?;
@@ -185,7 +185,7 @@ impl Validator<'_> {
         let prefixes = table
             .iter()
             .filter(|(_, owner)| owner.as_str().is_some_and(|o| o.eq_ignore_ascii_case(self.pusher)))
-            .map(|(prefix, _)| format!("data/experiences/{prefix}/"))
+            .map(|(prefix, _)| format!("experiences/{prefix}/"))
             .collect();
         Ok((prefixes, owners))
     }
@@ -207,7 +207,7 @@ impl Validator<'_> {
         if full.extension().is_none_or(|e| e != "parquet") {
             return out;
         }
-        let name = rel.trim_start_matches("data/");
+        let name = rel;
         let result = if name == "models.parquet" {
             check_schema(full, ModelRow::schema()).and_then(|_| ModelRow::read_all(full).map(|_| Vec::new()))
         } else if name == "protected.parquet" {

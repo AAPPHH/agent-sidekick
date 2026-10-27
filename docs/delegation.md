@@ -25,4 +25,4 @@ Für Menschen und für das Steuermodell. Grundlage ist der Steckbrief des Modell
 3. `sidekick_dispatch` starten, Ergebnis prüfen, dann mit `sidekick_record_experience` bewerten (`accepted`, `rejected`, `note`; Blocks und Aborts trägt der Sidekick selbst ein).
 4. Mit `sidekick_sync` Erfahrungen teilen. Neue Modelle ohne Registry-Zeile werden abgelehnt.
 
-Die Daten liegen öffentlich unter `data/` im Code-Repo; Texte privater Einträge und Rohkennungen verlassen den Rechner nie.
+Die Daten liegen im privaten Repo `AAPPHH/sidekick-data` (`data_repo`); Texte privater Einträge und Rohkennungen verlassen den Rechner nie.

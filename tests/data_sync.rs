@@ -36,7 +36,7 @@ fn init_remote(bare: &Path, work: &Path) {
     std::fs::create_dir_all(work).unwrap();
     sh(work, &["init", "-q", "-b", "main"]);
     sh(work, &["remote", "add", "origin", &bare.to_string_lossy()]);
-    ModelRow::write_all(&work.join("data/models.parquet"), &[model()]).unwrap();
+    ModelRow::write_all(&work.join("models.parquet"), &[model()]).unwrap();
     std::fs::write(work.join("README.md"), "code\n").unwrap();
     commit_all(work, "init");
     sh(work, &["push", "-q", "origin", "main"]);
@@ -89,14 +89,14 @@ fn remote_files(f: &Fx, rev: &str) -> Vec<String> {
 fn only_own_path_is_committed_and_pushed() {
     let f = fx();
     let s = open(&f);
-    assert!(s.checkout.join("data/models.parquet").exists());
-    assert!(!s.checkout.join("README.md").exists());
-    std::fs::write(s.checkout.join("data/stray.txt"), "x").unwrap();
+    assert!(s.checkout.join("models.parquet").exists());
+    assert!(s.checkout.join("README.md").exists());
+    std::fs::write(s.checkout.join("stray.txt"), "x").unwrap();
     let (_, pushed) = s.record(input(Outcome::Accepted, Dimension::WriteCode)).unwrap();
     assert!(pushed);
     let files = remote_files(&f, "main");
     assert_eq!(files.len(), 1);
-    assert!(files[0].starts_with("data/experiences/me/") && files[0].ends_with(".parquet"));
+    assert!(files[0].starts_with("experiences/me/") && files[0].ends_with(".parquet"));
     assert!(sh(&f.bare, &["log", "-1", "--format=%s", "main"]).starts_with("data: "));
     assert!(sh(&s.checkout, &["status", "--porcelain"]).contains("stray.txt"));
     assert!(s.local_root.join("experiences/me").read_dir().unwrap().count() == 1);
@@ -107,7 +107,7 @@ fn rebase_retry_after_concurrent_push() {
     let f = fx();
     let s = open(&f);
     s.record(input(Outcome::Accepted, Dimension::Search)).unwrap();
-    let other = f.peer.join("data/experiences/other/o.parquet");
+    let other = f.peer.join("experiences/other/o.parquet");
     write_events(&other, &[Event::new(&model().model_id(), Dimension::Search, Scope::Global, Outcome::Accepted, 1)]).unwrap();
     commit_all(&f.peer, "data: other");
     sh(&f.peer, &["pull", "-q", "--rebase", "origin", "main"]);
@@ -133,7 +133,7 @@ fn offline_keeps_pending_and_pushes_on_sync() {
     let report = s.sync().unwrap();
     assert!(report.contains("pushed"), "{report}");
     assert!(!s.pending());
-    assert!(remote_files(&f, "main").iter().any(|p| p.starts_with("data/experiences/me/")));
+    assert!(remote_files(&f, "main").iter().any(|p| p.starts_with("experiences/me/")));
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn pseudonyms_are_stable_and_raw_values_stay_local() {
     s.record(input(Outcome::Accepted, Dimension::Search)).unwrap();
     let clone = f.peer.parent().unwrap().join("check");
     sh(f.peer.parent().unwrap(), &["clone", "-q", &f.bare.to_string_lossy(), &clone.to_string_lossy()]);
-    let file = DataDir::experience_files(&clone.join("data")).unwrap().remove(0);
+    let file = DataDir::experience_files(&clone).unwrap().remove(0);
     let events = read_events(&file).unwrap();
     assert_eq!(events.len(), 2);
     let secret = std::fs::read_to_string(f.base.join("secret")).unwrap();
@@ -205,4 +205,12 @@ fn pushed_copy_of_a_private_block_reason_has_no_file_paths() {
     assert_eq!(e.block_reason.as_deref(), Some(full));
     e.visibility = Visibility::Shared;
     assert_eq!(shared_copy(&e, None).block_reason.as_deref(), Some(full));
+}
+
+#[test]
+fn repo_slug_becomes_github_url_and_paths_stay() {
+    use agent_sidekick::sync::remote_url;
+    assert_eq!(remote_url("AAPPHH/sidekick-data"), "https://github.com/AAPPHH/sidekick-data.git");
+    assert_eq!(remote_url("/tmp/x/remote.git"), "/tmp/x/remote.git");
+    assert_eq!(remote_url("https://example.com/a/b.git"), "https://example.com/a/b.git");
 }

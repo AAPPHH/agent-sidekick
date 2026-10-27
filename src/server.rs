@@ -1680,9 +1680,9 @@ impl SidekickServer {
             return Ok(s.clone());
         }
         let base = crate::paths::data_dir().map_err(|e| format!("{e:#}"))?;
-        let (remote, name) = (snap.config.data_remote.clone(), snap.config.data_name.clone());
+        let (repo, name) = (snap.config.data_repo.clone(), snap.config.data_name.clone());
         let opened = blocking(move || {
-            DataStore::open(&base, &remote, name.as_deref()).map(Arc::new).map_err(|e| format!("data store: {e:#}"))
+            DataStore::open(&base, &repo, name.as_deref()).map(Arc::new).map_err(|e| format!("data store: {e:#}"))
         })
         .await??;
         Ok(self.state.data.get_or_init(|| opened).clone())

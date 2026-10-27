@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent_sidekick::backends::{Backend, BackendKind, CodexAuth, Cost, OpencodeProvider};
 use agent_sidekick::data::{pseudonym, read_events, write_events, DataDir, ModelRow, ProtectedRow};
 use agent_sidekick::dispatch::{technical_sperre, Identity};
 use agent_sidekick::trust::{Dimension, Event, Outcome, Scope};
 
-const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 const ADDED_AT: i64 = 1_793_102_400_000;
 const QWEN: &str = "Qwen3-Coder-Next";
 const KIC_MODEL: &str = "openai-gpt-oss-120b";
@@ -102,14 +101,11 @@ fn events(qwen_id: &str) -> Vec<Event> {
     vec![incident, search, inventory]
 }
 
-#[test]
-#[ignore]
-fn generate_start_data() {
-    let data = PathBuf::from(ROOT).join("data");
+fn write_start_data(data: &Path) {
     ModelRow::write_all(&data.join("models.parquet"), &models()).unwrap();
     ProtectedRow::write_all(&data.join("protected.parquet"), &ProtectedRow::defaults()).unwrap();
     let qwen_id = models()[0].model_id();
-    let existing = DataDir::experience_files(&data).unwrap();
+    let existing = DataDir::experience_files(data).unwrap();
     let path = existing.first().cloned().unwrap_or_else(|| data.join(format!("experiences/aapphh/{}.parquet", uuid::Uuid::new_v4())));
     let old = if path.exists() { read_events(&path).unwrap() } else { Vec::new() };
     let mut fresh = events(&qwen_id);
@@ -120,9 +116,23 @@ fn generate_start_data() {
     std::fs::write(data.join("peers.toml"), "owners = [\"AAPPHH\"]\naapphh = \"AAPPHH\"\n").unwrap();
 }
 
+fn generated() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().to_path_buf();
+    write_start_data(&data);
+    (dir, data)
+}
+
 #[test]
-fn committed_start_data_matches_dispatch_identity() {
-    let data = DataDir::new(PathBuf::from(ROOT).join("data"));
+#[ignore]
+fn generate_start_data() {
+    write_start_data(&PathBuf::from(std::env::var("SIDEKICK_DATA_OUT").unwrap()));
+}
+
+#[test]
+fn generated_start_data_matches_dispatch_identity() {
+    let (_dir, root) = generated();
+    let data = DataDir::new(root);
     let ids: Vec<String> = data.models().unwrap().iter().map(ModelRow::model_id).collect();
     let expected: Vec<String> = models().iter().map(ModelRow::model_id).collect();
     assert_eq!(ids, expected);
@@ -139,8 +149,8 @@ fn committed_start_data_matches_dispatch_identity() {
 }
 
 #[test]
-fn committed_incident_event_is_plain_and_peers_name_owners() {
-    let data = PathBuf::from(ROOT).join("data");
+fn generated_incident_event_is_plain_and_peers_name_owners() {
+    let (_dir, data) = generated();
     let files = DataDir::experience_files(&data).unwrap();
     assert_eq!(files.len(), 1);
     let events = read_events(&files[0]).unwrap();

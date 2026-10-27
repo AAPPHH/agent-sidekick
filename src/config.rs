@@ -31,13 +31,13 @@ pub struct Config {
     /// the implicit claude-oauth backend `claude` (v0.1 behaviour). Validated and turned
     /// into [`crate::backends::Backends`] by [`crate::backends::resolve`].
     pub backends: Option<BTreeMap<String, RawBackend>>,
-    /// Git remote of the public code repository that carries `data/` (experience logs).
-    pub data_remote: String,
-    /// Contributor name = prefix under `data/experiences/`. Unset: nothing is pushed.
+    /// Private data repository (`owner/name`, a full git URL or a local path) with the models, protected rules and experience logs.
+    pub data_repo: String,
+    /// Contributor name = prefix under `experiences/` in the data repository. Unset: nothing is pushed.
     pub data_name: Option<String>,
 }
 
-pub const DEFAULT_DATA_REMOTE: &str = "https://github.com/AAPPHH/agent-sidekick.git";
+pub const DEFAULT_DATA_REPO: &str = "AAPPHH/sidekick-data";
 
 impl Default for Config {
     fn default() -> Self {
@@ -49,7 +49,7 @@ impl Default for Config {
             claude_path: None,
             pass_env: Vec::new(),
             backends: None,
-            data_remote: DEFAULT_DATA_REMOTE.into(),
+            data_repo: DEFAULT_DATA_REPO.into(),
             data_name: None,
         }
     }
