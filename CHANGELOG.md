@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-27
+
+### Added
+
+- Trust and Steckbriefe: every model (provider, model, checkpoint, quant, harness) has a trust value per dimension and scope, computed from experience events; Opus 5.5 is Gold. Trust decides write and decisions rights and the review share.
+- Parquet data: `models`, `protected` and per-session experience files with schema versions; `sidekick_query` runs SQL over them.
+- Gated dispatch: `sidekick_dispatch` runs a job in its own git worktree, derives the harness tools and limits from trust, checks the diff against protected paths and terms and records blocked and aborted outcomes.
+- MCP tools `sidekick_steckbrief`, `sidekick_dispatch`, `sidekick_record_experience`, `sidekick_query` and `sidekick_sync`.
+- Data sync with the private repository `AAPPHH/sidekick-data` (pseudonymised user and machine IDs, private texts stay local) and the subcommands `agent-sidekick data validate` and `agent-sidekick data aggregate` for its workflows.
+
+### Upgrading
+
+- New config keys `data_repo` (default `AAPPHH/sidekick-data`; `owner/name`, a full git URL or a local path) and `data_name` (your prefix under `experiences/`; without it nothing is pushed). The data repository is private, so git needs access to it; without access the sidekick keeps working on its local data.
+
 ## [0.6.0] - 2026-10-23
 
 ### Changed
