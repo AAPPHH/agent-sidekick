@@ -147,6 +147,7 @@ pub struct DiffChecker<'a> {
     pub protected: &'a [ProtectedRow],
     pub dimension: Dimension,
     pub limits: Limits,
+    pub scope: &'a Scope,
 }
 
 impl DiffChecker<'_> {
@@ -156,7 +157,14 @@ impl DiffChecker<'_> {
 
     pub fn check(&self, files: &[String], unified0: &str) -> DiffCheck {
         let mut out = DiffCheck { files: files.to_vec(), ..Default::default() };
+        let module = match self.scope {
+            Scope::Module(_, path) => Some(path.trim_matches('/')),
+            _ => None,
+        };
         for f in files {
+            if let Some(m) = module.filter(|m| f != m && !f.starts_with(&format!("{m}/"))) {
+                out.violations.push(format!("path {f} outside module path {m}"));
+            }
             if self.dimension == Dimension::WriteTests {
                 if !TEST_GLOBS.iter().any(|g| glob_match(g, f)) {
                     out.violations.push(format!("write-tests touches non-test path {f}"));
@@ -437,14 +445,21 @@ impl Dispatcher {
                 wt.remove(true);
                 return Ok(());
             }
+            let patch = wt.diff("-U3")?;
             if !write_right {
+                let reason = format!("diff without write right ({}): {}", req.dimension, files.join(", "));
+                result.status = Status::Blocked;
                 result.diff_discarded = true;
-                result.status = Status::NoChange;
+                result.evidence_hash = Some(sha256_hex(patch.as_bytes()));
+                event.outcome = Outcome::Blocked;
+                event.block_reason = Some(reason.clone());
+                event.evidence_hash = result.evidence_hash.clone();
+                result.violations = vec![reason.clone()];
+                result.block_reason = Some(reason);
                 wt.remove(true);
                 return Ok(());
             }
-            let patch = wt.diff("-U3")?;
-            let checker = DiffChecker { protected: &protected, dimension: req.dimension, limits: Limits::for_scope(&req.scope) };
+            let checker = DiffChecker { protected: &protected, dimension: req.dimension, limits: Limits::for_scope(&req.scope), scope: &req.scope };
             let check = checker.check(&files, &wt.diff("-U0")?);
             if !check.violations.is_empty() && !standing.apply_without_review() {
                 let reason = check.violations.join("; ");
@@ -464,10 +479,15 @@ impl Dispatcher {
             let patch_path = patches.join(format!("{}.patch", req.job_id));
             std::fs::write(&patch_path, &patch)?;
             if standing.apply_without_review() {
-                git(&req.repo, &["apply", "--whitespace=nowarn", &patch_path.to_string_lossy()])?;
-                result.applied = true;
-                wt.remove(true);
-            } else {
+                match git(&req.repo, &["apply", "--whitespace=nowarn", &patch_path.to_string_lossy()]) {
+                    Ok(_) => {
+                        result.applied = true;
+                        wt.remove(true);
+                    }
+                    Err(e) => result.warnings.push(format!("gold apply failed, branch and patch kept: {e:#}")),
+                }
+            }
+            if !result.applied {
                 wt.commit(&format!("sidekick job {}", req.job_id))?;
                 wt.remove(false);
                 result.branch = Some(wt.branch.clone());
@@ -505,7 +525,7 @@ mod tests {
     #[test]
     fn term_removal_needs_readd() {
         let protected = ProtectedRow::defaults();
-        let checker = DiffChecker { protected: &protected, dimension: Dimension::WriteCode, limits: GLOBAL_LIMITS };
+        let checker = DiffChecker { protected: &protected, dimension: Dimension::WriteCode, limits: GLOBAL_LIMITS, scope: &Scope::Global };
         let removed = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-assert!(x);\n+x;\n";
         assert_eq!(checker.check(&["src/a.rs".into()], removed).violations.len(), 1);
         let moved = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-assert!(x);\n+assert!(y);\n";

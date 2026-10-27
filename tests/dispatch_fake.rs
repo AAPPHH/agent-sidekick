@@ -199,7 +199,10 @@ async fn no_write_right_withholds_tools_and_discards_diff() {
     let r = run(&mut e, "m-e", Dimension::WriteCode, "j8").await;
     assert!(!r.write_right && r.write_tools_withheld);
     assert!(r.diff_discarded);
-    assert_eq!(r.status, Status::NoChange);
+    assert_eq!(r.status, Status::Blocked);
+    assert_eq!(r.evidence_hash.as_ref().unwrap().len(), 64);
+    assert!(r.block_reason.as_ref().unwrap().contains("without write right"));
+    assert_eq!(e.log.events()[0].outcome, Outcome::Blocked);
     assert!(r.branch.is_none() && branches(&e.repo).is_empty());
     let args = std::fs::read_to_string(e.dir.path().join("args.txt")).unwrap();
     let lines: Vec<&str> = args.lines().collect();
@@ -230,4 +233,50 @@ async fn step_limit_abort_is_a_result() {
     assert_eq!(r.status, Status::Aborted);
     assert!(branches(&e.repo).is_empty());
     assert_eq!(e.log.events()[0].outcome, Outcome::Aborted);
+}
+
+#[tokio::test]
+async fn search_job_producing_a_diff_is_blocked() {
+    let mut e = env("m-g", true, 40, "printf 'fn b() {}\\n' > src/b.rs\n");
+    let r = run(&mut e, "m-g", Dimension::Search, "j11").await;
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.diff_discarded && r.branch.is_none());
+    assert_eq!(e.log.events()[0].outcome, Outcome::Blocked);
+    assert_eq!(e.log.events()[0].evidence_hash, r.evidence_hash);
+    assert!(branches(&e.repo).is_empty());
+}
+
+#[tokio::test]
+async fn module_scope_bounds_paths() {
+    let mut e = env("m-h", true, 40, "printf 'fn b() {}\\n' > src/b.rs\nprintf 'fn c() {}\\n' > lib2.rs\n");
+    let mut req = request(&e, Dimension::WriteCode, "j12");
+    req.scope = Scope::Module("repo".into(), "src".into());
+    let r = e.dispatcher.dispatch(&backend("m-h"), &req, &mut e.log).await.unwrap();
+    assert_eq!(r.status, Status::Blocked);
+    assert_eq!(r.violations.len(), 1);
+    assert!(r.violations[0].contains("lib2.rs outside module path src"));
+
+    let mut e = env("m-h", true, 40, "printf 'fn b() {}\\n' > src/b.rs\n");
+    let mut req = request(&e, Dimension::WriteCode, "j13");
+    req.scope = Scope::Module("repo".into(), "src".into());
+    let r = e.dispatcher.dispatch(&backend("m-h"), &req, &mut e.log).await.unwrap();
+    assert_eq!(r.status, Status::Completed);
+    assert!(r.branch.is_some());
+}
+
+#[tokio::test]
+async fn gold_apply_conflict_keeps_branch_and_patch() {
+    let mut e = env(
+        "claude-opus-5-5",
+        true,
+        0,
+        "printf 'fn a() { new }\\n' > src/lib.rs\nprintf 'fn a() { other }\\n' > ../../../repo/src/lib.rs\n",
+    );
+    let r = run(&mut e, "claude-opus-5-5", Dimension::WriteCode, "j14").await;
+    assert_eq!(r.status, Status::Completed);
+    assert!(!r.applied);
+    assert_eq!(r.branch.as_deref(), Some("sidekick/j14"));
+    assert!(r.patch_path.as_ref().unwrap().exists());
+    assert!(r.warnings.iter().any(|w| w.contains("gold apply failed")));
+    assert!(branches(&e.repo).contains("sidekick/j14"));
 }
