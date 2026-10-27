@@ -43,7 +43,8 @@ pick one by description and cost. `sidekick_run`: run a prompt in a working dire
 (optional `backend`, `model`, `fallback`); it returns when the agent is done, which can take \
 many minutes. `sidekick_status`: running/queued jobs and setup problems. Without `backend`, a \
 run goes to the configured default backend. The result names the backend and model that ran, \
-the exit code, the log path and the tail of the output. If a run fails because no token, key \
+the exit code, the log path and the tail of the output. Registered models need `dimension` \
+(dispatch path, then record a verdict with `sidekick_record_experience` and `job_id`). If a run fails because no token, key \
 or login is stored, ask the user to run `agent-sidekick setup` (or `agent-sidekick setup \
 --backend <name>`) in a terminal.";
 
@@ -104,6 +105,12 @@ pub struct RunParams {
     /// own full `timeout_s` (and may wait in its own queue), so a request with a fallback can
     /// take up to about 2x timeout_s plus queue time.
     pub fallback: Option<String>,
+    /// search | inventory | write-tests | write-code | decisions. Required when the resolved
+    /// backend and model have a registry row (then the run is a dispatch: own worktree, gated
+    /// tools, diff check, logged job); ignored for unregistered backends.
+    pub dimension: Option<String>,
+    /// global (default) | repo:<name> | module:<repo>/<path>; only used for registered models.
+    pub scope: Option<String>,
 }
 
 /// Parameters of `sidekick_steckbrief`.
@@ -1140,7 +1147,10 @@ impl SidekickServer {
     /// description and cost) and `model` one of that backend's models (validated against its
     /// allowlist), `fallback` names a backend to use if the chosen one is unreachable, lacks credentials,
     /// fails to start or exits with an error (not after a timeout; the fallback gets its own
-    /// timeout_s, so the request can take up to about 2x timeout_s). The agent runs in `cwd`
+    /// timeout_s, so the request can take up to about 2x timeout_s). If the resolved backend and
+    /// model are registered (have a Steckbrief), `dimension` is required and the run is a
+    /// dispatch (see sidekick_dispatch; no fallback); other backends run as before without
+    /// any trust effect. The agent runs in `cwd`
     /// with the given limits and cannot see this conversation, so the prompt must be
     /// self-contained. Runs beyond the concurrency limits wait in a queue. Returns which
     /// backend ran, the exit code, the path of the full log file, the duration and the last
@@ -1175,7 +1185,7 @@ impl SidekickServer {
         };
         let home = crate::paths::home_dir().ok();
         let (backend_param, fallback_param) = (params.backend.clone(), params.fallback.clone());
-        let req = match resolve_request(params, &snap.config, &base_dir, home.as_deref()) {
+        let req = match resolve_request(params.clone(), &snap.config, &base_dir, home.as_deref()) {
             Ok(r) => r,
             Err(msg) => return tool_error_with(&snap, msg),
         };
@@ -1190,6 +1200,31 @@ impl SidekickServer {
         // A model the primary does not offer is an invalid parameter: no run, no fallback.
         if let Err(msg) = primary.effective_model(req.model.as_deref()) {
             return tool_error_with(&snap, msg);
+        }
+        if self.is_registered(&snap, primary, req.model.as_deref()).await {
+            let Some(dimension) = params.dimension.clone().filter(|d| !d.trim().is_empty()) else {
+                return tool_error_with(
+                    &snap,
+                    format!(
+                        "backend {} with this model is registered (has a Steckbrief), so sidekick_run needs `dimension` \
+                         (search | inventory | write-tests | write-code | decisions) and optionally `scope`; the run goes through \
+                         the dispatch path (worktree, gated tools, diff check, logged job)",
+                        primary.name
+                    ),
+                );
+            };
+            let dp = DispatchParams {
+                prompt: params.prompt,
+                cwd: params.cwd,
+                dimension,
+                scope: params.scope,
+                backend: Some(primary.name.clone()),
+                model: params.model,
+                max_turns: params.max_turns,
+                timeout_s: params.timeout_s,
+                ..Default::default()
+            };
+            return self.sidekick_dispatch(Parameters(dp), ctx).await;
         }
         let direct = match state.cooldown(&primary.name) {
             None => None,
@@ -1714,6 +1749,19 @@ impl SidekickServer {
         })
         .await??;
         Ok(self.state.data.get_or_init(|| opened).clone())
+    }
+
+    async fn is_registered(&self, snap: &Snapshot, backend: &Backend, model: Option<&str>) -> bool {
+        let Ok(base) = crate::paths::data_dir() else { return false };
+        if !DataStore::checkout_exists(&base) {
+            return false;
+        }
+        let Ok(model) = backend.effective_model(model) else { return false };
+        let id = Identity::default().key(backend, model.as_deref()).model_id();
+        match self.store(snap).await {
+            Ok(store) => store.data.model(&id).is_ok(),
+            Err(_) => false,
+        }
     }
 
     fn model_id_for(
