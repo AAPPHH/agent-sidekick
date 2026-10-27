@@ -3,15 +3,11 @@ name: Data validate
 on:
   push:
     branches: [main]
-    paths: ["data/**"]
+    paths: ["data/**", ".github/workflows/data-*.yml", ".github/CODEOWNERS"]
 
 permissions:
   contents: write
   issues: write
-
-concurrency:
-  group: data-main
-  cancel-in-progress: false
 
 jobs:
   validate:
@@ -19,46 +15,83 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      AGENT_SIDEKICK_VERSION: v0.6.0
+      PUSHER: ${{ github.actor }}
+      ZERO: "0000000000000000000000000000000000000000"
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Download the latest agent-sidekick release
+      - name: Download the pinned agent-sidekick release and verify its checksum
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/bin"
-          gh release download --repo "$GITHUB_REPOSITORY" --pattern 'agent-sidekick-x86_64-unknown-linux-musl.tar.gz' --dir "$RUNNER_TEMP"
-          tar -xzf "$RUNNER_TEMP/agent-sidekick-x86_64-unknown-linux-musl.tar.gz" -C "$RUNNER_TEMP/bin" agent-sidekick
+          archive=agent-sidekick-x86_64-unknown-linux-musl.tar.gz
+          dl="$RUNNER_TEMP/dl"
+          mkdir -p "$dl" "$RUNNER_TEMP/bin"
+          gh release download "$AGENT_SIDEKICK_VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --pattern SHA256SUMS --dir "$dl"
+          (cd "$dl" && grep "  $archive\$" SHA256SUMS | sha256sum -c -)
+          tar -xzf "$dl/$archive" -C "$RUNNER_TEMP/bin" agent-sidekick
 
-      - name: Validate
+      - name: Validate since the last validated revision
         id: validate
-        continue-on-error: true
         run: |
-          set -o pipefail
-          "$RUNNER_TEMP/bin/agent-sidekick" data validate \
-            --base "${{ github.event.before }}" \
-            --head "${{ github.event.after }}" \
-            --pusher "${{ github.actor }}" \
-            --root "$GITHUB_WORKSPACE" | tee "$RUNNER_TEMP/violations.txt"
+          set -uo pipefail
+          base=$(git rev-parse -q --verify "refs/tags/data-validated^{commit}" || echo "$ZERO")
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          "$RUNNER_TEMP/bin/agent-sidekick" data validate --base "$base" --head "$GITHUB_SHA" --pusher "$PUSHER" --root "$GITHUB_WORKSPACE" --paths-out "$RUNNER_TEMP/paths.txt" | tee "$RUNNER_TEMP/violations.txt"
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" = 0 ] && [ -f "$RUNNER_TEMP/paths.txt" ]; then
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" = 1 ] && [ -s "$RUNNER_TEMP/paths.txt" ]; then
+            echo "result=violations" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=error" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
-      - name: Revert the pushed commits and open an issue
-        if: steps.validate.outcome == 'failure'
+      - name: Restore the violating paths and open an issue
+        if: steps.validate.outputs.result == 'violations'
         run: |
           set -euo pipefail
+          base="${{ steps.validate.outputs.base }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          before="${{ github.event.before }}"
-          after="${{ github.event.after }}"
-          if [ "$before" = "0000000000000000000000000000000000000000" ]; then
-            git revert --no-edit "$after"
-          else
-            git revert --no-edit "$before..$after"
+          git fetch origin main
+          git checkout -q -B restore origin/main
+          while IFS= read -r p; do
+            if [ "$base" != "$ZERO" ] && git cat-file -e "$base:$p" 2>/dev/null; then
+              git checkout "$base" -- "$p"
+            else
+              git rm -rq --ignore-unmatch -- "$p"
+              rm -rf -- "$p"
+            fi
+          done < "$RUNNER_TEMP/paths.txt"
+          if ! git diff --cached --quiet; then
+            git commit -q -m "data: revert push by $PUSHER that violated the data rules"
+            for attempt in 1 2 3; do
+              git push origin HEAD:main && break
+              git fetch origin main
+              git rebase origin/main
+            done
           fi
-          git push origin HEAD:main || { git pull --rebase origin main && git push origin HEAD:main; }
           {
-            echo "Push $after by ${{ github.actor }} violated the data rules and was reverted."
+            echo "Push $GITHUB_SHA by $PUSHER violated the data rules; the violating paths were restored to the state of data-validated ($base)."
             echo
             cat "$RUNNER_TEMP/violations.txt"
           } > "$RUNNER_TEMP/issue.md"
-          gh issue create --title "data: push by ${{ github.actor }} reverted" --body-file "$RUNNER_TEMP/issue.md"
+          gh issue create --title "data: push by $PUSHER reverted" --body-file "$RUNNER_TEMP/issue.md"
+
+      - name: Move data-validated to the validated revision
+        if: steps.validate.outputs.result == 'ok'
+        run: |
+          set -euo pipefail
+          base="${{ steps.validate.outputs.base }}"
+          git tag -f data-validated "$GITHUB_SHA"
+          if [ "$base" = "$ZERO" ]; then lease="refs/tags/data-validated:"; else lease="refs/tags/data-validated:$base"; fi
+          git push --force-with-lease="$lease" origin refs/tags/data-validated || echo "data-validated was moved by a concurrent run; the next run validates from there"
+
+      - name: Open an issue when validation could not run
+        if: failure()
+        run: |
+          gh issue create --title "data: validation did not run for $GITHUB_SHA" --body "The data validation for push $GITHUB_SHA by $PUSHER failed before it could finish (download, checksum, validation or restore). data-validated was not moved, so the next run validates this range again. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

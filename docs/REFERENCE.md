@@ -449,6 +449,7 @@ A push-triggered workflow cannot stop a push that edits the workflow itself, so 
 
 - Name `protect-ci`, Enforcement status `Active`, Target branches: `Include default branch`.
 - Rules: `Restrict file paths` with `.github/**`, `Restrict pushes` with a bypass list holding only the repository owner (or require a pull request with `Require review from Code Owners` and `.github/CODEOWNERS` listing the owner for `/.github/`).
+- A second ruleset `protect-validated-tag` with target `Tags`, pattern `data-validated`, rules `Restrict creations`, `Restrict updates`, `Restrict deletions`; its bypass list needs the identity that moves the tag (use a deploy key or app token for the workflows if `GITHUB_TOKEN` cannot bypass), otherwise anyone with write access can move the tag and skip validation.
 - Bypass list: the repository owner only (add the `github-actions` app only if the bot must change files under `.github/`; it does not).
 
 ## CLI reference
