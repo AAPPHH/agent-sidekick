@@ -488,14 +488,24 @@ pub fn redact_block_reason(reason: &str) -> String {
 const LINE_MAX: usize = 180;
 
 fn clauses(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split(". ")
-        .flat_map(|s| s.split("; "))
-        .map(|s| s.trim().trim_end_matches(['.', ';']).to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = flat.chars().collect();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        let next = chars.get(i + 2).copied();
+        let split = chars.get(i + 1) == Some(&' ') && (*c == ';' || (*c == '.' && next.is_some_and(|n| n.is_uppercase())));
+        if split {
+            if *c == ';' {
+                cur.push(*c);
+            }
+            out.push(std::mem::take(&mut cur));
+        } else if !(i > 0 && chars[i - 1] == ' ' && *c == ' ') {
+            cur.push(*c);
+        }
+    }
+    out.push(cur);
+    out.into_iter().map(|s| s.trim().trim_end_matches([';']).to_string()).filter(|s| !s.is_empty()).collect()
 }
 
 fn fit(items: Vec<String>, max: usize) -> Vec<String> {
@@ -1232,8 +1242,8 @@ mod tests {
 
     #[test]
     fn fit_keeps_whole_clauses() {
-        assert_eq!(fit(clauses("Eins ist gut. Zwei auch; drei"), 20), vec!["Eins ist gut"]);
-        assert_eq!(fit(clauses("Eins ist gut. Zwei auch; drei"), 100), vec!["Eins ist gut", "Zwei auch", "drei"]);
+        assert_eq!(fit(clauses("Eins ist gut. Zwei auch; drei ca. 5 min"), 20), vec!["Eins ist gut"]);
+        assert_eq!(fit(clauses("Eins ist gut. Zwei auch; drei ca. 5 min"), 100), vec!["Eins ist gut", "Zwei auch", "drei ca. 5 min"]);
         let long = "x ".repeat(150);
         assert_eq!(fit(clauses(&long), 20), vec![long.trim().to_string()]);
     }
