@@ -1,14 +1,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use agent_sidekick::backends::{Backend, BackendKind, CodexAuth, Cost, OpencodeProvider};
+use agent_sidekick::backends::{Backend, BackendKind, Cost, OpencodeProvider};
 use agent_sidekick::data::{pseudonym, read_events, write_events, DataDir, ModelRow, ProtectedRow};
 use agent_sidekick::dispatch::{technical_sperre, Identity};
 use agent_sidekick::trust::{Dimension, Event, Outcome, Scope};
 
 const ADDED_AT: i64 = 1_793_102_400_000;
 const QWEN: &str = "Qwen3-Coder-Next";
-const KIC_MODEL: &str = "openai-gpt-oss-120b";
 
 fn backend(kind: BackendKind) -> Backend {
     Backend {
@@ -44,18 +43,6 @@ fn dgx() -> Backend {
     })
 }
 
-fn kiconnect_codex() -> Backend {
-    backend(BackendKind::Codex {
-        auth: CodexAuth::ApiKey,
-        base_url: Some("https://chat.kiconnect.nrw/api/v1".into()),
-        api_key_env: None,
-        harness_path: None,
-        read_only: false,
-        windows_sandbox: Default::default(),
-        base_dir: PathBuf::from("/x"),
-    })
-}
-
 fn row(b: &Backend, model: &str, cost: &str, max_steps: i64, context_tokens: Option<i64>, budget: i64) -> ModelRow {
     ModelRow {
         key: Identity::default().key(b, Some(model)),
@@ -72,8 +59,7 @@ fn row(b: &Backend, model: &str, cost: &str, max_steps: i64, context_tokens: Opt
 
 fn models() -> Vec<ModelRow> {
     vec![
-        row(&dgx(), QWEN, "shared-dgx", 80, None, 64_000),
-        row(&kiconnect_codex(), KIC_MODEL, "free", 80, None, 64_000),
+        row(&dgx(), QWEN, "shared-dgx", 80, Some(262_144), 64_000),
         row(&claude(), "claude-sonnet-5-5", "quota", 100, Some(200_000), 150_000),
         row(&claude(), "claude-opus-5-5", "quota", 100, Some(200_000), 150_000),
     ]
@@ -144,8 +130,8 @@ fn generated_start_data_matches_dispatch_identity() {
     assert!((trust(Dimension::Inventory) - 0.35).abs() < 1e-9);
     assert!((trust(Dimension::WriteCode) - 0.10).abs() < 1e-9);
     assert!(!sb.write_right_code && !sb.decisions_right);
-    assert!(data.steckbrief(&expected[3], &Scope::Global, None, now).unwrap().gold);
-    assert!(!data.steckbrief(&expected[2], &Scope::Global, None, now).unwrap().gold);
+    assert!(data.steckbrief(&expected[2], &Scope::Global, None, now).unwrap().gold);
+    assert!(!data.steckbrief(&expected[1], &Scope::Global, None, now).unwrap().gold);
 }
 
 #[test]
