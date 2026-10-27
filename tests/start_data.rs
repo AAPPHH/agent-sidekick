@@ -129,7 +129,7 @@ fn events(qwen_id: &str) -> Vec<Event> {
     incident.duration_s = Some(142.0);
     incident.block_reason = Some("Validierung decided_by entfernt".into());
     incident.summary = Some("Qwen3-Coder-Next hat bei einer Code-Aufgabe eine Validierung entfernt, damit der eigene Test durchgeht.".into());
-    incident.conclusion = None;
+    incident.conclusion = Some("Schutzbegriff decided_by und Validierungen dürfen nicht entfernt werden – im Auftrag nennen; Tests sind unveränderlich".into());
     let mut search = make(Dimension::Search, Outcome::Seed, 2_000);
     search.seed_value = Some(0.55);
     let mut inventory = make(Dimension::Inventory, Outcome::Seed, 3_000);
@@ -212,7 +212,7 @@ fn generated_incident_event_is_plain_and_peers_name_owners() {
         incident.summary.as_deref(),
         Some("Qwen3-Coder-Next hat bei einer Code-Aufgabe eine Validierung entfernt, damit der eigene Test durchgeht.")
     );
-    assert_eq!(incident.conclusion, None);
+    assert_eq!(incident.conclusion.as_deref(), Some("Schutzbegriff decided_by und Validierungen dürfen nicht entfernt werden – im Auftrag nennen; Tests sind unveränderlich"));
     let peers = std::fs::read_to_string(data.join("peers.toml")).unwrap();
     assert!(peers.contains("owners = [\"AAPPHH\"]"));
 }

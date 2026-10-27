@@ -485,14 +485,31 @@ pub fn redact_block_reason(reason: &str) -> String {
         .join("; ")
 }
 
-fn condense(text: &str, max: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        return flat;
+const LINE_MAX: usize = 180;
+
+fn clauses(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split(". ")
+        .flat_map(|s| s.split("; "))
+        .map(|s| s.trim().trim_end_matches(['.', ';']).to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn fit(items: Vec<String>, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut len = 0;
+    for item in items {
+        let add = item.chars().count() + if out.is_empty() { 0 } else { 2 };
+        if !out.is_empty() && len + add > max {
+            break;
+        }
+        len += add;
+        out.push(item);
     }
-    let cut: String = flat.chars().take(max).collect();
-    let end = cut.rfind([' ', ';', ',']).filter(|i| *i > max / 2).unwrap_or(cut.len());
-    format!("{}…", cut[..end].trim_end_matches([' ', ';', ',', '.']))
+    out
 }
 
 pub fn block_lesson(reason: &str, scope: &Scope) -> Option<String> {
@@ -789,7 +806,7 @@ impl Steckbrief {
             .iter()
             .filter(|e| matches!(e.outcome, Outcome::Rejected | Outcome::Blocked) && chain.contains(&e.scope))
             .filter_map(|e| {
-                let derived = || e.block_reason.as_deref().filter(|_| e.outcome == Outcome::Blocked).and_then(|r| block_lesson(r, &e.scope));
+                let derived = || e.block_reason.as_deref().filter(|_| e.outcome == Outcome::Blocked).and_then(|r| block_lesson(r, &e.scope).or_else(|| Some(format!("Blockiert: {r} – im Auftrag ausdrücklich verbieten"))));
                 e.conclusion.clone().filter(|c| !c.trim().is_empty()).or_else(derived).map(|t| (e.ts_ms, t))
             })
             .collect();
@@ -880,7 +897,7 @@ impl Steckbrief {
             }
         };
         let p = self.profile.clone().unwrap_or_default();
-        let part = |v: &Option<String>| v.as_deref().map(|t| condense(t, 70));
+        let part = |v: &Option<String>| v.as_deref().map(clauses).unwrap_or_default();
         let join = |v: Vec<String>| if v.is_empty() { "-".to_string() } else { v.join("; ") };
         let mut how = Vec::new();
         if self.gold {
@@ -892,13 +909,13 @@ impl Steckbrief {
                 how.push(if self.at_least(Dimension::Decisions, DECISIONS_RIGHT_MIN) { "darf selbst entscheiden" } else { "Entscheidungen im Auftrag vorgeben" }.to_string());
             }
         }
-        how.extend(part(&p.prompting));
-        let mut avoid: Vec<String> = part(&p.weaknesses).into_iter().collect();
+        how.extend(fit(part(&p.prompting), LINE_MAX));
+        let mut avoid: Vec<String> = part(&p.weaknesses);
         if !self.gold {
             avoid.extend(Dimension::ALL.iter().filter(|d| self.deactivated(**d)).map(|d| format!("nicht für {d}")));
         }
-        let good: Vec<String> = [&p.strengths, &p.task_scope].into_iter().filter_map(part).collect();
-        let lessons: Vec<String> = self.lessons.iter().map(|l| condense(l, 90)).collect();
+        let good: Vec<String> = fit([&p.strengths, &p.task_scope].into_iter().flat_map(part).collect(), LINE_MAX);
+        let lessons = fit(self.lessons.clone(), LINE_MAX);
         format!(
             "{} ({}) – {}\nGut für: {}\nSo formulieren: {}\nNicht geben: {}\nAus Fehlern: {}\n",
             k.model,
@@ -906,7 +923,7 @@ impl Steckbrief {
             role,
             join(good),
             join(how),
-            join(avoid),
+            join(fit(avoid, LINE_MAX)),
             join(lessons)
         )
     }
@@ -1214,9 +1231,20 @@ mod tests {
     }
 
     #[test]
-    fn condense_truncates_cleanly() {
-        assert_eq!(condense("kurz", 10), "kurz");
-        assert_eq!(condense("eins zwei drei vier fünf", 14), "eins zwei…");
+    fn fit_keeps_whole_clauses() {
+        assert_eq!(fit(clauses("Eins ist gut. Zwei auch; drei"), 20), vec!["Eins ist gut"]);
+        assert_eq!(fit(clauses("Eins ist gut. Zwei auch; drei"), 100), vec!["Eins ist gut", "Zwei auch", "drei"]);
+        let long = "x ".repeat(150);
+        assert_eq!(fit(clauses(&long), 20), vec![long.trim().to_string()]);
+    }
+
+    #[test]
+    fn free_text_block_without_conclusion_gets_forbid_lesson() {
+        let id = qwen_row().model_id();
+        let mut blk = ev(&id, Dimension::WriteCode, "global", Outcome::Blocked, 3);
+        blk.block_reason = Some("Validierung decided_by entfernt".into());
+        let text = short_for(&[blk], None);
+        assert!(text.contains("Aus Fehlern: Blockiert: Validierung decided_by entfernt – im Auftrag ausdrücklich verbieten"), "{text}");
     }
 
     fn short_for(events: &[Event], profile: Option<Profile>) -> String {
