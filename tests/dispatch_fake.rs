@@ -569,6 +569,17 @@ async fn gold_with_an_unanswered_question_is_returned_as_branch_and_not_applied(
 }
 
 #[tokio::test]
+async fn an_unanswered_question_warns_even_when_the_step_changed_nothing() {
+    let e = env("claude-opus-5-5", true, 0, &reports("claude-opus-5-5-20261001"));
+    let req = request(&e, Dimension::Search, "unans-nc");
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let extras = RunExtras { unanswered: Some(flag), hold_gold: true, ..Default::default() };
+    let (r, _) = e.dispatcher.run_with(&backend("claude-opus-5-5"), &req, tokio_util::sync::CancellationToken::new(), extras).await.unwrap();
+    assert_eq!(r.status, Status::NoChange);
+    assert!(r.warnings.iter().any(|w| w.contains("went unanswered")), "{:?}", r.warnings);
+}
+
+#[tokio::test]
 async fn a_step_branch_is_one_commit_on_its_base_and_the_answer_is_the_final_text() {
     let e = env("claude-opus-5-5", true, 0, &format!("echo x > one.txt; git add -A; git -c user.name=w -c user.email=w@w commit -q -m own; echo y > two.txt\n{}", reports("claude-opus-5-5-20261001")));
     let mut req = request(&e, Dimension::WriteCode, "squash");

@@ -798,6 +798,10 @@ impl Dispatcher {
         event.user_id = self.user_id.clone();
         event.job_id = Some(req.job_id.clone());
         event.duration_s = Some(result.duration_s);
+        let unanswered = extras.unanswered.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+        if unanswered {
+            result.warnings.push("a question of the worker went unanswered: gold is not applied directly, result returned as branch/patch".into());
+        }
         let finished = (|| -> Result<()> {
             if let Some(reason) = guard.check_and_restore() {
                 result.status = Status::Blocked;
@@ -906,10 +910,6 @@ impl Dispatcher {
             let patch_path = patches.join(format!("{}.patch", req.job_id));
             std::fs::write(&patch_path, &patch)?;
             result.gold = gold;
-            let unanswered = extras.unanswered.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
-            if gold && unanswered {
-                result.warnings.push("gold not applied: a question of the worker went unanswered, result returned as branch/patch".into());
-            }
             if gold && !extras.hold_gold && !unanswered {
                 match git(&req.repo, &["apply", "--whitespace=nowarn", &patch_path.to_string_lossy()]) {
                     Ok(_) => {
