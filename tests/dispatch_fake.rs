@@ -468,6 +468,10 @@ fn alias_table_and_default_model_resolution() {
         assert_eq!(key(id).model_id(), key(a).model_id());
     }
     assert_eq!(resolve_claude_alias("claude-opus-5-5-20261001"), "claude-opus-5-5-20261001");
+    for variant in ["Claude-Sonnet-5-5", "claude-sonnet-5-5-20260901", "sonnet[1m]", "claude-sonnet-5-5-20260901[1m]", " SONNET ", "Sonnet"] {
+        assert_eq!(key(variant).model_id(), key("claude-sonnet-5-5").model_id(), "{variant}");
+    }
+    assert_ne!(key("claude-sonnet-5-5-evil").model_id(), key("claude-sonnet-5-5").model_id());
     let mut b = backend("opus");
     b.model = Some("sonnet".into());
     assert_eq!(Identity::default().key(&b, None).model, "claude-sonnet-5-5");

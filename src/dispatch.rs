@@ -59,10 +59,26 @@ pub fn resolve_claude_alias(model: &str) -> String {
     CLAUDE_ALIASES.iter().find(|(alias, _)| *alias == model).map_or(model, |(_, id)| id).to_string()
 }
 
+pub fn normalize_claude_model(model: &str) -> String {
+    let lower = model.trim().to_lowercase();
+    let base = lower.split('[').next().unwrap_or_default();
+    let base = match base.rsplit_once('-') {
+        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => base,
+    };
+    resolve_claude_alias(base)
+}
+
+fn claude_model_with(backend: &Backend, model: Option<&str>, f: fn(&str) -> String) -> Option<String> {
+    matches!(backend.kind, BackendKind::ClaudeOauth { .. }).then(|| model.or(backend.model.as_deref()).map(f)).flatten()
+}
+
 pub fn expected_claude_model(backend: &Backend, model: Option<&str>) -> Option<String> {
-    matches!(backend.kind, BackendKind::ClaudeOauth { .. })
-        .then(|| model.or(backend.model.as_deref()).map(resolve_claude_alias))
-        .flatten()
+    claude_model_with(backend, model, normalize_claude_model)
+}
+
+pub fn same_registry_scope(backend: &Backend, key: &ModelKey) -> bool {
+    key.provider == default_provider(backend) && key.harness == harness_name(backend)
 }
 
 impl Identity {
@@ -484,7 +500,7 @@ impl Dispatcher {
         let limited = with_registry_limits(backend, &row);
         let prepared = if write_right { limited } else { withhold_writes(&limited) };
         let expected = expected_claude_model(backend, model.as_deref());
-        let model = expected.clone().or(model);
+        let model = claude_model_with(backend, model.as_deref(), resolve_claude_alias).or(model);
         let max_turns = match (backend.harness_kind(), row.max_steps) {
             (HarnessKind::Claude | HarnessKind::OpenCode, Some(m)) if m > 0 => req.max_turns.min(m as u32),
             _ => req.max_turns,

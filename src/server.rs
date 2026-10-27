@@ -1155,7 +1155,9 @@ impl SidekickServer {
     /// fails to start or exits with an error (not after a timeout; the fallback gets its own
     /// timeout_s, so the request can take up to about 2x timeout_s). If the resolved backend and
     /// model are registered (have a Steckbrief), `dimension` is required and the run is a
-    /// dispatch (see sidekick_dispatch; no fallback); other backends run as before without
+    /// dispatch (see sidekick_dispatch); a registered `fallback` runs as a dispatch with the same
+    /// `dimension` too, and the request is rejected without `dimension`; a model that is not
+    /// registered on a backend that has registered models is rejected; other backends run as before without
     /// any trust effect. The agent runs in `cwd`
     /// with the given limits and cannot see this conversation, so the prompt must be
     /// self-contained. Runs beyond the concurrency limits wait in a queue. Returns which
@@ -1207,30 +1209,51 @@ impl SidekickServer {
         if let Err(msg) = primary.effective_model(req.model.as_deref()) {
             return tool_error_with(&snap, msg);
         }
-        if self.is_registered(&snap, primary, req.model.as_deref()).await {
-            let Some(dimension) = params.dimension.clone().filter(|d| !d.trim().is_empty()) else {
-                return tool_error_with(
-                    &snap,
-                    format!(
-                        "backend {} with this model is registered (has a Steckbrief), so sidekick_run needs `dimension` \
-                         (search | inventory | write-tests | write-code | decisions) and optionally `scope`; the run goes through \
-                         the dispatch path (worktree, gated tools, diff check, logged job)",
-                        primary.name
-                    ),
-                );
-            };
-            let dp = DispatchParams {
-                prompt: params.prompt,
-                cwd: params.cwd,
-                dimension,
-                scope: params.scope,
-                backend: Some(primary.name.clone()),
-                model: params.model,
-                max_turns: params.max_turns,
-                timeout_s: params.timeout_s,
-                ..Default::default()
-            };
-            return self.sidekick_dispatch(Parameters(dp), ctx).await;
+        let dimension = params.dimension.clone().filter(|d| !d.trim().is_empty());
+        let dispatch_params = |backend: &Backend, model: Option<String>, dimension: String| DispatchParams {
+            prompt: params.prompt.clone(),
+            cwd: params.cwd.clone(),
+            dimension,
+            scope: params.scope.clone(),
+            backend: Some(backend.name.clone()),
+            model,
+            max_turns: params.max_turns,
+            timeout_s: params.timeout_s,
+            ..Default::default()
+        };
+        let needs_dimension = |backend: &Backend| {
+            format!(
+                "backend {} with this model is registered (has a Steckbrief), so sidekick_run needs `dimension` \
+                 (search | inventory | write-tests | write-code | decisions) and optionally `scope`; the run goes through \
+                 the dispatch path (worktree, gated tools, diff check, logged job)",
+                backend.name
+            )
+        };
+        match self.registry_gate(&snap, primary, req.model.as_deref()).await {
+            Err(msg) => return tool_error_with(&snap, msg),
+            Ok(true) => {
+                let Some(dimension) = dimension else { return tool_error_with(&snap, needs_dimension(primary)) };
+                return self.sidekick_dispatch(Parameters(dispatch_params(primary, params.model.clone(), dimension)), ctx).await;
+            }
+            Ok(false) => {}
+        }
+        let fallback_dispatch = match fallback {
+            None => None,
+            Some(fb) => {
+                let fb_model = fallback_request(fb, &req).0.model;
+                match self.registry_gate(&snap, fb, fb_model.as_deref()).await {
+                    Err(msg) => return tool_error_with(&snap, format!("fallback: {msg}")),
+                    Ok(false) => None,
+                    Ok(true) => match dimension {
+                        Some(dimension) => Some(dispatch_params(fb, fb_model, dimension)),
+                        None => return tool_error_with(&snap, format!("fallback: {}", needs_dimension(fb))),
+                    },
+                }
+            }
+        };
+        if let (Some(secs), Some(dp)) = (state.cooldown(&primary.name), &fallback_dispatch) {
+            tracing::info!(primary = %primary.name, secs, "primary rate limited; the registered fallback runs as dispatch");
+            return self.sidekick_dispatch(Parameters(dp.clone()), ctx).await;
         }
         let direct = match state.cooldown(&primary.name) {
             None => None,
@@ -1317,6 +1340,11 @@ impl SidekickServer {
                             true,
                         ),
                     }
+                }
+                (first, Some(fb)) if fallback_eligible(&first) && fallback_dispatch.is_some() => {
+                    tracing::warn!(primary = %primary.name, fallback = %fb.name, "primary backend failed; the registered fallback runs as dispatch");
+                    drop(ticker);
+                    return self.sidekick_dispatch(Parameters(fallback_dispatch.clone().expect("checked above")), ctx).await;
                 }
                 (first, Some(fb)) if fallback_eligible(&first) => {
                     let why = match &first {
@@ -1761,17 +1789,23 @@ impl SidekickServer {
         Ok(self.state.data.get_or_init(|| opened).clone())
     }
 
-    async fn is_registered(&self, snap: &Snapshot, backend: &Backend, model: Option<&str>) -> bool {
-        let Ok(base) = crate::paths::data_dir() else { return false };
-        if !DataStore::checkout_exists(&base) {
-            return false;
-        }
-        let Ok(model) = backend.effective_model(model) else { return false };
+    async fn registry_gate(&self, snap: &Snapshot, backend: &Backend, model: Option<&str>) -> Result<bool, String> {
+        let model = backend.effective_model(model)?;
+        let store = self.store(snap).await?;
+        let rows = store.data.models().map_err(|e| format!("registry cannot be read: {e:#}"))?;
         let id = Identity::default().key(backend, model.as_deref()).model_id();
-        match self.store(snap).await {
-            Ok(store) => store.data.model(&id).is_ok(),
-            Err(_) => false,
+        if rows.iter().any(|r| r.model_id() == id) {
+            return Ok(true);
         }
+        if rows.iter().any(|r| dispatch::same_registry_scope(backend, &r.key)) {
+            return Err(format!(
+                "backend {} has registered models, but `{}` is not one of them (model_id {id}); it would run without gating. \
+                 Register it or choose a registered model (see sidekick_steckbrief)",
+                backend.name,
+                model.as_deref().unwrap_or("default")
+            ));
+        }
+        Ok(false)
     }
 
     fn model_id_for(
