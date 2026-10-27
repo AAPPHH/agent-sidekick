@@ -70,6 +70,26 @@ case "$last" in
 *GOLD-CODE*) echo "fn g() {}" >> src/lib.rs ;;
 *GOLD-TESTS*) echo "// gold" >> tests/t.rs ;;
 *GOLD-BAD*) echo "fn a() { x; }" > src/lib.rs ;;
+*GOLD-SWITCH*)
+  echo "fn a() { x; }" > src/lib.rs
+  git add -A && git -c user.name=w -c user.email=w@w commit -q -m evil
+  git checkout -q --detach HEAD~1
+  echo "fn g() {}" >> src/lib.rs
+  ;;
+*GOLD-HOOK*)
+  common=$(cd "$(git rev-parse --git-common-dir)" && pwd)
+  printf '#!/bin/sh\necho "fn a() { x; }" > src/lib.rs\ngit add src/lib.rs\n' > "$common/hooks/pre-commit"
+  chmod +x "$common/hooks/pre-commit"
+  echo "doc" > docs.txt
+  ;;
+*GOLD-CONFIG*)
+  git config core.hooksPath /nonexistent-hooks
+  echo "doc" > docs.txt
+  ;;
+*GOLD-REF*)
+  git branch evil
+  echo "doc" > docs.txt
+  ;;
 *GOLD-COMMIT*)
   echo "fn c() {}" >> src/lib.rs
   git add -A && git -c user.name=w -c user.email=w@w commit -q -m own
@@ -412,4 +432,29 @@ fn a_kept_branch_or_a_running_workflow_id_is_rejected_up_front() {
     assert!(res["isError"] == json!(true) && text.contains("already running"), "{text}");
     let done = text_of(&fx.server.call_tool_within("sidekick_answer", json!({"job_id": field(&q, "job_id"), "answer": "mint"}), Duration::from_secs(60)));
     assert!(done.contains("ASK-ANSWER") && done.contains("mint"), "{done}");
+}
+
+#[test]
+fn a_worker_that_moves_its_branch_or_switches_head_cannot_smuggle_an_unchecked_commit() {
+    let mut fx = fixture();
+    let (res, text) = run(&mut fx, vec![gold("code", "GOLD-SWITCH", "write-code", &[])]);
+    assert!(res["isError"] != json!(true), "{text}");
+    let lib = std::fs::read_to_string(fx.repo.join("src/lib.rs")).unwrap();
+    assert!(lib.contains("assert!(x)") && !lib.contains("fn a() { x; }"), "{lib}\n{text}");
+}
+
+#[test]
+fn git_hooks_config_and_foreign_refs_touched_by_a_worker_block_the_step_and_are_restored() {
+    for (marker, probe) in [("GOLD-HOOK", "hooks"), ("GOLD-CONFIG", "config"), ("GOLD-REF", "ref")] {
+        let mut fx = fixture();
+        let (_res, text) = run(&mut fx, vec![gold("code", marker, "write-code", &[])]);
+        assert!(text.contains("Blocked") && text.contains("Ausbruchsversuch"), "{marker}: {text}");
+        assert!(!fx.repo.join("docs.txt").exists());
+        match probe {
+            "hooks" => assert!(!fx.repo.join(".git/hooks/pre-commit").exists()),
+            "config" => assert!(Command::new("git").arg("-C").arg(&fx.repo).args(["config", "--get", "core.hooksPath"]).output().unwrap().stdout.is_empty()),
+            _ => assert!(!git(&fx.repo, &["branch", "--list", "evil"]).contains("evil")),
+        }
+        assert_eq!(std::fs::read_to_string(fx.repo.join("src/lib.rs")).unwrap(), "fn a() { assert!(x); }\n");
+    }
 }

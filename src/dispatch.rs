@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -378,6 +379,8 @@ pub struct DispatchResult {
     pub sperre_note: Option<String>,
     pub unsupported_limits: Vec<&'static str>,
     pub branch: Option<String>,
+    pub tree: Option<String>,
+    pub base: Option<String>,
     pub patch_path: Option<PathBuf>,
     pub applied: bool,
     pub diff_discarded: bool,
@@ -443,12 +446,133 @@ pub fn name_taken(repo: &Path, work_dir: &Path, id: &str) -> Option<String> {
     work_dir.join("worktrees").join(id).exists().then(|| format!("worktree for `{id}` already exists"))
 }
 
-pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").env("GIT_TERMINAL_PROMPT", "0").arg("-C").arg(dir).args(args).output().context("running git")?;
+const HARDEN: [&str; 4] = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+
+fn run_git(mut cmd: Command, args: &[&str]) -> Result<String> {
+    let out = cmd.env("GIT_TERMINAL_PROMPT", "0").args(HARDEN).args(args).output().context("running git")?;
     if !out.status.success() {
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir);
+    run_git(cmd, args)
+}
+
+fn file_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+fn set_file_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
+fn scan_files(path: &Path, out: &mut BTreeMap<PathBuf, (Vec<u8>, u32)>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+    if meta.is_dir() {
+        for e in std::fs::read_dir(path).into_iter().flatten().flatten() {
+            scan_files(&e.path(), out);
+        }
+    } else if let Ok(bytes) = std::fs::read(path) {
+        out.insert(path.to_path_buf(), (bytes, file_mode(&meta)));
+    }
+}
+
+struct Guard {
+    repo: PathBuf,
+    watched: Vec<PathBuf>,
+    files: BTreeMap<PathBuf, (Vec<u8>, u32)>,
+    refs: BTreeMap<String, String>,
+    head: (String, String),
+}
+
+impl Guard {
+    fn capture(repo: &Path, admin: &Path) -> Result<Self> {
+        let common = admin_common(admin);
+        let watched = vec![common.join("hooks"), common.join("config"), common.join("info/attributes"), admin.join("config.worktree"), admin.join("info/attributes"), admin.join("hooks")];
+        let mut guard = Self { repo: repo.to_path_buf(), watched, files: BTreeMap::new(), refs: BTreeMap::new(), head: Default::default() };
+        guard.files = guard.scan();
+        guard.refs = guard.read_refs()?;
+        guard.head = guard.read_head()?;
+        Ok(guard)
+    }
+
+    fn scan(&self) -> BTreeMap<PathBuf, (Vec<u8>, u32)> {
+        let mut out = BTreeMap::new();
+        self.watched.iter().for_each(|w| scan_files(w, &mut out));
+        out
+    }
+
+    fn read_refs(&self) -> Result<BTreeMap<String, String>> {
+        let out = git(&self.repo, &["for-each-ref", "--format=%(refname) %(objectname)"])?;
+        Ok(out.lines().filter_map(|l| l.split_once(' ')).filter(|(r, _)| !r.starts_with(&format!("refs/heads/{BRANCH_PREFIX}"))).map(|(r, o)| (r.to_string(), o.to_string())).collect())
+    }
+
+    fn read_head(&self) -> Result<(String, String)> {
+        let sym = git(&self.repo, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_default().trim().to_string();
+        Ok((sym, git(&self.repo, &["rev-parse", "HEAD"])?.trim().to_string()))
+    }
+
+    fn check_and_restore(&self) -> Option<String> {
+        let mut found = Vec::new();
+        let now = self.scan();
+        if now != self.files {
+            found.push("Git-Hooks/Config verändert");
+            for p in now.keys().filter(|p| !self.files.contains_key(*p)) {
+                let _ = std::fs::remove_file(p);
+            }
+            for (p, (bytes, mode)) in self.files.iter().filter(|(p, v)| now.get(*p) != Some(v)) {
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(p, bytes);
+                set_file_mode(p, *mode);
+            }
+        }
+        let refs = self.read_refs().unwrap_or_default();
+        let head = self.read_head().unwrap_or_default();
+        if refs != self.refs || head != self.head {
+            found.push("Refs außerhalb des Job-Branches verändert");
+            for (r, o) in self.refs.iter().filter(|(r, o)| refs.get(*r) != Some(*o)) {
+                let _ = git(&self.repo, &["update-ref", r, o]);
+            }
+            for r in refs.keys().filter(|r| !self.refs.contains_key(*r)) {
+                let _ = git(&self.repo, &["update-ref", "-d", r]);
+            }
+            if head != self.head {
+                let _ = if self.head.0.is_empty() { git(&self.repo, &["update-ref", "--no-deref", "HEAD", &self.head.1]) } else { git(&self.repo, &["symbolic-ref", "HEAD", &self.head.0]) };
+            }
+        }
+        (!found.is_empty()).then(|| format!("Ausbruchsversuch: {}", found.join(", ")))
+    }
+}
+
+fn admin_common(admin: &Path) -> PathBuf {
+    let rel = std::fs::read_to_string(admin.join("commondir")).unwrap_or_default();
+    let rel = rel.trim();
+    if rel.is_empty() {
+        admin.to_path_buf()
+    } else {
+        admin.join(rel).canonicalize().unwrap_or_else(|_| admin.join(rel))
+    }
 }
 
 struct Worktree {
@@ -456,6 +580,8 @@ struct Worktree {
     path: PathBuf,
     branch: String,
     base: String,
+    admin: PathBuf,
+    index: PathBuf,
 }
 
 impl Worktree {
@@ -469,32 +595,47 @@ impl Worktree {
         let branch = format!("{BRANCH_PREFIX}{job_id}");
         std::fs::create_dir_all(path.parent().unwrap())?;
         git(repo, &["worktree", "add", "-b", &branch, &path.to_string_lossy(), &base])?;
-        Ok(Self { repo: repo.to_path_buf(), path, branch, base })
+        let admin = PathBuf::from(git(&path, &["rev-parse", "--absolute-git-dir"])?.trim());
+        let index = work_dir.join("index").join(job_id);
+        std::fs::create_dir_all(index.parent().unwrap())?;
+        Ok(Self { repo: repo.to_path_buf(), path, branch, base, admin, index })
     }
 
-    fn diff(&self, unified: &str) -> Result<String> {
-        git(&self.path, &["add", "-A"])?;
-        git(&self.path, &["-c", "core.quotepath=false", "diff", "--cached", "--binary", "--no-color", "--no-renames", unified, &self.base])
+    fn private(&self, args: &[&str]) -> Result<String> {
+        let mut cmd = Command::new("git");
+        cmd.arg("--git-dir").arg(&self.admin).arg("--work-tree").arg(&self.path).current_dir(&self.path).env("GIT_INDEX_FILE", &self.index);
+        run_git(cmd, args)
     }
 
-    fn files(&self) -> Result<Vec<String>> {
-        git(&self.path, &["add", "-A"])?;
-        let out = git(&self.path, &["diff", "--cached", "--name-only", "-z", "--no-renames", &self.base])?;
+    fn snapshot(&self) -> Result<String> {
+        let _ = std::fs::remove_file(&self.index);
+        self.private(&["read-tree", &self.base])?;
+        self.private(&["add", "-A"])?;
+        Ok(self.private(&["write-tree"])?.trim().to_string())
+    }
+
+    fn diff(&self, tree: &str, unified: &str) -> Result<String> {
+        git(&self.repo, &["-c", "core.quotepath=false", "diff", "--binary", "--no-color", "--no-renames", "--no-ext-diff", "--no-textconv", unified, &self.base, tree])
+    }
+
+    fn files(&self, tree: &str) -> Result<Vec<String>> {
+        let out = git(&self.repo, &["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", &self.base, tree])?;
         Ok(out.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
     }
 
     fn remove(&self, drop_branch: bool) {
+        let _ = std::fs::remove_file(&self.index);
         let _ = git(&self.repo, &["worktree", "remove", "--force", &self.path.to_string_lossy()]);
         if drop_branch {
             let _ = git(&self.repo, &["branch", "-D", &self.branch]);
         }
     }
 
-    fn commit(&self, message: &str) -> Result<()> {
+    fn commit(&self, tree: &str, message: &str) -> Result<()> {
         let mut args: Vec<&str> = GIT_IDENT.to_vec();
-        args.extend(["commit", "-q", "-m", message]);
-        git(&self.path, &["reset", "-q", "--soft", &self.base])?;
-        git(&self.path, &args).map(|_| ())
+        args.extend(["commit-tree", tree, "-p", &self.base, "-m", message]);
+        let commit = git(&self.repo, &args)?.trim().to_string();
+        git(&self.repo, &["update-ref", &format!("refs/heads/{}", self.branch), &commit]).map(|_| ())
     }
 }
 
@@ -551,6 +692,13 @@ impl Dispatcher {
         };
         let proposal = req.dimension.is_write() && !write_right;
         let wt = Worktree::create(&req.repo, &self.work_dir, &req.job_id, extras.base.as_deref())?;
+        let guard = match Guard::capture(&req.repo, &wt.admin) {
+            Ok(g) => g,
+            Err(e) => {
+                wt.remove(true);
+                return Err(e);
+            }
+        };
         let run_req = RunRequest {
             prompt: {
                 let mut prompt = req.prompt.clone();
@@ -586,6 +734,7 @@ impl Dispatcher {
         let outcome = match outcome {
             Ok(o) => o,
             Err(e) => {
+                guard.check_and_restore();
                 wt.remove(true);
                 return Err(e);
             }
@@ -599,6 +748,8 @@ impl Dispatcher {
             sperre_note,
             unsupported_limits: unsupported_limits(backend),
             branch: None,
+            tree: None,
+            base: Some(wt.base.clone()),
             patch_path: None,
             applied: false,
             diff_discarded: false,
@@ -648,6 +799,19 @@ impl Dispatcher {
         event.job_id = Some(req.job_id.clone());
         event.duration_s = Some(result.duration_s);
         let finished = (|| -> Result<()> {
+            if let Some(reason) = guard.check_and_restore() {
+                result.status = Status::Blocked;
+                result.diff_discarded = true;
+                result.evidence_hash = Some(sha256_hex(reason.as_bytes()));
+                event.outcome = Outcome::Blocked;
+                event.block_reason = Some(reason.clone());
+                event.conclusion = block_lesson(&reason, &req.scope);
+                event.evidence_hash = result.evidence_hash.clone();
+                result.violations = vec![reason.clone()];
+                result.block_reason = Some(reason);
+                wt.remove(true);
+                return Ok(());
+            }
             let max_turns_hit = report.as_ref().is_some_and(|r| r.subtype == MAX_TURNS_SUBTYPE);
             if let Some(r) = report.as_ref().filter(|r| r.is_error && r.subtype != MAX_TURNS_SUBTYPE) {
                 result.status = Status::Failed;
@@ -658,7 +822,8 @@ impl Dispatcher {
                 return Ok(());
             }
             let aborted = outcome.timed_out || outcome.cancelled || max_turns_hit;
-            let mut files = wt.files()?;
+            let mut tree = wt.snapshot()?;
+            let mut files = wt.files(&tree)?;
             let mut proposed = false;
             if proposal && files.is_empty() {
                 let applied = extract_patch(&result.answer).and_then(|patch| {
@@ -666,15 +831,17 @@ impl Dispatcher {
                     std::fs::create_dir_all(proposal_path.parent().unwrap()).map_err(|e| e.to_string())?;
                     std::fs::write(&proposal_path, patch).map_err(|e| e.to_string())?;
                     let arg = proposal_path.to_string_lossy().into_owned();
-                    let done = git(&wt.path, &["apply", "--check", "--whitespace=nowarn", &arg])
-                        .and_then(|_| git(&wt.path, &["apply", "--whitespace=nowarn", &arg]))
+                    let done = wt
+                        .private(&["apply", "--check", "--whitespace=nowarn", &arg])
+                        .and_then(|_| wt.private(&["apply", "--whitespace=nowarn", &arg]))
                         .map_err(|e| format!("proposed patch does not apply: {e:#}"));
                     let _ = std::fs::remove_file(&proposal_path);
                     done
                 });
                 match applied {
                     Ok(_) => {
-                        files = wt.files()?;
+                        tree = wt.snapshot()?;
+                        files = wt.files(&tree)?;
                         proposed = true;
                     }
                     Err(_) if aborted => {}
@@ -696,7 +863,7 @@ impl Dispatcher {
                 wt.remove(true);
                 return Ok(());
             }
-            let patch = wt.diff("-U3")?;
+            let patch = wt.diff(&tree, "-U3")?;
             if !write_right && !proposed {
                 let reason = format!("diff without write right ({}): {}", req.dimension, files.join(", "));
                 result.status = Status::Blocked;
@@ -712,7 +879,7 @@ impl Dispatcher {
                 return Ok(());
             }
             let checker = DiffChecker { protected: &protected, dimension: req.dimension, limits: Limits::for_scope(&req.scope), scope: &req.scope };
-            let check = checker.check(&files, &wt.diff("-U0")?);
+            let check = checker.check(&files, &wt.diff(&tree, "-U0")?);
             let gold = gold_model;
             if !check.violations.is_empty() && (!gold || aborted) {
                 let reason = check.violations.join("; ");
@@ -753,7 +920,8 @@ impl Dispatcher {
                 }
             }
             if !result.applied {
-                wt.commit(&format!("sidekick job {}", req.job_id))?;
+                wt.commit(&tree, &format!("sidekick job {}", req.job_id))?;
+                result.tree = Some(tree);
                 wt.remove(false);
                 result.branch = Some(wt.branch.clone());
             }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use tokio::task::JoinSet;
 
@@ -195,18 +195,38 @@ fn prefixed_prompt(prompt: &str, deps: &[&StepResult]) -> String {
     format!("{out}\n---\n\n{prompt}")
 }
 
-fn merge(wt: &std::path::Path, branch: &str) -> Result<String> {
-    let summary = git(wt, &["show", "--stat", "--format=", branch])?;
-    let mut args: Vec<&str> = GIT_IDENT.to_vec();
-    args.extend(["cherry-pick", branch]);
-    if let Err(e) = git(wt, &args) {
-        let _ = git(wt, &["cherry-pick", "--abort"]);
-        return Err(anyhow!("merge into the workflow branch failed: {e:#}"));
+fn merge(repo: &std::path::Path, wt: &std::path::Path, work: &std::path::Path, wf_branch: &str, tip: &str, res: &crate::dispatch::DispatchResult) -> Result<(String, String)> {
+    let (Some(branch), Some(tree), Some(base)) = (&res.branch, &res.tree, &res.base) else { bail!("step result without branch, tree and base") };
+    let kept = git(repo, &["rev-parse", &format!("{branch}^{{tree}}")])?;
+    if kept.trim() != tree {
+        bail!("Branch nach Prüfung verändert: {branch} is no longer the checked tree");
     }
-    Ok(summary.trim().to_string())
+    if git(wt, &["rev-parse", "HEAD"])?.trim() != tip || git(repo, &["rev-parse", &format!("refs/heads/{wf_branch}")])?.trim() != tip {
+        bail!("Workflow-Branch nach Prüfung verändert");
+    }
+    let patch = work.join("patches").join(format!("{tip}.merge"));
+    std::fs::create_dir_all(patch.parent().unwrap_or(work))?;
+    let patch_arg = patch.to_string_lossy().into_owned();
+    let merged = (|| -> Result<(String, String)> {
+        git(repo, &["diff", "--binary", "--no-color", "--no-renames", "--no-ext-diff", "--no-textconv", &format!("--output={patch_arg}"), base, tree])?;
+        git(wt, &["apply", "--3way", "--index", "--whitespace=nowarn", &patch_arg])?;
+        let new_tree = git(wt, &["write-tree"])?.trim().to_string();
+        let message = format!("sidekick step {tree}");
+        let mut args: Vec<&str> = GIT_IDENT.to_vec();
+        args.extend(["commit-tree", &new_tree, "-p", tip, "-m", &message]);
+        let commit = git(wt, &args)?.trim().to_string();
+        git(wt, &["update-ref", &format!("refs/heads/{wf_branch}"), &commit, tip])?;
+        let summary = git(wt, &["show", "--stat", "--format=", &commit])?;
+        Ok((summary.trim().to_string(), commit))
+    })();
+    let _ = std::fs::remove_file(&patch);
+    if merged.is_err() {
+        let _ = git(wt, &["reset", "--hard", "-q", tip]);
+    }
+    merged
 }
 
-fn step_result(planned: &Planned, report: &JobReport, wt: &std::path::Path, tip: &mut String) -> StepResult {
+fn step_result(planned: &Planned, report: &JobReport, wt: &std::path::Path, work: &std::path::Path, wf_branch: &str, tip: &mut String) -> StepResult {
     let mut r = StepResult {
         id: planned.id.clone(),
         job_id: planned.prep.dreq.job_id.clone(),
@@ -232,13 +252,11 @@ fn step_result(planned: &Planned, report: &JobReport, wt: &std::path::Path, tip:
     r.reason = res.block_reason.clone().or_else(|| res.reason.clone());
     r.ok = matches!(res.status, Status::Completed | Status::NoChange);
     if let (true, Some(branch)) = (res.status == Status::Completed, &res.branch) {
-        match merge(wt, branch) {
-            Ok(summary) => {
+        match merge(&planned.prep.dreq.repo, wt, work, wf_branch, tip, res) {
+            Ok((summary, commit)) => {
                 r.merged = true;
                 r.summary = summary;
-                if let Ok(head) = git(wt, &["rev-parse", "HEAD"]) {
-                    *tip = head.trim().to_string();
-                }
+                *tip = commit;
                 let _ = git(&planned.prep.dreq.repo, &["branch", "-D", branch]);
             }
             Err(e) => {
@@ -322,7 +340,7 @@ async fn execute(server: SidekickServer, snap: Arc<Snapshot>, plan: Plan, sessio
         }
         let Some(joined) = set.join_next().await else { break };
         let (i, report) = joined.map_err(|e| anyhow!("a step task failed: {e}"))?;
-        results[i] = Some(step_result(&steps[i], &report, &wt, &mut tip));
+        results[i] = Some(step_result(&steps[i], &report, &wt, &work, &branch, &mut tip));
     }
     let results: Vec<StepResult> = results.into_iter().flatten().collect();
     let all_ok = results.iter().all(|r| r.ok);
