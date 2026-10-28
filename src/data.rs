@@ -723,6 +723,15 @@ pub fn pseudonym(secret: &[u8], raw: &str) -> String {
 pub fn shared_copy(event: &Event, secret: Option<&[u8]>) -> Event {
     let mut shared = strip_private(event);
     if let Some(secret) = secret {
+        if event.visibility == Visibility::Private {
+            let alias = |raw: &str| format!("p-{}", pseudonym(secret, raw));
+            shared.scope = match &event.scope {
+                Scope::Global => Scope::Global,
+                Scope::Repo(r) => Scope::Repo(alias(r)),
+                Scope::Module(r, p) => Scope::Module(alias(r), alias(p)),
+            };
+            shared.repo = event.repo.as_deref().map(alias);
+        }
         shared.user_id = pseudonym(secret, &event.user_id);
         shared.machine_id = pseudonym(secret, &event.machine_id);
     }
@@ -2029,5 +2038,89 @@ mod tests {
         assert!(!sb.render_short(None).contains("Bewährt"));
         let none = Steckbrief::build(&qwen_row(), &[], &Scope::Global, NOW);
         assert!(!none.render_short(None).contains("Bewährt"));
+    }
+
+    fn private_repo_event(id: &str, ts: i64) -> Event {
+        let mut e = ev(
+            "m",
+            Dimension::WriteCode,
+            "repo:Deep_Frame",
+            Outcome::Accepted,
+            ts,
+        );
+        e.event_id = id.into();
+        e.repo = Some("Deep_Frame".into());
+        e.visibility = Visibility::Private;
+        e.conclusion = Some("82/82 green".into());
+        e
+    }
+
+    #[test]
+    fn shared_copy_pseudonymizes_private_repo_and_module_names_only_with_secret() {
+        let e = private_repo_event("a", 1);
+        let alias = format!("p-{}", pseudonym(b"s", "Deep_Frame"));
+        let sh = shared_copy(&e, Some(b"s"));
+        assert_eq!(sh.scope.to_string(), format!("repo:{alias}"));
+        assert_eq!(sh.repo.as_deref(), Some(alias.as_str()));
+        assert_eq!(sh.conclusion, None);
+        let mut m = e.clone();
+        m.scope = Scope::parse("module:Deep_Frame/src/x").unwrap();
+        let sh = shared_copy(&m, Some(b"s"));
+        assert_eq!(
+            sh.scope.to_string(),
+            format!("module:{alias}/p-{}", pseudonym(b"s", "src/x"))
+        );
+        assert_eq!(shared_copy(&e, None).scope, e.scope);
+        let mut g = e.clone();
+        g.scope = Scope::Global;
+        g.repo = None;
+        assert_eq!(shared_copy(&g, Some(b"s")).scope, Scope::Global);
+        let mut open = e.clone();
+        open.visibility = Visibility::Shared;
+        let sh = shared_copy(&open, Some(b"s"));
+        assert_eq!(sh.scope, open.scope);
+        assert_eq!(sh.repo, open.repo);
+    }
+
+    #[test]
+    fn own_real_name_copy_wins_over_pseudonymized_shared_row() {
+        let shared = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let id = qwen_row().model_id();
+        let mut log = SessionLog::open(shared.path(), local.path(), "john", "s1")
+            .unwrap()
+            .with_secret(b"s".to_vec());
+        for i in 1..=3 {
+            let mut e = private_repo_event(&format!("e{i}"), i);
+            e.model_id = id.clone();
+            log.append(e).unwrap();
+        }
+        let dd = DataDir::new(shared.path());
+        let only_shared = dd.events(None).unwrap();
+        assert!(only_shared
+            .iter()
+            .all(|e| e.scope.to_string().starts_with("repo:p-")));
+        let union = dd.events(Some(local.path())).unwrap();
+        assert_eq!(union.len(), 3);
+        assert!(union
+            .iter()
+            .all(|e| e.scope.to_string() == "repo:Deep_Frame"
+                && e.repo.as_deref() == Some("Deep_Frame")));
+        let sb = Steckbrief::build(
+            &qwen_row(),
+            &union,
+            &Scope::parse("repo:Deep_Frame").unwrap(),
+            NOW,
+        );
+        let r = sb
+            .rows
+            .iter()
+            .find(|r| {
+                r.dimension == Dimension::WriteCode && r.scope.to_string() == "repo:Deep_Frame"
+            })
+            .unwrap();
+        assert_eq!(r.counters.accepted, 3);
+        assert!(sb.rows.iter().all(|r| !r.scope.to_string().contains("p-")));
+        assert!(!sb.render().contains("repo:p-"));
     }
 }
