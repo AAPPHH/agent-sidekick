@@ -29,6 +29,7 @@ dependencies = [
  "clap",
  "datafusion",
  "directories",
+ "futures",
  "keyring",
  "libc",
  "parquet",
