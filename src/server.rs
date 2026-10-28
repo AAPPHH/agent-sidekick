@@ -38,19 +38,17 @@ use crate::trust::{Dimension, Outcome, Scope, Visibility};
 /// Server instructions. Codex uses (at least) the first 512 characters for tool selection, so
 /// the tools and the long run time come first (tested in tests/mcp_handshake.rs).
 const INSTRUCTIONS: &str = "agent-sidekick hands a self-contained task to a separate, \
-headless agent (another Claude Code account, OpenCode, Codex, Gemini or a local model). \
-`sidekick_run` (plain), `sidekick_dispatch` (own git worktree, trust rules, result is a \
-branch and patch) and `sidekick_workflow` (mixed tasks as steps) return only when the agent \
-is done, which can take many minutes. `sidekick_steckbrief`: trust and lessons per model; \
-`sidekick_backends`: backends with cost, models, reachability; `sidekick_status`: running \
-jobs and setup problems. Without `backend`, \
-a run goes to the default backend; the result names backend, model, exit code, log path and \
-output tail. Registered models need `dimension` (use dispatch), then record a verdict with \
-`sidekick_record_experience` and `job_id`. `sidekick_query`: read-only SQL over models, \
-protected and experiences. `sidekick_sync`: pull and push the shared data. A worker may ask a \
-question: the call returns status `question`; reply with `sidekick_answer`. If a run fails \
-because no token, key or login is stored, ask the user to run `agent-sidekick setup` (or \
-`agent-sidekick setup --backend <name>`) in a terminal.";
+headless agent. `sidekick_run`, `sidekick_dispatch` (own git worktree, result is a branch and \
+patch) and `sidekick_workflow` (mixed tasks as steps) take many minutes and return when the \
+agent is done, or early with status `question`: reply with `sidekick_answer`. \
+`sidekick_steckbrief`: trust per model; `sidekick_backends`: backends, cost, reachability; \
+`sidekick_status`: running jobs. Backends are another Claude Code account, OpenCode, Codex, \
+Gemini or a local model. Without `backend`, a run goes to the default backend; the result \
+names backend, model, exit code, log path and output tail. Registered models need `dimension` \
+(use dispatch), then record a verdict with `sidekick_record_experience` and `job_id`. \
+`sidekick_query`: read-only SQL over models, protected and experiences. `sidekick_sync`: pull \
+and push the shared data. If a run fails because no token, key or login is stored, ask the \
+user to run `agent-sidekick setup` (or `agent-sidekick setup --backend <name>`) in a terminal.";
 
 /// Upper bound for all reachability checks of one `sidekick_backends` call.
 const BACKENDS_CHECK_BUDGET: Duration = Duration::from_secs(PROBE_TIMEOUT.as_secs() + 1);

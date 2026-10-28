@@ -40,6 +40,8 @@ fn handshake_as_sent_by_codex() {
         "sidekick_backends",
         "sidekick_status",
         "minutes",
+        "sidekick_answer",
+        "question",
     ] {
         assert!(
             head.contains(needle),
