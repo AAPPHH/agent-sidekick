@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use agent_sidekick::backends::{Backend, BackendKind, Cost, OpencodeProvider};
+use agent_sidekick::backends::{
+    resolve_with, Backend, BackendKind, CodexAuth, Cost, OpencodeProvider, ResolveDefaults,
+    WindowsSandbox,
+};
+use agent_sidekick::config::Config;
 use agent_sidekick::data::{
     pseudonym, read_events, write_events, DataDir, ModelRow, Profile, ProtectedRow,
 };
@@ -50,6 +54,25 @@ fn dgx() -> Backend {
     })
 }
 
+fn codex() -> Backend {
+    backend(BackendKind::Codex {
+        auth: CodexAuth::Chatgpt,
+        base_url: None,
+        api_key_env: None,
+        harness_path: None,
+        read_only: false,
+        windows_sandbox: WindowsSandbox::default(),
+        base_dir: PathBuf::from("/x"),
+    })
+}
+
+const CODEX_MODELS: [(&str, i64, i64); 4] = [
+    ("gpt-reserve", 60, 64_000),
+    ("gpt-6-luna", 40, 32_000),
+    ("gpt-5.6-terra", 60, 64_000),
+    ("gpt-5.6-luna", 40, 32_000),
+];
+
 fn openai_compatible(base_url: &str) -> Backend {
     let mut b = dgx();
     if let BackendKind::OpenCode { base_url: url, .. } = &mut b.kind {
@@ -88,6 +111,16 @@ fn row(
 }
 
 fn models() -> Vec<ModelRow> {
+    let mut rows = base_models();
+    rows.extend(
+        CODEX_MODELS
+            .iter()
+            .map(|(m, steps, budget)| row(&codex(), m, "quota", *steps, Some(272_000), *budget)),
+    );
+    rows
+}
+
+fn base_models() -> Vec<ModelRow> {
     vec![
         row(&dgx(), QWEN, "shared-dgx", 80, Some(262_144), 64_000),
         row(
@@ -374,7 +407,7 @@ fn every_configured_model_is_registered_with_the_id_dispatch_computes() {
     let mut default_claude = claude();
     default_claude.model = Some("opus".into());
     assert!(Identity::default().key(&default_claude, None).is_gold());
-    assert_eq!(rows.len(), 10);
+    assert_eq!(rows.len(), 14);
 }
 
 #[test]
@@ -417,4 +450,31 @@ fn sample_profiles_attach_to_rows_and_do_not_change_trust() {
         .unwrap()
         .values()
         .all(|p| *p == Profile::default()));
+}
+
+#[test]
+fn codex_rows_match_the_key_of_the_configured_backend() {
+    let cfg = Config::parse(
+        "[backends.codex]\nharness = \"codex\"\nauth = \"chatgpt\"\ndescription = \"c\"\ndefault = true\nmodels = [\"gpt-reserve\", \"gpt-6-luna\", \"gpt-5.6-terra\", \"gpt-5.6-luna\"]\n",
+        Path::new("config.toml"),
+    )
+    .unwrap();
+    let defaults = ResolveDefaults {
+        home: Some(PathBuf::from("/h")),
+        legacy_agent_config_dir: None,
+        config_dir: Some(PathBuf::from("/cfg")),
+    };
+    let real = resolve_with(&cfg, &defaults).unwrap();
+    let real = real.get("codex").unwrap();
+    let ids: std::collections::HashSet<String> = models().iter().map(ModelRow::model_id).collect();
+    for (m, _, _) in CODEX_MODELS {
+        let key = Identity::default().key(real, Some(m));
+        assert_eq!(
+            (key.provider.as_str(), key.harness.as_str()),
+            ("openai", "codex")
+        );
+        assert_eq!(key, Identity::default().key(&codex(), Some(m)));
+        assert!(ids.contains(&key.model_id()), "no registry row for {m}");
+    }
+    assert_eq!(technical_sperre(real), technical_sperre(&codex()));
 }
