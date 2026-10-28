@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-10-28
+
+### Changed
+
+- Global Steckbrief: "Bewährt" now also shows successes from single repos or modules, prefixed with their scope (`[repo:Deep_Frame] 82/82 green ...`). Events from the queried scope chain have no prefix and rank first, the rest newest first; limit stays 2. Only conclusions the reader can already see are used, so peers never see private successes. Lessons ("Aus Fehlern") and trust numbers are unchanged.
+
+### Security
+
+- Privacy gap closed: in the pushed copy of a private event, repo and module names (scope and `repo` column) are replaced by `p-` plus an HMAC pseudonym with the local secret (module path too); shared events are unchanged. The local full copy keeps the real names and wins over the shared row when the union is deduplicated by `event_id`, so own trust and Steckbrief are unaffected. Rows already pushed before 0.9.1 are append-only and keep their clear repo names.
+
 ## [0.9.0] - 2026-10-27
 
 ### Added
