@@ -61,10 +61,19 @@ fn register_into_an_empty_config() {
     // The read-only tools run without an approval prompt; sidekick_run keeps Codex's default.
     let v: toml::Value = toml::from_str(&text).unwrap();
     let tools = &v["mcp_servers"]["agent-sidekick"]["tools"];
-    for t in ["sidekick_backends", "sidekick_status"] {
+    for t in READ_ONLY_TOOLS {
         assert_eq!(tools[t]["approval_mode"].as_str(), Some("approve"), "{t}");
     }
-    assert!(tools.get("sidekick_run").is_none());
+    for t in [
+        "sidekick_run",
+        "sidekick_dispatch",
+        "sidekick_workflow",
+        "sidekick_record_experience",
+        "sidekick_sync",
+        "sidekick_answer",
+    ] {
+        assert!(tools.get(t).is_none(), "{t}");
+    }
     // Registering again changes nothing.
     assert_eq!(register_in(&text, &r).unwrap(), text);
 }
@@ -117,6 +126,9 @@ fn reregistering_updates_in_place_and_keeps_user_settings() {
         tools["sidekick_status"]["approval_mode"].as_str(),
         Some("approve")
     );
+    for t in ["sidekick_steckbrief", "sidekick_query"] {
+        assert_eq!(tools[t]["approval_mode"].as_str(), Some("approve"), "{t}");
+    }
     // A user's choice for a tool is kept.
     let custom = old.replace(
         "[mcp_servers.agent-sidekick.tools.sidekick_status]\napproval_mode = \"approve\"",

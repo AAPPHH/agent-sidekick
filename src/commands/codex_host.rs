@@ -34,9 +34,17 @@ use crate::APP_NAME;
 pub const SERVER_NAME: &str = APP_NAME;
 /// Tools that only read: registered with `approval_mode = "approve"`, so Codex calls them
 /// without asking (it asks before every MCP tool call by default and refuses them in
-/// `codex exec`). `sidekick_run` keeps Codex's default (ask first): it starts another agent
-/// that works outside Codex's sandbox.
-pub const READ_ONLY_TOOLS: [&str; 2] = ["sidekick_backends", "sidekick_status"];
+/// `codex exec`). `sidekick_query` is read-only SQL (DDL, DML and statements are refused) over
+/// in-memory tables. Everything else keeps Codex's default (ask first): `sidekick_run`,
+/// `sidekick_dispatch` and `sidekick_workflow` start another agent that works outside
+/// Codex's sandbox, `sidekick_record_experience` writes an event, `sidekick_sync` pushes and
+/// `sidekick_answer` replies to a worker.
+pub const READ_ONLY_TOOLS: [&str; 4] = [
+    "sidekick_backends",
+    "sidekick_status",
+    "sidekick_steckbrief",
+    "sidekick_query",
+];
 /// `tool_timeout_sec` of the registration: two attempts of the longest allowed run (a
 /// fallback gets its own full timeout) plus ten minutes for queueing and startup.
 pub const TOOL_TIMEOUT_SEC: u64 = 2 * MAX_TIMEOUT_S + 600;

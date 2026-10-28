@@ -39,15 +39,18 @@ use crate::trust::{Dimension, Outcome, Scope, Visibility};
 /// the tools and the long run time come first (tested in tests/mcp_handshake.rs).
 const INSTRUCTIONS: &str = "agent-sidekick hands a self-contained task to a separate, \
 headless agent (another Claude Code account, OpenCode, Codex, Gemini or a local model). \
-`sidekick_backends`: the configured backends with description, cost, models and reachability; \
-pick one by description and cost. `sidekick_run`: run a prompt in a working directory \
-(optional `backend`, `model`, `fallback`); it returns when the agent is done, which can take \
-many minutes. `sidekick_status`: running/queued jobs and setup problems. Without `backend`, a \
-run goes to the configured default backend. The result names the backend and model that ran, \
-the exit code, the log path and the tail of the output. Registered models need `dimension` \
-(dispatch path, then record a verdict with `sidekick_record_experience` and `job_id`). A worker may ask a question: the call then returns status `question`; reply with `sidekick_answer`. Mixed tasks: `sidekick_workflow` (steps with one dimension each). If a run fails because no token, key \
-or login is stored, ask the user to run `agent-sidekick setup` (or `agent-sidekick setup \
---backend <name>`) in a terminal.";
+`sidekick_run` (plain), `sidekick_dispatch` (own git worktree, trust rules, result is a \
+branch and patch) and `sidekick_workflow` (mixed tasks as steps) return only when the agent \
+is done, which can take many minutes. `sidekick_steckbrief`: trust and lessons per model; \
+`sidekick_backends`: backends with cost, models, reachability; `sidekick_status`: running \
+jobs and setup problems. Without `backend`, \
+a run goes to the default backend; the result names backend, model, exit code, log path and \
+output tail. Registered models need `dimension` (use dispatch), then record a verdict with \
+`sidekick_record_experience` and `job_id`. `sidekick_query`: read-only SQL over models, \
+protected and experiences. `sidekick_sync`: pull and push the shared data. A worker may ask a \
+question: the call returns status `question`; reply with `sidekick_answer`. If a run fails \
+because no token, key or login is stored, ask the user to run `agent-sidekick setup` (or \
+`agent-sidekick setup --backend <name>`) in a terminal.";
 
 /// Upper bound for all reachability checks of one `sidekick_backends` call.
 const BACKENDS_CHECK_BUDGET: Duration = Duration::from_secs(PROBE_TIMEOUT.as_secs() + 1);
