@@ -33,10 +33,15 @@ fn handshake_as_sent_by_codex() {
     let instructions = init["instructions"].as_str().expect("instructions");
     let head: String = instructions.chars().take(512).collect();
     for needle in [
-        "sidekick_backends",
         "sidekick_run",
+        "sidekick_dispatch",
+        "sidekick_workflow",
+        "sidekick_steckbrief",
+        "sidekick_backends",
         "sidekick_status",
         "minutes",
+        "sidekick_answer",
+        "question",
     ] {
         assert!(
             head.contains(needle),

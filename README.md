@@ -134,7 +134,7 @@ Ist die Codex-CLI installiert, fragt das Setup „Auch in Codex anmelden?“ (oh
 agent-sidekick setup --codex
 ```
 
-Das trägt agent-sidekick in deine Codex-Konfiguration ein (`~/.codex/config.toml`, vorher wird eine Sicherung angelegt). Starte danach eine neue Codex-Sitzung; `/mcp` zeigt `agent-sidekick`. Bitte Codex dann zum Beispiel: „Nutze sidekick_backends und lass den Claude-Agenten die Tests reparieren.“ Vor jedem `sidekick_run` fragt Codex nach deiner Zustimmung, denn der zweite Agent arbeitet außerhalb der Codex-Sandbox.
+Das trägt agent-sidekick in deine Codex-Konfiguration ein (`~/.codex/config.toml`, vorher wird eine Sicherung angelegt). Starte danach eine neue Codex-Sitzung; `/mcp` zeigt `agent-sidekick`. Bitte Codex dann zum Beispiel: „Nutze sidekick_backends und lass den Claude-Agenten die Tests reparieren.“ Lesende Werkzeuge (`sidekick_backends`, `sidekick_status`, `sidekick_steckbrief`, `sidekick_query`) laufen ohne Nachfrage; vor `sidekick_run`, `sidekick_dispatch`, `sidekick_workflow`, `sidekick_record_experience`, `sidekick_sync` und `sidekick_answer` fragt Codex nach deiner Zustimmung (der zweite Agent arbeitet außerhalb der Codex-Sandbox). Hast du agent-sidekick schon vor Version 0.9.2 in Codex angemeldet, führe `agent-sidekick setup --codex` noch einmal aus, damit die neuen Freigaben eingetragen werden. `sidekick_query` ist begrenzt (256 MB Speicher, 1000 Zeilen, 30 Sekunden).
 
 ## KI:connect-API-Schlüssel erzeugen
 
@@ -216,7 +216,7 @@ Lade VS Code neu oder starte es komplett neu. Hilft das nicht, führe `agent-sid
 
 ### Änderungen an der config.toml wirken nicht
 
-Seit Version 0.5.0 liest agent-sidekick die `config.toml` beim nächsten Aufruf eines Werkzeugs (`sidekick_run`, `sidekick_backends`, `sidekick_status`) neu ein; ein Neustart ist nicht nötig. Ist die geänderte Datei fehlerhaft, arbeitet agent-sidekick mit der letzten gültigen Fassung weiter und meldet den Fehler als `config_error` in `sidekick_backends`; `agent-sidekick doctor` zeigt Details. Ältere Versionen lesen die Datei nur beim Start: Wähle in Claude Code `/mcp`, dann agent-sidekick und **Reconnect**.
+Seit Version 0.5.0 liest agent-sidekick die `config.toml` beim nächsten Aufruf eines Werkzeugs (zum Beispiel `sidekick_run`, `sidekick_backends`, `sidekick_status`) neu ein; ein Neustart ist nicht nötig. Ist die geänderte Datei fehlerhaft, arbeitet agent-sidekick mit der letzten gültigen Fassung weiter und meldet den Fehler als `config_error` in `sidekick_backends`; `agent-sidekick doctor` zeigt Details. Ältere Versionen lesen die Datei nur beim Start: Wähle in Claude Code `/mcp`, dann agent-sidekick und **Reconnect**.
 
 ### Vertrauen und Steckbriefe
 

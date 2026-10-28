@@ -12,7 +12,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, TimestampMi
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SQLOptions;
-use datafusion::prelude::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use futures::StreamExt;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
@@ -828,6 +830,10 @@ impl SessionLog {
     }
 }
 
+const QUERY_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+const QUERY_MAX_ROWS: usize = 1000;
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone, Debug)]
 pub struct DataDir {
     pub root: PathBuf,
@@ -965,7 +971,10 @@ impl DataDir {
     }
 
     pub async fn query(&self, local_root: Option<&Path>, sql: &str) -> Result<String> {
-        let ctx = SessionContext::new();
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(QUERY_MEMORY_BYTES, 1.0)
+            .build_arc()?;
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
         let tables = [
             (
                 "models",
@@ -984,8 +993,29 @@ impl DataDir {
             .with_allow_ddl(false)
             .with_allow_dml(false)
             .with_allow_statements(false);
-        let batches = ctx.sql_with_options(sql, options).await?.collect().await?;
-        Ok(pretty_format_batches(&batches)?.to_string())
+        let frame = ctx.sql_with_options(sql, options).await?;
+        let (batches, truncated) = tokio::time::timeout(QUERY_TIMEOUT, async {
+            let mut stream = frame.execute_stream().await?;
+            let mut batches = Vec::new();
+            let mut rows = 0;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let take = batch.num_rows().min(QUERY_MAX_ROWS - rows);
+                rows += take;
+                batches.push(batch.slice(0, take));
+                if rows >= QUERY_MAX_ROWS {
+                    return Ok::<_, anyhow::Error>((batches, stream.next().await.is_some()));
+                }
+            }
+            Ok((batches, false))
+        })
+        .await
+        .map_err(|_| anyhow!("query timed out after {} s", QUERY_TIMEOUT.as_secs()))??;
+        let mut out = pretty_format_batches(&batches)?.to_string();
+        if truncated {
+            out.push_str(&format!("\ntruncated after {QUERY_MAX_ROWS} rows"));
+        }
+        Ok(out)
     }
 }
 
@@ -1645,6 +1675,23 @@ mod tests {
             .await
             .unwrap()
             .contains("assert"));
+        let t = std::time::Instant::now();
+        let out = dd
+            .query(None, "select * from generate_series(1, 10000000000)")
+            .await
+            .unwrap();
+        assert!(t.elapsed().as_secs() < 10);
+        assert!(
+            out.ends_with("truncated after 1000 rows"),
+            "{}",
+            &out[out.len() - 60..]
+        );
+        assert_eq!(out.matches("\n| ").count(), 1001);
+        assert!(!dd
+            .query(None, "select 1")
+            .await
+            .unwrap()
+            .contains("truncated"));
         assert!(dd.query(None, "create table x as select 1").await.is_err());
         assert!(dd
             .query(None, "copy (select 1) to '/tmp/x.csv'")

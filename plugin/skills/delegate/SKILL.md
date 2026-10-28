@@ -1,6 +1,6 @@
 ---
 name: delegate
-description: When and how to hand work to the agent-sidekick MCP tools (sidekick_backends, sidekick_run, sidekick_status). Use when a task could be delegated to a second, headless agent or a local model, e.g. boilerplate, tests, mechanical refactors, or a separate multi-file change.
+description: When and how to hand work to the agent-sidekick MCP tools (sidekick_backends, sidekick_run, sidekick_dispatch, sidekick_workflow, sidekick_steckbrief, sidekick_status). Use when a task could be delegated to a second, headless agent or a local model, e.g. boilerplate, tests, mechanical refactors, or a separate multi-file change.
 ---
 
 # Delegating with agent-sidekick
