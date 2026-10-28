@@ -399,3 +399,27 @@ fn validate_accepts_the_questions_column_and_files_without_it() {
     commit(&root, "x");
     assert!(violations(&root, &base, "alice").is_empty());
 }
+
+#[test]
+fn validate_accepts_pseudonymized_scope_and_repo_of_private_rows() {
+    use agent_sidekick::data::shared_copy;
+    let (_d, root, base) = repo();
+    let mut repo_row = event("a", Outcome::Accepted, Dimension::WriteCode);
+    repo_row.scope = Scope::parse("repo:Deep_Frame").unwrap();
+    repo_row.repo = Some("Deep_Frame".into());
+    repo_row.visibility = Visibility::Private;
+    let mut module_row = repo_row.clone();
+    module_row.event_id = "b".into();
+    module_row.scope = Scope::parse("module:Deep_Frame/src/x").unwrap();
+    let shared: Vec<Event> = [repo_row, module_row]
+        .iter()
+        .map(|e| shared_copy(e, Some(b"secret")))
+        .collect();
+    assert!(shared.iter().all(|e| !e.scope.to_string().contains("Deep")));
+    write_events(&root.join("experiences/alice/s1.parquet"), &shared).unwrap();
+    commit(&root, "x");
+    assert!(violations(&root, &base, "alice").is_empty());
+    let back = read_events(&root.join("experiences/alice/s1.parquet")).unwrap();
+    assert_eq!(back[0].scope, shared[0].scope);
+    assert_eq!(back[1].scope, shared[1].scope);
+}

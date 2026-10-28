@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-10-28
+
+### Changed
+
+- Global Steckbrief: "Bewährt" now also shows successes from single repos or modules, prefixed with their scope (`[repo:Deep_Frame] 82/82 green ...`). Events from the queried scope chain have no prefix and rank first, the rest newest first; limit stays 2. Only conclusions the reader can already see are used, so peers never see private successes. Lessons ("Aus Fehlern") and trust numbers are unchanged.
+
+### Security
+
+- Privacy gap narrowed: in the pushed copy of a private event, repo and module names (scope and `repo` column) are replaced by `p-` plus an HMAC pseudonym with the local secret (module path too); shared events are unchanged. The local full copy keeps the real names and wins over the shared row when the union is deduplicated by `event_id`, so own trust and Steckbrief are unaffected. `job_id` of private events is pseudonymized the same way (otherwise a join with the clear dispatch note of the same job would reveal the alias), and `review_s` is rounded to 5 minutes in the pushed copy (it would otherwise give the timestamp of that note). The aliases are resolved back to real names on read when the name is known from a clear row or a local copy and the local secret matches; another machine resolves them only if it uses the same `secret` file (copy `<data dir>/secret` between your machines), otherwise foreign private verdicts stay in a `repo:p-...` cell there and do not count for `repo:<name>` trust. Blocked rows and dispatch notes stay in clear (counters), so the name of a repo you dispatch to is still visible in the data repo; what is hidden is which private verdicts and conclusions belong to it. Rows already pushed before 0.9.1 are append-only and keep their clear repo names.
+
 ## [0.9.0] - 2026-10-27
 
 ### Added

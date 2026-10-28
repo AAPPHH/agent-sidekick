@@ -156,7 +156,7 @@ impl DataStore {
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "unknown".into());
         let own = name_ok.unwrap_or("local");
-        let data = DataDir::new(checkout.clone());
+        let data = DataDir::new(checkout.clone()).with_secret(secret.clone().into_bytes());
         let log = SessionLog::open(
             &data.root,
             &local_root,

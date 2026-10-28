@@ -720,9 +720,49 @@ pub fn pseudonym(secret: &[u8], raw: &str) -> String {
         .collect()
 }
 
+pub fn resolve_aliases(events: &mut [Event], secret: &[u8]) {
+    let mut known: HashMap<String, String> = HashMap::new();
+    let mut learn = |raw: &str| {
+        known.insert(format!("p-{}", pseudonym(secret, raw)), raw.to_string());
+    };
+    for e in events.iter() {
+        match &e.scope {
+            Scope::Global => {}
+            Scope::Repo(r) => learn(r),
+            Scope::Module(r, p) => {
+                learn(r);
+                learn(p);
+            }
+        }
+        if let Some(r) = &e.repo {
+            learn(r);
+        }
+    }
+    let back = |raw: &str| known.get(raw).cloned().unwrap_or_else(|| raw.to_string());
+    for e in events.iter_mut() {
+        e.scope = match &e.scope {
+            Scope::Global => Scope::Global,
+            Scope::Repo(r) => Scope::Repo(back(r)),
+            Scope::Module(r, p) => Scope::Module(back(r), back(p)),
+        };
+        e.repo = e.repo.as_deref().map(back);
+    }
+}
+
 pub fn shared_copy(event: &Event, secret: Option<&[u8]>) -> Event {
     let mut shared = strip_private(event);
     if let Some(secret) = secret {
+        if event.visibility == Visibility::Private {
+            let alias = |raw: &str| format!("p-{}", pseudonym(secret, raw));
+            shared.scope = match &event.scope {
+                Scope::Global => Scope::Global,
+                Scope::Repo(r) => Scope::Repo(alias(r)),
+                Scope::Module(r, p) => Scope::Module(alias(r), alias(p)),
+            };
+            shared.repo = event.repo.as_deref().map(alias);
+            shared.job_id = event.job_id.as_deref().map(alias);
+            shared.review_s = event.review_s.map(|r| (r / 300.0).round() * 300.0);
+        }
         shared.user_id = pseudonym(secret, &event.user_id);
         shared.machine_id = pseudonym(secret, &event.machine_id);
     }
@@ -791,11 +831,20 @@ impl SessionLog {
 #[derive(Clone, Debug)]
 pub struct DataDir {
     pub root: PathBuf,
+    secret: Option<Vec<u8>>,
 }
 
 impl DataDir {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            secret: None,
+        }
+    }
+
+    pub fn with_secret(mut self, secret: Vec<u8>) -> Self {
+        self.secret = Some(secret);
+        self
     }
 
     pub fn models_path(&self) -> PathBuf {
@@ -886,7 +935,11 @@ impl DataDir {
         for file in files {
             all.extend(read_events(&file)?);
         }
-        Ok(dedup_sorted(all))
+        let mut events = dedup_sorted(all);
+        if let Some(secret) = &self.secret {
+            resolve_aliases(&mut events, secret);
+        }
+        Ok(events)
     }
 
     pub fn event_ids(&self, local_root: Option<&Path>) -> Result<HashSet<String>> {
@@ -1059,20 +1112,30 @@ impl Steckbrief {
                 lessons.push(t);
             }
         }
-        let mut proven: Vec<String> = Vec::new();
-        for c in own
+        let mut accepted: Vec<(bool, i64, String)> = own
             .iter()
-            .filter(|e| e.outcome == Outcome::Accepted && chain.contains(&e.scope))
+            .filter(|e| e.outcome == Outcome::Accepted)
             .filter_map(|e| {
+                let local = chain.contains(&e.scope);
                 e.conclusion
                     .clone()
                     .filter(|c| !c.trim().is_empty())
-                    .map(|c| (e.ts_ms, c))
+                    .map(|c| {
+                        (
+                            local,
+                            e.ts_ms,
+                            if local {
+                                c
+                            } else {
+                                format!("[{}] {c}", e.scope)
+                            },
+                        )
+                    })
             })
-            .collect::<std::collections::BTreeMap<_, _>>()
-            .into_values()
-            .rev()
-        {
+            .collect();
+        accepted.sort_by_key(|(local, ts, _)| (!*local, std::cmp::Reverse(*ts)));
+        let mut proven: Vec<String> = Vec::new();
+        for (_, _, c) in accepted {
             if proven.len() < 2 && !proven.contains(&c) {
                 proven.push(c);
             }
@@ -2029,5 +2092,183 @@ mod tests {
         assert!(!sb.render_short(None).contains("Bewährt"));
         let none = Steckbrief::build(&qwen_row(), &[], &Scope::Global, NOW);
         assert!(!none.render_short(None).contains("Bewährt"));
+    }
+
+    fn private_repo_event(id: &str, ts: i64) -> Event {
+        let mut e = ev(
+            "m",
+            Dimension::WriteCode,
+            "repo:Deep_Frame",
+            Outcome::Accepted,
+            ts,
+        );
+        e.event_id = id.into();
+        e.repo = Some("Deep_Frame".into());
+        e.visibility = Visibility::Private;
+        e.conclusion = Some("82/82 green".into());
+        e
+    }
+
+    #[test]
+    fn shared_copy_pseudonymizes_private_repo_and_module_names_only_with_secret() {
+        let e = private_repo_event("a", 1);
+        let alias = format!("p-{}", pseudonym(b"s", "Deep_Frame"));
+        let sh = shared_copy(&e, Some(b"s"));
+        assert_eq!(sh.scope.to_string(), format!("repo:{alias}"));
+        assert_eq!(sh.repo.as_deref(), Some(alias.as_str()));
+        assert_eq!(sh.conclusion, None);
+        let mut m = e.clone();
+        m.scope = Scope::parse("module:Deep_Frame/src/x").unwrap();
+        let sh = shared_copy(&m, Some(b"s"));
+        assert_eq!(
+            sh.scope.to_string(),
+            format!("module:{alias}/p-{}", pseudonym(b"s", "src/x"))
+        );
+        assert_eq!(shared_copy(&e, None).scope, e.scope);
+        let mut g = e.clone();
+        g.scope = Scope::Global;
+        g.repo = None;
+        assert_eq!(shared_copy(&g, Some(b"s")).scope, Scope::Global);
+        let mut open = e.clone();
+        open.visibility = Visibility::Shared;
+        let sh = shared_copy(&open, Some(b"s"));
+        assert_eq!(sh.scope, open.scope);
+        assert_eq!(sh.repo, open.repo);
+    }
+
+    #[test]
+    fn private_shared_copy_cannot_be_joined_to_a_clear_job_row() {
+        let mut v = private_repo_event("v", 1);
+        v.job_id = Some("job-1".into());
+        v.review_s = Some(412.0);
+        let sh = shared_copy(&v, Some(b"s"));
+        assert_ne!(sh.job_id, v.job_id);
+        assert!(sh.job_id.unwrap().starts_with("p-"));
+        assert_eq!(sh.review_s, Some(300.0));
+        let mut open = v.clone();
+        open.visibility = Visibility::Shared;
+        assert_eq!(shared_copy(&open, Some(b"s")).job_id, v.job_id);
+    }
+
+    #[test]
+    fn aliases_resolve_with_same_secret_on_another_machine_only() {
+        let shared = tempfile::tempdir().unwrap();
+        let other_local = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(shared.path(), other_local.path(), "dgx", "s1")
+            .unwrap()
+            .with_secret(b"s".to_vec());
+        log.append(private_repo_event("p1", 1)).unwrap();
+        let mut note = private_repo_event("n1", 2);
+        note.visibility = Visibility::Shared;
+        note.outcome = Outcome::Note;
+        let mut log2 = SessionLog::open(shared.path(), other_local.path(), "dgx", "s2").unwrap();
+        log2.append(note).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let same = DataDir::new(shared.path()).with_secret(b"s".to_vec());
+        let ev = same.events(Some(empty.path())).unwrap();
+        assert!(ev.iter().all(|e| e.scope.to_string() == "repo:Deep_Frame"));
+        let diff = DataDir::new(shared.path()).with_secret(b"t".to_vec());
+        let ev = diff.events(Some(empty.path())).unwrap();
+        assert!(ev
+            .iter()
+            .any(|e| e.scope.to_string().starts_with("repo:p-")));
+    }
+
+    #[test]
+    fn own_real_name_copy_wins_over_pseudonymized_shared_row() {
+        let shared = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let id = qwen_row().model_id();
+        let mut log = SessionLog::open(shared.path(), local.path(), "john", "s1")
+            .unwrap()
+            .with_secret(b"s".to_vec());
+        for i in 1..=3 {
+            let mut e = private_repo_event(&format!("e{i}"), i);
+            e.model_id = id.clone();
+            log.append(e).unwrap();
+        }
+        let dd = DataDir::new(shared.path());
+        let only_shared = dd.events(None).unwrap();
+        assert!(only_shared
+            .iter()
+            .all(|e| e.scope.to_string().starts_with("repo:p-")));
+        let union = dd.events(Some(local.path())).unwrap();
+        assert_eq!(union.len(), 3);
+        assert!(union
+            .iter()
+            .all(|e| e.scope.to_string() == "repo:Deep_Frame"
+                && e.repo.as_deref() == Some("Deep_Frame")));
+        let sb = Steckbrief::build(
+            &qwen_row(),
+            &union,
+            &Scope::parse("repo:Deep_Frame").unwrap(),
+            NOW,
+        );
+        let r = sb
+            .rows
+            .iter()
+            .find(|r| {
+                r.dimension == Dimension::WriteCode && r.scope.to_string() == "repo:Deep_Frame"
+            })
+            .unwrap();
+        assert_eq!(r.counters.accepted, 3);
+        assert!(sb.rows.iter().all(|r| !r.scope.to_string().contains("p-")));
+        assert!(!sb.render().contains("repo:p-"));
+    }
+
+    #[test]
+    fn global_steckbrief_shows_repo_successes_with_scope_prefix_after_chain_ones() {
+        let id = qwen_row().model_id();
+        let mut a = ev(
+            &id,
+            Dimension::WriteCode,
+            "repo:Deep_Frame",
+            Outcome::Accepted,
+            5,
+        );
+        a.conclusion = Some("82/82 green".into());
+        let mut b = ev(
+            &id,
+            Dimension::WriteCode,
+            "repo:Other",
+            Outcome::Accepted,
+            4,
+        );
+        b.conclusion = Some("alt".into());
+        let mut g = ev(&id, Dimension::WriteCode, "global", Outcome::Accepted, 1);
+        g.conclusion = Some("global ok".into());
+        let sb = Steckbrief::build(&qwen_row(), &[a.clone(), b, g.clone()], &Scope::Global, NOW);
+        assert_eq!(
+            sb.proven,
+            vec!["global ok", "[repo:Deep_Frame] 82/82 green"]
+        );
+        let sb = Steckbrief::build(
+            &qwen_row(),
+            &[a, g],
+            &Scope::parse("repo:Deep_Frame").unwrap(),
+            NOW,
+        );
+        assert_eq!(sb.proven, vec!["82/82 green", "global ok"]);
+        assert!(sb
+            .render_short(None)
+            .contains("Bewährt: 82/82 green; global ok\n"));
+    }
+
+    #[test]
+    fn peer_private_success_yields_no_proven_entry_and_no_pseudonym() {
+        let id = qwen_row().model_id();
+        let mut e = private_repo_event("p1", 3);
+        e.model_id = id;
+        let peer = shared_copy(&e, Some(b"peer-secret"));
+        let alias = pseudonym(b"peer-secret", "Deep_Frame");
+        assert!(peer.scope.to_string().contains(&alias));
+        let sb = Steckbrief::build(&qwen_row(), &[peer], &Scope::Global, NOW);
+        assert!(sb.proven.is_empty());
+        for text in [sb.render(), sb.render_short(None)] {
+            assert!(
+                !text.contains(&alias) && !text.contains("p-") && !text.contains("Bewährt"),
+                "{text}"
+            );
+        }
     }
 }
