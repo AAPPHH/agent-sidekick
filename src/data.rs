@@ -720,6 +720,35 @@ pub fn pseudonym(secret: &[u8], raw: &str) -> String {
         .collect()
 }
 
+pub fn resolve_aliases(events: &mut [Event], secret: &[u8]) {
+    let mut known: HashMap<String, String> = HashMap::new();
+    let mut learn = |raw: &str| {
+        known.insert(format!("p-{}", pseudonym(secret, raw)), raw.to_string());
+    };
+    for e in events.iter() {
+        match &e.scope {
+            Scope::Global => {}
+            Scope::Repo(r) => learn(r),
+            Scope::Module(r, p) => {
+                learn(r);
+                learn(p);
+            }
+        }
+        if let Some(r) = &e.repo {
+            learn(r);
+        }
+    }
+    let back = |raw: &str| known.get(raw).cloned().unwrap_or_else(|| raw.to_string());
+    for e in events.iter_mut() {
+        e.scope = match &e.scope {
+            Scope::Global => Scope::Global,
+            Scope::Repo(r) => Scope::Repo(back(r)),
+            Scope::Module(r, p) => Scope::Module(back(r), back(p)),
+        };
+        e.repo = e.repo.as_deref().map(back);
+    }
+}
+
 pub fn shared_copy(event: &Event, secret: Option<&[u8]>) -> Event {
     let mut shared = strip_private(event);
     if let Some(secret) = secret {
@@ -731,6 +760,8 @@ pub fn shared_copy(event: &Event, secret: Option<&[u8]>) -> Event {
                 Scope::Module(r, p) => Scope::Module(alias(r), alias(p)),
             };
             shared.repo = event.repo.as_deref().map(alias);
+            shared.job_id = event.job_id.as_deref().map(alias);
+            shared.review_s = event.review_s.map(|r| (r / 300.0).round() * 300.0);
         }
         shared.user_id = pseudonym(secret, &event.user_id);
         shared.machine_id = pseudonym(secret, &event.machine_id);
@@ -800,11 +831,20 @@ impl SessionLog {
 #[derive(Clone, Debug)]
 pub struct DataDir {
     pub root: PathBuf,
+    secret: Option<Vec<u8>>,
 }
 
 impl DataDir {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            secret: None,
+        }
+    }
+
+    pub fn with_secret(mut self, secret: Vec<u8>) -> Self {
+        self.secret = Some(secret);
+        self
     }
 
     pub fn models_path(&self) -> PathBuf {
@@ -895,7 +935,11 @@ impl DataDir {
         for file in files {
             all.extend(read_events(&file)?);
         }
-        Ok(dedup_sorted(all))
+        let mut events = dedup_sorted(all);
+        if let Some(secret) = &self.secret {
+            resolve_aliases(&mut events, secret);
+        }
+        Ok(events)
     }
 
     pub fn event_ids(&self, local_root: Option<&Path>) -> Result<HashSet<String>> {
@@ -2090,6 +2134,44 @@ mod tests {
         let sh = shared_copy(&open, Some(b"s"));
         assert_eq!(sh.scope, open.scope);
         assert_eq!(sh.repo, open.repo);
+    }
+
+    #[test]
+    fn private_shared_copy_cannot_be_joined_to_a_clear_job_row() {
+        let mut v = private_repo_event("v", 1);
+        v.job_id = Some("job-1".into());
+        v.review_s = Some(412.0);
+        let sh = shared_copy(&v, Some(b"s"));
+        assert_ne!(sh.job_id, v.job_id);
+        assert!(sh.job_id.unwrap().starts_with("p-"));
+        assert_eq!(sh.review_s, Some(300.0));
+        let mut open = v.clone();
+        open.visibility = Visibility::Shared;
+        assert_eq!(shared_copy(&open, Some(b"s")).job_id, v.job_id);
+    }
+
+    #[test]
+    fn aliases_resolve_with_same_secret_on_another_machine_only() {
+        let shared = tempfile::tempdir().unwrap();
+        let other_local = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(shared.path(), other_local.path(), "dgx", "s1")
+            .unwrap()
+            .with_secret(b"s".to_vec());
+        log.append(private_repo_event("p1", 1)).unwrap();
+        let mut note = private_repo_event("n1", 2);
+        note.visibility = Visibility::Shared;
+        note.outcome = Outcome::Note;
+        let mut log2 = SessionLog::open(shared.path(), other_local.path(), "dgx", "s2").unwrap();
+        log2.append(note).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let same = DataDir::new(shared.path()).with_secret(b"s".to_vec());
+        let ev = same.events(Some(empty.path())).unwrap();
+        assert!(ev.iter().all(|e| e.scope.to_string() == "repo:Deep_Frame"));
+        let diff = DataDir::new(shared.path()).with_secret(b"t".to_vec());
+        let ev = diff.events(Some(empty.path())).unwrap();
+        assert!(ev
+            .iter()
+            .any(|e| e.scope.to_string().starts_with("repo:p-")));
     }
 
     #[test]
