@@ -589,7 +589,7 @@ On SIGTERM (sent by Claude Code when it stops the server) running process trees 
 
 ## Codex as MCP host
 
-agent-sidekick also works as an MCP server of the OpenAI Codex CLI: Codex then gets `sidekick_backends`, `sidekick_run` and `sidekick_status` (as the tool namespace `mcp__agent_sidekick`) and can hand work to any configured backend, e.g. a Claude account or KI:connect.
+agent-sidekick also works as an MCP server of the OpenAI Codex CLI: Codex then gets all tools of the server (`sidekick_run`, `sidekick_dispatch`, `sidekick_workflow`, `sidekick_steckbrief`, `sidekick_backends`, `sidekick_status`, `sidekick_record_experience`, `sidekick_query`, `sidekick_sync`, `sidekick_answer`; as the tool namespace `mcp__agent_sidekick`) and can hand work to any configured backend, e.g. a Claude account or KI:connect.
 
 ```sh
 agent-sidekick setup --codex     # register in $CODEX_HOME/config.toml (default ~/.codex/config.toml)
@@ -612,15 +612,22 @@ approval_mode = "approve"
 [mcp_servers.agent-sidekick.tools.sidekick_status]
 approval_mode = "approve"
 
+[mcp_servers.agent-sidekick.tools.sidekick_steckbrief]
+approval_mode = "approve"
+
+[mcp_servers.agent-sidekick.tools.sidekick_query]
+approval_mode = "approve"
+
 [mcp_servers.agent-sidekick.env]
 AGENT_SIDEKICK_CLAUDE = '/abs/path/to/claude'
 ```
 
 - **`tool_timeout_sec`:** Codex cancels an MCP tool call after 60 s by default, and progress notifications do not extend that (unlike Claude Code; verified with codex 0.163.0). 15000 s covers the longest possible `sidekick_run` (two attempts of `timeout_s` = 7200 with a fallback, plus queueing). An entry without it (e.g. from `codex mcp add`, which cannot set timeouts) makes `doctor` fail.
 - **Environment:** Codex starts MCP servers with an allowlisted environment (on Windows: `APPDATA`, `LOCALAPPDATA`, `PATH`, `PATHEXT`, `TEMP`, `TMP`, `USERPROFILE`, `USERNAME`, the system variables; not `CODEX_*`, not your other variables). So `setup --codex` writes `AGENT_SIDEKICK_CLAUDE` (the claude it found, or `--claude PATH`) and a set `AGENT_SIDEKICK_CONFIG_DIR`/`AGENT_SIDEKICK_CLAUDE_CONFIG_DIR` into `env` (paths, never secrets), and puts the names of every `api_key_env` and `pass_env` of `config.toml`, the proxy and CA variables, `LANG`, `CLAUDE_CODE_GIT_BASH_PATH` (a claude backend on Windows may need it) and on Unix `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR` and `XDG_CONFIG_HOME` into `env_vars`: Codex then forwards their values from its own environment, so no key is written into its config. After adding an `api_key_env` run `setup --codex` again; `doctor` names missing variables.
-- **Approval:** Codex asks before every MCP tool call by default (and refuses it in `codex exec`, "approval policy is never"). The read-only tools `sidekick_backends` and `sidekick_status` are registered with `approval_mode = "approve"`. `sidekick_run` keeps Codex's prompt, because the delegated agent works outside Codex's sandbox with its own permissions. To run it without asking (e.g. in `codex exec`), add `[mcp_servers.agent-sidekick.tools.sidekick_run]` with `approval_mode = "approve"` yourself.
+- **Approval:** Codex asks before every MCP tool call by default (and refuses it in `codex exec`, "approval policy is never"). Registered with `approval_mode = "approve"` are the tools that only read: `sidekick_backends`, `sidekick_status`, `sidekick_steckbrief` and `sidekick_query` (read-only SQL: DDL, DML and statements are refused, over in-memory tables). All others keep Codex's prompt: `sidekick_run`, `sidekick_dispatch` and `sidekick_workflow` start an agent that works outside Codex's sandbox with its own permissions, `sidekick_record_experience` writes an event, `sidekick_sync` pushes to the shared data repository and `sidekick_answer` replies to a worker. To run one of them without asking (e.g. in `codex exec`), add `[mcp_servers.agent-sidekick.tools.<name>]` with `approval_mode = "approve"` yourself. Re-running `setup --codex` adds missing approvals for the four read-only tools but never changes an `approval_mode` you set.
 - **Editing:** the file is edited directly (with `toml_edit`), not with `codex mcp add`, which can set neither timeout and rewrites other tables. The previous file is copied to `config.toml.bak-agent-sidekick-<timestamp>` first; everything outside the `agent-sidekick` table stays byte for byte (checked before writing). Re-running `setup --codex` updates `command`, `args`, the timeouts, `env_vars` and the `env` values in place and keeps everything else of the entry (`enabled`, other `env` values, tool settings). `mcp_servers` as an inline table is not edited (error, nothing written). The new file is written next to the old one and renamed over it; on Unix it keeps the old file's mode (a new file gets 0600, since the config can hold other MCP servers' secrets), and a symlinked `config.toml` is written through to its target (the link stays).
-- **Instructions:** Codex uses (at least) the first 512 characters of the server instructions for tool selection; agent-sidekick names its three tools and the possibly long run time there.
+- **Instructions:** Codex uses (at least) the first 512 characters of the server instructions for tool selection; agent-sidekick names its main tools (run, dispatch, workflow, steckbrief, backends, status) and the possibly long run time there.
+- **Workers started from Codex:** the `ask_orchestrator` wiring for `codex` backend workers (`-c mcp_servers.sidekick_ask.*`) is covered by unit tests only; it is not verified with a real codex worker run. The tool-set and approvals above are verified only on the config level; the live check with codex 0.163.0 was made with the original three tools.
 - **Cancellation:** whether Codex sends `notifications/cancelled` when a call times out or the user interrupts is not verified; when Codex ends, the server's stdin closes and every running process tree is killed.
 - `uninstall` removes the entry (after a backup); `doctor` checks it when Codex is installed (entry, `enabled`, `command` = this binary, `args`, timeout, `AGENT_SIDEKICK_CLAUDE` exists, variables of `config.toml` forwarded).
 

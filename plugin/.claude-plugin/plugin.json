@@ -1,7 +1,7 @@
 {
   "name": "agent-sidekick",
-  "version": "0.9.1",
-  "description": "Registers the agent-sidekick MCP server (sidekick_run, sidekick_backends, sidekick_status) for an already installed agent-sidekick binary, plus a skill on when to delegate",
+  "version": "0.9.2",
+  "description": "Registers the agent-sidekick MCP server (sidekick_run, sidekick_dispatch, sidekick_workflow, sidekick_steckbrief, sidekick_backends, sidekick_status, and more) for an already installed agent-sidekick binary, plus a skill on when to delegate",
   "author": {
     "name": "AAPPHH",
     "url": "https://github.com/AAPPHH"
