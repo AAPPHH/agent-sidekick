@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Codex as MCP host: `setup --codex` now also registers `sidekick_steckbrief` and `sidekick_query` (read-only SQL, DDL/DML refused) with `approval_mode = "approve"`, next to `sidekick_backends` and `sidekick_status`. Tools that start agents, write events, push or answer a worker keep Codex's prompt. An `approval_mode` set by the user is never changed.
-- Server instructions: the first 512 characters (the part Codex uses for tool selection) now name run, dispatch, workflow, steckbrief, backends and status and the long run time; the rest covers record_experience, query, sync and answer.
+- Codex as MCP host: `setup --codex` now also registers `sidekick_steckbrief` and `sidekick_query` (read-only SQL, DDL/DML refused) with `approval_mode = "approve"`, next to `sidekick_backends` and `sidekick_status`. Tools that start agents, write events, push or answer a worker keep Codex's prompt. An `approval_mode` set by the user is never changed. Existing Codex users run `agent-sidekick setup --codex` again to get the new approvals.
+- `sidekick_query` is bounded: 256 MB memory pool, result cut after 1000 rows ("truncated after 1000 rows"), 30 s timeout.
+- Server instructions: the first 512 characters (the part Codex uses for tool selection) now name run, dispatch, workflow, steckbrief, backends and status, the long run time and the early `question` status answered with `sidekick_answer`; the rest covers record_experience, query, sync and answer.
 - Docs: "Codex as MCP host" lists all tools and the approvals; README and the plugin tool lists brought up to date.
 
 ## [0.9.1] - 2026-10-28

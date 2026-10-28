@@ -134,7 +134,7 @@ Ist die Codex-CLI installiert, fragt das Setup „Auch in Codex anmelden?“ (oh
 agent-sidekick setup --codex
 ```
 
-Das trägt agent-sidekick in deine Codex-Konfiguration ein (`~/.codex/config.toml`, vorher wird eine Sicherung angelegt). Starte danach eine neue Codex-Sitzung; `/mcp` zeigt `agent-sidekick`. Bitte Codex dann zum Beispiel: „Nutze sidekick_backends und lass den Claude-Agenten die Tests reparieren.“ Lesende Werkzeuge (`sidekick_backends`, `sidekick_status`, `sidekick_steckbrief`, `sidekick_query`) laufen ohne Nachfrage; vor jedem `sidekick_run`, `sidekick_dispatch` und `sidekick_workflow` fragt Codex nach deiner Zustimmung, denn der zweite Agent arbeitet außerhalb der Codex-Sandbox.
+Das trägt agent-sidekick in deine Codex-Konfiguration ein (`~/.codex/config.toml`, vorher wird eine Sicherung angelegt). Starte danach eine neue Codex-Sitzung; `/mcp` zeigt `agent-sidekick`. Bitte Codex dann zum Beispiel: „Nutze sidekick_backends und lass den Claude-Agenten die Tests reparieren.“ Lesende Werkzeuge (`sidekick_backends`, `sidekick_status`, `sidekick_steckbrief`, `sidekick_query`) laufen ohne Nachfrage; vor `sidekick_run`, `sidekick_dispatch`, `sidekick_workflow`, `sidekick_record_experience`, `sidekick_sync` und `sidekick_answer` fragt Codex nach deiner Zustimmung (der zweite Agent arbeitet außerhalb der Codex-Sandbox). Hast du agent-sidekick schon vor Version 0.9.2 in Codex angemeldet, führe `agent-sidekick setup --codex` noch einmal aus, damit die neuen Freigaben eingetragen werden. `sidekick_query` ist begrenzt (256 MB Speicher, 1000 Zeilen, 30 Sekunden).
 
 ## KI:connect-API-Schlüssel erzeugen
 
