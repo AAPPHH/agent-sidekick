@@ -1,21 +1,34 @@
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::ask::{self, AskWire, ASK_PROMPT_LINE};
 use crate::backends::{self, Backend, BackendKind, OpencodeProvider, PermissionMode};
 use crate::data::{block_lesson, DataDir, ModelRow, ProtectedKind, ProtectedRow, SessionLog};
 use crate::harness::claude::{model_matches, parse_report};
 use crate::harness::HarnessKind;
-use crate::runner::{self, Launch, RunRequest};
+use crate::runner::{self, Launch, Pause, RunRequest};
 use crate::trust::{Dimension, Event, ModelKey, Outcome, Scope, Sperre, Standing};
 
-pub const GLOBAL_LIMITS: Limits = Limits { max_files: 8, max_lines: 300 };
-pub const REPO_LIMITS: Limits = Limits { max_files: 15, max_lines: 600 };
-pub const MODULE_LIMITS: Limits = Limits { max_files: 25, max_lines: 1000 };
+pub const GLOBAL_LIMITS: Limits = Limits {
+    max_files: 8,
+    max_lines: 300,
+};
+pub const REPO_LIMITS: Limits = Limits {
+    max_files: 15,
+    max_lines: 600,
+};
+pub const MODULE_LIMITS: Limits = Limits {
+    max_files: 25,
+    max_lines: 1000,
+};
 pub const TEST_GLOBS: [&str; 2] = ["tests/**", "spec/**"];
 pub const WRITE_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"];
 pub const READ_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
@@ -24,7 +37,12 @@ pub const PATCH_BEGIN: &str = "<<<SIDEKICK-PATCH";
 pub const PATCH_END: &str = "SIDEKICK-PATCH>>>";
 pub const PROPOSAL_INSTRUCTION: &str = "You have no write tools in this job. Do not try to modify files. Return the complete change as one unified diff (git format, paths relative to the repository root, a/ and b/ prefixes) in your final answer, between a line containing only <<<SIDEKICK-PATCH and a line containing only SIDEKICK-PATCH>>>. Nothing else may be inside the markers.";
 pub const BRANCH_PREFIX: &str = "sidekick/";
-pub(crate) const GIT_IDENT: [&str; 4] = ["-c", "user.name=agent-sidekick", "-c", "user.email=agent-sidekick@localhost"];
+pub(crate) const GIT_IDENT: [&str; 4] = [
+    "-c",
+    "user.name=agent-sidekick",
+    "-c",
+    "user.email=agent-sidekick@localhost",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -56,7 +74,11 @@ pub const CLAUDE_ALIASES: [(&str, &str); 4] = [
 ];
 
 pub fn resolve_claude_alias(model: &str) -> String {
-    CLAUDE_ALIASES.iter().find(|(alias, _)| *alias == model).map_or(model, |(_, id)| id).to_string()
+    CLAUDE_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == model)
+        .map_or(model, |(_, id)| id)
+        .to_string()
 }
 
 pub fn normalize_claude_model(model: &str) -> String {
@@ -69,8 +91,14 @@ pub fn normalize_claude_model(model: &str) -> String {
     resolve_claude_alias(base)
 }
 
-fn claude_model_with(backend: &Backend, model: Option<&str>, f: fn(&str) -> String) -> Option<String> {
-    matches!(backend.kind, BackendKind::ClaudeOauth { .. }).then(|| model.or(backend.model.as_deref()).map(f)).flatten()
+fn claude_model_with(
+    backend: &Backend,
+    model: Option<&str>,
+    f: fn(&str) -> String,
+) -> Option<String> {
+    matches!(backend.kind, BackendKind::ClaudeOauth { .. })
+        .then(|| model.or(backend.model.as_deref()).map(f))
+        .flatten()
 }
 
 pub fn expected_claude_model(backend: &Backend, model: Option<&str>) -> Option<String> {
@@ -113,9 +141,16 @@ fn default_provider(backend: &Backend) -> String {
     match &backend.kind {
         BackendKind::ClaudeOauth { .. } => "anthropic".into(),
         BackendKind::ClaudeEndpoint { base_url, .. } => url_host(base_url),
-        BackendKind::Codex { base_url: Some(url), .. } => url_host(url),
+        BackendKind::Codex {
+            base_url: Some(url),
+            ..
+        } => url_host(url),
         BackendKind::Codex { .. } => "openai".into(),
-        BackendKind::OpenCode { provider: OpencodeProvider::OpenaiCompatible, base_url: Some(url), .. } => url_host(url),
+        BackendKind::OpenCode {
+            provider: OpencodeProvider::OpenaiCompatible,
+            base_url: Some(url),
+            ..
+        } => url_host(url),
         BackendKind::OpenCode { provider, .. } => provider.as_str().into(),
         BackendKind::Command { command, .. } => Path::new(&command[0])
             .file_name()
@@ -153,8 +188,14 @@ pub fn with_registry_limits(backend: &Backend, row: &ModelRow) -> Backend {
 pub fn withhold_writes(backend: &Backend) -> Backend {
     let mut b = backend.clone();
     match &mut b.kind {
-        BackendKind::ClaudeOauth { permissions, .. } | BackendKind::ClaudeEndpoint { permissions, .. } => {
-            if matches!(permissions.mode, PermissionMode::AcceptEdits | PermissionMode::Auto | PermissionMode::BypassPermissions) {
+        BackendKind::ClaudeOauth { permissions, .. }
+        | BackendKind::ClaudeEndpoint { permissions, .. } => {
+            if matches!(
+                permissions.mode,
+                PermissionMode::AcceptEdits
+                    | PermissionMode::Auto
+                    | PermissionMode::BypassPermissions
+            ) {
                 permissions.mode = PermissionMode::Default;
             }
             permissions.allowed_tools = Some(READ_TOOLS.map(String::from).to_vec());
@@ -164,7 +205,9 @@ pub fn withhold_writes(backend: &Backend) -> Backend {
                 }
             }
         }
-        BackendKind::OpenCode { read_only, .. } | BackendKind::Codex { read_only, .. } => *read_only = true,
+        BackendKind::OpenCode { read_only, .. } | BackendKind::Codex { read_only, .. } => {
+            *read_only = true
+        }
         BackendKind::Command { .. } => {}
     }
     b
@@ -172,21 +215,34 @@ pub fn withhold_writes(backend: &Backend) -> Backend {
 
 pub fn extract_patch(text: &str) -> Result<String, String> {
     let lines: Vec<&str> = text.lines().collect();
-    let end_after = |i: usize| lines[i + 1..].iter().position(|l| l.trim() == PATCH_END).map(|j| i + 1 + j);
+    let end_after = |i: usize| {
+        lines[i + 1..]
+            .iter()
+            .position(|l| l.trim() == PATCH_END)
+            .map(|j| i + 1 + j)
+    };
     let (begin, end) = (0..lines.len())
         .rev()
         .filter(|&i| lines[i].trim() == PATCH_BEGIN)
         .find_map(|i| end_after(i).map(|j| (i, j)))
         .ok_or("no complete patch between the SIDEKICK-PATCH markers")?;
     let mut body = &lines[begin + 1..end];
-    while body.first().is_some_and(|l| l.trim_start().starts_with("```")) {
+    while body
+        .first()
+        .is_some_and(|l| l.trim_start().starts_with("```"))
+    {
         body = &body[1..];
     }
-    while body.last().is_some_and(|l| l.trim_start().starts_with("```")) {
+    while body
+        .last()
+        .is_some_and(|l| l.trim_start().starts_with("```"))
+    {
         body = &body[..body.len() - 1];
     }
     let patch = body.join("\n");
-    if !patch.lines().any(|l| l.starts_with("--- ")) || !patch.lines().any(|l| l.starts_with("+++ ")) {
+    if !patch.lines().any(|l| l.starts_with("--- "))
+        || !patch.lines().any(|l| l.starts_with("+++ "))
+    {
         return Err("the text between the markers is not a unified diff".into());
     }
     Ok(format!("{patch}\n"))
@@ -214,7 +270,9 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
                 }
                 (0..=s.len()).any(|i| go(&p[2..], &s[i..]))
             }
-            Some(b'*') => (0..=s.len()).take_while(|&i| i == 0 || s[i - 1] != b'/').any(|i| go(&p[1..], &s[i..])),
+            Some(b'*') => (0..=s.len())
+                .take_while(|&i| i == 0 || s[i - 1] != b'/')
+                .any(|i| go(&p[1..], &s[i..])),
             Some(b'?') => !s.is_empty() && s[0] != b'/' && go(&p[1..], &s[1..]),
             Some(c) => s.first() == Some(c) && go(&p[1..], &s[1..]),
         }
@@ -223,7 +281,10 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
-    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -242,29 +303,42 @@ pub struct DiffChecker<'a> {
 
 impl DiffChecker<'_> {
     fn globs(&self) -> impl Iterator<Item = &str> {
-        self.protected.iter().filter(|p| p.kind == ProtectedKind::PathGlob).map(|p| p.value.as_str())
+        self.protected
+            .iter()
+            .filter(|p| p.kind == ProtectedKind::PathGlob)
+            .map(|p| p.value.as_str())
     }
 
     pub fn check(&self, files: &[String], unified0: &str) -> DiffCheck {
-        let mut out = DiffCheck { files: files.to_vec(), ..Default::default() };
+        let mut out = DiffCheck {
+            files: files.to_vec(),
+            ..Default::default()
+        };
         let module = match self.scope {
             Scope::Module(_, path) => Some(path.trim_matches('/')),
             _ => None,
         };
         for f in files {
             if let Some(m) = module.filter(|m| f != m && !f.starts_with(&format!("{m}/"))) {
-                out.violations.push(format!("path {f} outside module path {m}"));
+                out.violations
+                    .push(format!("path {f} outside module path {m}"));
             }
             if self.dimension == Dimension::WriteTests {
                 if !TEST_GLOBS.iter().any(|g| glob_match_path(g, f)) {
-                    out.violations.push(format!("write-tests touches non-test path {f}"));
+                    out.violations
+                        .push(format!("write-tests touches non-test path {f}"));
                 }
             } else if let Some(g) = self.globs().find(|g| glob_match_path(g, f)) {
-                out.violations.push(format!("protected path {f} (matches {g})"));
+                out.violations
+                    .push(format!("protected path {f} (matches {g})"));
             }
         }
-        let terms: Vec<&str> =
-            self.protected.iter().filter(|p| p.kind == ProtectedKind::RemovedTerm).map(|p| p.value.as_str()).collect();
+        let terms: Vec<&str> = self
+            .protected
+            .iter()
+            .filter(|p| p.kind == ProtectedKind::RemovedTerm)
+            .map(|p| p.value.as_str())
+            .collect();
         let mut file = String::new();
         let mut header = false;
         let mut counts: Vec<(String, usize, usize)> = Vec::new();
@@ -277,7 +351,10 @@ impl DiffChecker<'_> {
             if header {
                 if line.starts_with("@@") {
                     header = false;
-                } else if let Some(n) = line.strip_prefix("--- a/").or_else(|| line.strip_prefix("+++ b/")) {
+                } else if let Some(n) = line
+                    .strip_prefix("--- a/")
+                    .or_else(|| line.strip_prefix("+++ b/"))
+                {
                     file = n.to_string();
                 }
                 continue;
@@ -312,14 +389,22 @@ impl DiffChecker<'_> {
             if removed > added {
                 let (f, i) = key.split_once('\0').unwrap();
                 let term = terms[i.parse::<usize>().unwrap()];
-                out.violations.push(format!("removed protected term `{term}` in {f}"));
+                out.violations
+                    .push(format!("removed protected term `{term}` in {f}"));
             }
         }
         if files.len() > self.limits.max_files {
-            out.violations.push(format!("{} files exceed limit {}", files.len(), self.limits.max_files));
+            out.violations.push(format!(
+                "{} files exceed limit {}",
+                files.len(),
+                self.limits.max_files
+            ));
         }
         if out.lines > self.limits.max_lines {
-            out.violations.push(format!("{} changed lines exceed limit {}", out.lines, self.limits.max_lines));
+            out.violations.push(format!(
+                "{} changed lines exceed limit {}",
+                out.lines, self.limits.max_lines
+            ));
         }
         out
     }
@@ -375,6 +460,8 @@ pub struct DispatchResult {
     pub sperre_note: Option<String>,
     pub unsupported_limits: Vec<&'static str>,
     pub branch: Option<String>,
+    pub tree: Option<String>,
+    pub base: Option<String>,
     pub patch_path: Option<PathBuf>,
     pub applied: bool,
     pub diff_discarded: bool,
@@ -383,12 +470,24 @@ pub struct DispatchResult {
     pub block_reason: Option<String>,
     pub reason: Option<String>,
     pub proposal_mode: bool,
+    pub gold: bool,
+    pub gold_model: bool,
+    pub answer: String,
     pub evidence_hash: Option<String>,
     pub event_id: Option<String>,
     pub exit_code: Option<i32>,
     pub duration_s: f64,
     pub log_path: PathBuf,
     pub tail: String,
+}
+
+#[derive(Default)]
+pub struct RunExtras {
+    pub ask: Option<AskWire>,
+    pub base: Option<String>,
+    pub hold_gold: bool,
+    pub pause: Option<Arc<Pause>>,
+    pub unanswered: Option<Arc<AtomicBool>>,
 }
 
 pub type Launcher = Box<dyn Fn(&Backend, &RunRequest) -> Result<Launch, String> + Send + Sync>;
@@ -408,16 +507,417 @@ pub fn real_launcher(claude_path: Option<PathBuf>, pass_env: Vec<String>) -> Lau
         let (cred, _) = backends::load_credential(backend)?;
         let program = backends::resolve_program(backend, claude_path.as_deref())?;
         backend.harness().pre_run_check(backend, &cred)?;
-        backends::build_launch(backend, req, &cred, &program, std::env::vars_os(), &pass_env)
+        backends::build_launch(
+            backend,
+            req,
+            &cred,
+            &program,
+            std::env::vars_os(),
+            &pass_env,
+        )
     })
 }
 
-pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").env("GIT_TERMINAL_PROMPT", "0").arg("-C").arg(dir).args(args).output().context("running git")?;
+pub const ID_MAX: usize = 40;
+pub const JOB_ID_MAX: usize = 2 * ID_MAX + 1;
+
+pub fn valid_id(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub fn name_taken(repo: &Path, work_dir: &Path, id: &str) -> Option<String> {
+    let branch = format!("refs/heads/{BRANCH_PREFIX}{id}");
+    let exists = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show-ref", "--verify", "--quiet", &branch])
+        .status()
+        .is_ok_and(|s| s.success());
+    if exists {
+        return Some(format!("branch {BRANCH_PREFIX}{id} already exists"));
+    }
+    if work_dir.join("worktrees").join(id).exists() {
+        return Some(format!("worktree for `{id}` already exists"));
+    }
+    ["patches/{}.patch", "patches/{}.proposal", "index/{}"]
+        .iter()
+        .map(|t| work_dir.join(t.replace("{}", id)))
+        .find(|p| p.exists())
+        .map(|p| {
+            format!(
+                "artefact {} of an earlier job `{id}` already exists (another repository?)",
+                p.display()
+            )
+        })
+}
+
+fn no_hooks() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "sidekick-nohooks-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500));
+        }
+        dir
+    })
+}
+
+fn empty_config() -> &'static Path {
+    static FILE: OnceLock<PathBuf> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let file = std::env::temp_dir().join(format!(
+            "sidekick-gitconfig-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::write(&file, "");
+        file
+    })
+}
+
+fn run_git(mut cmd: Command, args: &[&str], isolate: bool) -> Result<String> {
+    let _helper = runner::helper_guard();
+    if isolate {
+        cmd.env("GIT_CONFIG_GLOBAL", empty_config())
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+    }
+    let out = cmd
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", no_hooks().display()))
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .output()
+        .context("running git")?;
     if !out.status.success() {
-        bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "git {} failed ({}): {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir);
+    run_git(cmd, args, true)
+}
+
+pub(crate) fn git_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).env("GIT_INDEX_FILE", index);
+    run_git(cmd, args, true)
+}
+
+pub(crate) fn git_user_config(dir: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir);
+    run_git(cmd, args, false)
+}
+
+pub(crate) fn tree_diff(repo: &Path, extra: &[&str], from: &str, to: &str) -> Result<String> {
+    let mut args = vec![
+        "-c",
+        "core.quotepath=false",
+        "diff",
+        "--no-color",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+    ];
+    args.extend(extra);
+    args.extend([from, to]);
+    git(repo, &args)
+}
+
+fn file_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+fn set_file_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
+#[derive(Clone, PartialEq)]
+enum Entry {
+    File(Vec<u8>, u32),
+    Link(PathBuf),
+}
+
+fn scan_files(path: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        if let Ok(target) = std::fs::read_link(path) {
+            out.insert(path.to_path_buf(), Entry::Link(target));
+        }
+    } else if meta.is_dir() {
+        for e in std::fs::read_dir(path).into_iter().flatten().flatten() {
+            scan_files(&e.path(), out);
+        }
+    } else if let Ok(bytes) = std::fs::read(path) {
+        out.insert(path.to_path_buf(), Entry::File(bytes, file_mode(&meta)));
+    }
+}
+
+fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+fn make_link(target: &Path, path: &Path) {
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(target, path);
+    #[cfg(not(unix))]
+    let _ = (target, path);
+}
+
+struct Watch {
+    paths: Vec<PathBuf>,
+    files: BTreeMap<PathBuf, Entry>,
+}
+
+impl Watch {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        let mut w = Self {
+            paths,
+            files: BTreeMap::new(),
+        };
+        w.files = w.scan();
+        w
+    }
+
+    fn scan(&self) -> BTreeMap<PathBuf, Entry> {
+        let mut out = BTreeMap::new();
+        self.paths.iter().for_each(|p| scan_files(p, &mut out));
+        out
+    }
+
+    fn clear_links(&self, path: &Path) {
+        for root in self.paths.iter().filter(|r| path.starts_with(r)) {
+            let mut cur = root.clone();
+            let rest = path.strip_prefix(root).unwrap_or(Path::new(""));
+            for part in std::iter::once(None).chain(rest.components().map(Some)) {
+                if let Some(c) = part {
+                    cur.push(c);
+                }
+                if is_link(&cur) && !matches!(self.files.get(&cur), Some(Entry::Link(_))) {
+                    let _ = std::fs::remove_file(&cur);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn restore(&self) -> bool {
+        let now = self.scan();
+        if now == self.files {
+            return false;
+        }
+        for p in now.keys().filter(|p| !self.files.contains_key(*p)) {
+            let _ = std::fs::remove_file(p);
+        }
+        for (p, entry) in self.files.iter().filter(|(p, v)| now.get(*p) != Some(v)) {
+            self.clear_links(p);
+            if is_link(p) || p.is_file() {
+                let _ = std::fs::remove_file(p);
+            }
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            match entry {
+                Entry::File(bytes, mode) => {
+                    let _ = std::fs::write(p, bytes);
+                    set_file_mode(p, *mode);
+                }
+                Entry::Link(target) => make_link(target, p),
+            }
+        }
+        true
+    }
+}
+
+struct Guard {
+    repo: PathBuf,
+    git: Watch,
+    own: Watch,
+    exe: Option<(PathBuf, String)>,
+    refs: BTreeMap<String, String>,
+    head: (String, String),
+}
+
+fn fingerprint(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.ctime(), meta.ctime_nsec(), meta.ino())
+    };
+    #[cfg(not(unix))]
+    let changed = (0, 0, 0);
+    Some(format!("{}:{modified}:{changed:?}", meta.len()))
+}
+
+fn exe_print() -> Option<(PathBuf, String)> {
+    let path = std::env::current_exe().ok()?;
+    let print = fingerprint(&path)?;
+    Some((path, print))
+}
+
+impl Guard {
+    fn capture(repo: &Path, admin: &Path, own: Vec<PathBuf>) -> Result<Self> {
+        let common = admin_common(admin);
+        let mut paths = vec![
+            common.join("hooks"),
+            common.join("config"),
+            common.join("config.worktree"),
+            common.join("info/attributes"),
+            common.join("info/exclude"),
+            admin.join("config.worktree"),
+            admin.join("info/attributes"),
+            admin.join("hooks"),
+        ];
+        paths.extend(
+            std::fs::read_dir(common.join("worktrees"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path().join("config.worktree")),
+        );
+        let git = Watch::new(paths);
+        let mut guard = Self {
+            repo: repo.to_path_buf(),
+            git,
+            own: Watch::new(own),
+            exe: exe_print(),
+            refs: BTreeMap::new(),
+            head: Default::default(),
+        };
+        guard.refs = guard.read_refs()?;
+        guard.head = guard.read_head()?;
+        Ok(guard)
+    }
+
+    fn read_refs(&self) -> Result<BTreeMap<String, String>> {
+        let out = git(
+            &self.repo,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        )?;
+        Ok(out
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .filter(|(r, _)| !r.starts_with(&format!("refs/heads/{BRANCH_PREFIX}")))
+            .map(|(r, o)| (r.to_string(), o.to_string()))
+            .collect())
+    }
+
+    fn read_head(&self) -> Result<(String, String)> {
+        let sym = git(&self.repo, &["symbolic-ref", "-q", "HEAD"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        Ok((
+            sym,
+            git(&self.repo, &["rev-parse", "HEAD"])?.trim().to_string(),
+        ))
+    }
+
+    fn check_and_restore(&self) -> Option<String> {
+        let mut found: Vec<String> = Vec::new();
+        if self.git.restore() {
+            found.push("Git-Hooks/Config verändert".into());
+        }
+        let own_changed = self.own.restore();
+        let exe_changed = self
+            .exe
+            .as_ref()
+            .is_some_and(|(p, h)| fingerprint(p).as_ref() != Some(h));
+        if own_changed || exe_changed {
+            found.push("Sidekick-Dateien verändert".into());
+        }
+        let refs = self.read_refs().unwrap_or_default();
+        let head = self.read_head().unwrap_or_default();
+        let moved: std::collections::BTreeSet<&str> = self
+            .refs
+            .keys()
+            .chain(refs.keys())
+            .filter(|r| self.refs.get(*r) != refs.get(*r))
+            .map(String::as_str)
+            .collect();
+        if !moved.is_empty() || head != self.head {
+            let mut what: Vec<&str> = moved.into_iter().collect();
+            if head != self.head {
+                what.push("HEAD");
+            }
+            found.push(format!(
+                "Refs außerhalb des Job-Branches verändert, nicht zurückgesetzt: {}",
+                what.join(", ")
+            ));
+        }
+        (!found.is_empty()).then(|| format!("Ausbruchsversuch: {}", found.join(", ")))
+    }
+}
+
+fn repo_lock(repo: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let key = git(repo, &["rev-parse", "--git-common-dir"])
+        .ok()
+        .map(|d| repo.join(d.trim()))
+        .and_then(|d| d.canonicalize().ok())
+        .unwrap_or_else(|| repo.to_path_buf());
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_default()
+        .clone()
+}
+
+fn admin_common(admin: &Path) -> PathBuf {
+    let rel = std::fs::read_to_string(admin.join("commondir")).unwrap_or_default();
+    let rel = rel.trim();
+    if rel.is_empty() {
+        admin.to_path_buf()
+    } else {
+        admin
+            .join(rel)
+            .canonicalize()
+            .unwrap_or_else(|_| admin.join(rel))
+    }
 }
 
 struct Worktree {
@@ -425,43 +925,114 @@ struct Worktree {
     path: PathBuf,
     branch: String,
     base: String,
+    admin: PathBuf,
+    index: PathBuf,
 }
 
 impl Worktree {
-    fn create(repo: &Path, work_dir: &Path, job_id: &str) -> Result<Self> {
-        if job_id.is_empty() || job_id.contains(['/', '\\', ' ']) || job_id.starts_with('.') {
+    fn create(repo: &Path, work_dir: &Path, job_id: &str, from: Option<&str>) -> Result<Self> {
+        if !valid_id(job_id, JOB_ID_MAX) {
             bail!("invalid job_id `{job_id}`");
         }
-        let base = git(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+        let start = from.unwrap_or("HEAD");
+        let base = git(repo, &["rev-parse", start])?.trim().to_string();
         let path = work_dir.join("worktrees").join(job_id);
         let branch = format!("{BRANCH_PREFIX}{job_id}");
         std::fs::create_dir_all(path.parent().unwrap())?;
-        git(repo, &["worktree", "add", "-b", &branch, &path.to_string_lossy(), "HEAD"])?;
-        Ok(Self { repo: repo.to_path_buf(), path, branch, base })
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                &path.to_string_lossy(),
+                &base,
+            ],
+        )?;
+        let admin = PathBuf::from(git(&path, &["rev-parse", "--absolute-git-dir"])?.trim());
+        let index = work_dir.join("index").join(job_id);
+        std::fs::create_dir_all(index.parent().unwrap())?;
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            path,
+            branch,
+            base,
+            admin,
+            index,
+        })
     }
 
-    fn diff(&self, unified: &str) -> Result<String> {
-        git(&self.path, &["add", "-A"])?;
-        git(&self.path, &["-c", "core.quotepath=false", "diff", "--cached", "--binary", "--no-color", "--no-renames", unified, &self.base])
+    fn private(&self, args: &[&str]) -> Result<String> {
+        let mut cmd = Command::new("git");
+        cmd.arg("--git-dir")
+            .arg(&self.admin)
+            .arg("--work-tree")
+            .arg(&self.path)
+            .current_dir(&self.path)
+            .env("GIT_INDEX_FILE", &self.index);
+        run_git(cmd, args, true)
     }
 
-    fn files(&self) -> Result<Vec<String>> {
-        git(&self.path, &["add", "-A"])?;
-        let out = git(&self.path, &["diff", "--cached", "--name-only", "-z", "--no-renames", &self.base])?;
-        Ok(out.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+    fn snapshot(&self) -> Result<String> {
+        let _ = std::fs::remove_file(&self.index);
+        self.private(&["read-tree", &self.base])?;
+        self.private(&["add", "-A"])?;
+        Ok(self.private(&["write-tree"])?.trim().to_string())
+    }
+
+    fn diff(&self, tree: &str, unified: &str) -> Result<String> {
+        tree_diff(&self.repo, &["--binary", unified], &self.base, tree)
+    }
+
+    fn files(&self, tree: &str) -> Result<Vec<String>> {
+        let out = tree_diff(&self.repo, &["--name-only", "-z"], &self.base, tree)?;
+        Ok(out
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect())
     }
 
     fn remove(&self, drop_branch: bool) {
-        let _ = git(&self.repo, &["worktree", "remove", "--force", &self.path.to_string_lossy()]);
+        let _ = std::fs::remove_file(&self.index);
+        let _ = git(
+            &self.repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &self.path.to_string_lossy(),
+            ],
+        );
         if drop_branch {
             let _ = git(&self.repo, &["branch", "-D", &self.branch]);
         }
     }
 
-    fn commit(&self, message: &str) -> Result<()> {
+    fn commit(&self, tree: &str, message: &str) -> Result<()> {
         let mut args: Vec<&str> = GIT_IDENT.to_vec();
-        args.extend(["commit", "-q", "-m", message]);
-        git(&self.path, &args).map(|_| ())
+        args.extend(["commit-tree", tree, "-p", &self.base, "-m", message]);
+        let commit = git(&self.repo, &args)?.trim().to_string();
+        git(
+            &self.repo,
+            &[
+                "update-ref",
+                &format!("refs/heads/{}", self.branch),
+                &commit,
+            ],
+        )
+        .map(|_| ())
+    }
+}
+
+fn final_answer(backend: &Backend, report_text: Option<&str>, raw: &str) -> String {
+    match report_text {
+        Some(t) => t.to_string(),
+        None => backend
+            .harness()
+            .normalize_output(raw)
+            .map_or_else(|| raw.to_string(), |n| n.text),
     }
 }
 
@@ -470,7 +1041,31 @@ fn now_ms() -> i64 {
 }
 
 impl Dispatcher {
-    pub async fn dispatch(&self, backend: &Backend, req: &DispatchRequest, log: &mut SessionLog) -> Result<DispatchResult> {
+    fn own_files(&self) -> Vec<PathBuf> {
+        let base = self
+            .work_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let checkout = base.join("checkout");
+        let mut paths = vec![
+            base.join("secret"),
+            base.join("machine_id"),
+            checkout.join("models.parquet"),
+            checkout.join("protected.parquet"),
+            checkout.join(".git/hooks"),
+            checkout.join(".git/config"),
+        ];
+        paths.extend(crate::paths::config_file().ok());
+        paths
+    }
+
+    pub async fn dispatch(
+        &self,
+        backend: &Backend,
+        req: &DispatchRequest,
+        log: &mut SessionLog,
+    ) -> Result<DispatchResult> {
         let (result, event) = self.run(backend, req, CancellationToken::new()).await?;
         if let Some(event) = event {
             log.append(event)?;
@@ -478,8 +1073,26 @@ impl Dispatcher {
         Ok(result)
     }
 
-    pub async fn run(&self, backend: &Backend, req: &DispatchRequest, cancel: CancellationToken) -> Result<(DispatchResult, Option<Event>)> {
-        let model = backend.effective_model(req.model.as_deref()).map_err(|e| anyhow!(e))?;
+    pub async fn run(
+        &self,
+        backend: &Backend,
+        req: &DispatchRequest,
+        cancel: CancellationToken,
+    ) -> Result<(DispatchResult, Option<Event>)> {
+        self.run_with(backend, req, cancel, RunExtras::default())
+            .await
+    }
+
+    pub async fn run_with(
+        &self,
+        backend: &Backend,
+        req: &DispatchRequest,
+        cancel: CancellationToken,
+        extras: RunExtras,
+    ) -> Result<(DispatchResult, Option<Event>)> {
+        let model = backend
+            .effective_model(req.model.as_deref())
+            .map_err(|e| anyhow!(e))?;
         let key = req.identity.key(backend, model.as_deref());
         let model_id = key.model_id();
         let row = self.data.model(&model_id).map_err(|_| {
@@ -489,26 +1102,63 @@ impl Dispatcher {
             )
         })?;
         let technical = technical_sperre(backend);
-        let sperre = if row.sperre == Sperre::Technisch && technical == Sperre::Technisch { Sperre::Technisch } else { Sperre::NurDiff };
+        let sperre = if row.sperre == Sperre::Technisch && technical == Sperre::Technisch {
+            Sperre::Technisch
+        } else {
+            Sperre::NurDiff
+        };
         let sperre_note = (sperre != row.sperre).then(|| {
             format!("registry says {} but the {} harness cannot withhold write tools; treated as nur-diff", row.sperre.as_str(), key.harness)
         });
         let events = self.data.events(Some(&self.local_root))?;
         let standing = Standing::compute(&key, sperre, &events, now_ms());
-        let write_right = req.dimension.is_write() && standing.write_right(req.dimension, &req.scope);
+        let write_right =
+            req.dimension.is_write() && standing.write_right(req.dimension, &req.scope);
         let protected = self.data.protected()?;
         let limited = with_registry_limits(backend, &row);
-        let prepared = if write_right { limited } else { withhold_writes(&limited) };
+        let prepared = if write_right {
+            limited
+        } else {
+            withhold_writes(&limited)
+        };
         let expected = expected_claude_model(backend, model.as_deref());
         let model = claude_model_with(backend, model.as_deref(), resolve_claude_alias).or(model);
         let max_turns = match (backend.harness_kind(), row.max_steps) {
-            (HarnessKind::Claude | HarnessKind::OpenCode, Some(m)) if m > 0 => req.max_turns.min(m as u32),
+            (HarnessKind::Claude | HarnessKind::OpenCode, Some(m)) if m > 0 => {
+                req.max_turns.min(m as u32)
+            }
             _ => req.max_turns,
         };
         let proposal = req.dimension.is_write() && !write_right;
-        let wt = Worktree::create(&req.repo, &self.work_dir, &req.job_id)?;
+        let _repo_turn = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("cancelled while waiting for another job on this repository"),
+            g = repo_lock(&req.repo).lock_owned() => g,
+        };
+        let wt = Worktree::create(
+            &req.repo,
+            &self.work_dir,
+            &req.job_id,
+            extras.base.as_deref(),
+        )?;
+        let guard = match Guard::capture(&req.repo, &wt.admin, self.own_files()) {
+            Ok(g) => g,
+            Err(e) => {
+                wt.remove(true);
+                return Err(e);
+            }
+        };
         let run_req = RunRequest {
-            prompt: if proposal { format!("{}\n\n{PROPOSAL_INSTRUCTION}", req.prompt) } else { req.prompt.clone() },
+            prompt: {
+                let mut prompt = req.prompt.clone();
+                if extras.ask.is_some() {
+                    prompt = format!("{prompt}\n\n{ASK_PROMPT_LINE}");
+                }
+                if proposal {
+                    prompt = format!("{prompt}\n\n{PROPOSAL_INSTRUCTION}");
+                }
+                prompt
+            },
             cwd: wt.path.clone(),
             max_turns,
             model,
@@ -516,20 +1166,39 @@ impl Dispatcher {
             timeout: req.timeout,
         };
         let json_output = matches!(backend.kind, BackendKind::ClaudeOauth { .. });
-        let launched = (self.launcher)(&prepared, &run_req).map(|mut l| {
-            if json_output {
-                let at = if l.args.len() >= 2 && l.args[l.args.len() - 2] == "--" { l.args.len() - 2 } else { l.args.len() };
-                l.args.splice(at..at, ["--output-format".into(), "json".into()]);
-            }
-            l
-        }).map_err(|e| anyhow!(e));
+        let launched = (self.launcher)(&prepared, &run_req)
+            .map_err(|e| anyhow!(e))
+            .and_then(|mut l| {
+                if json_output {
+                    let at = if l.args.len() >= 2 && l.args[l.args.len() - 2] == "--" {
+                        l.args.len() - 2
+                    } else {
+                        l.args.len()
+                    };
+                    l.args
+                        .splice(at..at, ["--output-format".into(), "json".into()]);
+                }
+                if let Some(wire) = &extras.ask {
+                    ask::wire_launch(backend.harness_kind(), &mut l, wire)?;
+                }
+                Ok(l)
+            });
         let outcome = match launched {
-            Ok(launch) => runner::run_launch(launch, run_req, &self.logs_dir, cancel).await.map_err(anyhow::Error::from),
+            Ok(launch) => runner::run_launch_with(
+                launch,
+                run_req,
+                &self.logs_dir,
+                cancel,
+                extras.pause.clone(),
+            )
+            .await
+            .map_err(anyhow::Error::from),
             Err(e) => Err(e),
         };
         let outcome = match outcome {
             Ok(o) => o,
             Err(e) => {
+                guard.check_and_restore();
                 wt.remove(true);
                 return Err(e);
             }
@@ -543,6 +1212,8 @@ impl Dispatcher {
             sperre_note,
             unsupported_limits: unsupported_limits(backend),
             branch: None,
+            tree: None,
+            base: Some(wt.base.clone()),
             patch_path: None,
             applied: false,
             diff_discarded: false,
@@ -551,6 +1222,9 @@ impl Dispatcher {
             block_reason: None,
             reason: None,
             proposal_mode: proposal,
+            gold: false,
+            gold_model: false,
+            answer: String::new(),
             evidence_hash: None,
             event_id: None,
             exit_code: outcome.exit_code,
@@ -558,11 +1232,13 @@ impl Dispatcher {
             log_path: outcome.log_path.clone(),
             tail: outcome.tail.clone(),
         };
-        let raw = runner::read_logged_output(&outcome.log_path, outcome.output_offset).unwrap_or_else(|| outcome.output.clone());
+        let raw = runner::read_logged_output(&outcome.log_path, outcome.output_offset)
+            .unwrap_or_else(|| outcome.output.clone());
         let report = json_output.then(|| parse_report(&raw)).flatten();
         if let Some(r) = &report {
             result.tail = runner::truncate_tail(&r.text, runner::TAIL_CHARS);
         }
+        result.answer = final_answer(backend, report.as_ref().map(|r| r.text.as_str()), &raw);
         let model_verified = match &expected {
             None => true,
             Some(exp) => match report.as_ref().and_then(|r| r.models.first()) {
@@ -572,22 +1248,61 @@ impl Dispatcher {
                 }
                 Some(m) if model_matches(m, exp) => true,
                 Some(m) => {
-                    result.warnings.push(format!("model mismatch: expected {exp}, the claude CLI reported {m}"));
+                    result.warnings.push(format!(
+                        "model mismatch: expected {exp}, the claude CLI reported {m}"
+                    ));
                     false
                 }
             },
         };
         if !model_verified && standing.apply_without_review() {
-            result.warnings.push("gold not applied without a verified model: result returned as branch/patch".into());
+            result.warnings.push(
+                "gold not applied without a verified model: result returned as branch/patch".into(),
+            );
         }
-        let mut event = Event::new(&model_id, req.dimension, req.scope.clone(), Outcome::Note, now_ms());
+        let gold_model = standing.apply_without_review()
+            && matches!(backend.kind, BackendKind::ClaudeOauth { .. })
+            && model_verified;
+        result.gold_model = gold_model;
+        let mut event = Event::new(
+            &model_id,
+            req.dimension,
+            req.scope.clone(),
+            Outcome::Note,
+            now_ms(),
+        );
         event.machine_id = self.machine_id.clone();
         event.user_id = self.user_id.clone();
         event.job_id = Some(req.job_id.clone());
         event.duration_s = Some(result.duration_s);
+        let unanswered = extras
+            .unanswered
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::SeqCst));
+        if unanswered {
+            result.warnings.push("a question of the worker went unanswered: gold is not applied directly, result returned as branch/patch".into());
+        }
         let finished = (|| -> Result<()> {
-            let max_turns_hit = report.as_ref().is_some_and(|r| r.subtype == MAX_TURNS_SUBTYPE);
-            if let Some(r) = report.as_ref().filter(|r| r.is_error && r.subtype != MAX_TURNS_SUBTYPE) {
+            if let Some(reason) = guard.check_and_restore() {
+                result.status = Status::Blocked;
+                result.diff_discarded = true;
+                result.evidence_hash = Some(sha256_hex(reason.as_bytes()));
+                event.outcome = Outcome::Blocked;
+                event.block_reason = Some(reason.clone());
+                event.conclusion = block_lesson(&reason, &req.scope);
+                event.evidence_hash = result.evidence_hash.clone();
+                result.violations = vec![reason.clone()];
+                result.block_reason = Some(reason);
+                wt.remove(true);
+                return Ok(());
+            }
+            let max_turns_hit = report
+                .as_ref()
+                .is_some_and(|r| r.subtype == MAX_TURNS_SUBTYPE);
+            if let Some(r) = report
+                .as_ref()
+                .filter(|r| r.is_error && r.subtype != MAX_TURNS_SUBTYPE)
+            {
                 result.status = Status::Failed;
                 let reason = format!("claude reported an error ({}): {}", r.subtype, r.text);
                 result.tail = runner::truncate_tail(&reason, runner::TAIL_CHARS);
@@ -596,27 +1311,30 @@ impl Dispatcher {
                 return Ok(());
             }
             let aborted = outcome.timed_out || outcome.cancelled || max_turns_hit;
-            let mut files = wt.files()?;
+            let mut tree = wt.snapshot()?;
+            let mut files = wt.files(&tree)?;
             let mut proposed = false;
             if proposal && files.is_empty() {
-                let text = match &report {
-                    Some(r) => r.text.clone(),
-                    None => backend.harness().normalize_output(&raw).map_or(raw.clone(), |n| n.text),
-                };
-                let applied = extract_patch(&text).and_then(|patch| {
-                    let proposal_path = self.work_dir.join("patches").join(format!("{}.proposal", req.job_id));
-                    std::fs::create_dir_all(proposal_path.parent().unwrap()).map_err(|e| e.to_string())?;
+                let applied = extract_patch(&result.answer).and_then(|patch| {
+                    let proposal_path = self
+                        .work_dir
+                        .join("patches")
+                        .join(format!("{}.proposal", req.job_id));
+                    std::fs::create_dir_all(proposal_path.parent().unwrap())
+                        .map_err(|e| e.to_string())?;
                     std::fs::write(&proposal_path, patch).map_err(|e| e.to_string())?;
                     let arg = proposal_path.to_string_lossy().into_owned();
-                    let done = git(&wt.path, &["apply", "--check", "--whitespace=nowarn", &arg])
-                        .and_then(|_| git(&wt.path, &["apply", "--whitespace=nowarn", &arg]))
+                    let done = wt
+                        .private(&["apply", "--check", "--whitespace=nowarn", &arg])
+                        .and_then(|_| wt.private(&["apply", "--whitespace=nowarn", &arg]))
                         .map_err(|e| format!("proposed patch does not apply: {e:#}"));
                     let _ = std::fs::remove_file(&proposal_path);
                     done
                 });
                 match applied {
                     Ok(_) => {
-                        files = wt.files()?;
+                        tree = wt.snapshot()?;
+                        files = wt.files(&tree)?;
                         proposed = true;
                     }
                     Err(_) if aborted => {}
@@ -638,9 +1356,13 @@ impl Dispatcher {
                 wt.remove(true);
                 return Ok(());
             }
-            let patch = wt.diff("-U3")?;
+            let patch = wt.diff(&tree, "-U3")?;
             if !write_right && !proposed {
-                let reason = format!("diff without write right ({}): {}", req.dimension, files.join(", "));
+                let reason = format!(
+                    "diff without write right ({}): {}",
+                    req.dimension,
+                    files.join(", ")
+                );
                 result.status = Status::Blocked;
                 result.diff_discarded = true;
                 result.evidence_hash = Some(sha256_hex(patch.as_bytes()));
@@ -653,9 +1375,14 @@ impl Dispatcher {
                 wt.remove(true);
                 return Ok(());
             }
-            let checker = DiffChecker { protected: &protected, dimension: req.dimension, limits: Limits::for_scope(&req.scope), scope: &req.scope };
-            let check = checker.check(&files, &wt.diff("-U0")?);
-            let gold = standing.apply_without_review() && matches!(backend.kind, BackendKind::ClaudeOauth { .. }) && model_verified;
+            let checker = DiffChecker {
+                protected: &protected,
+                dimension: req.dimension,
+                limits: Limits::for_scope(&req.scope),
+                scope: &req.scope,
+            };
+            let check = checker.check(&files, &wt.diff(&tree, "-U0")?);
+            let gold = gold_model;
             if !check.violations.is_empty() && (!gold || aborted) {
                 let reason = check.violations.join("; ");
                 result.status = Status::Blocked;
@@ -680,17 +1407,28 @@ impl Dispatcher {
             std::fs::create_dir_all(&patches)?;
             let patch_path = patches.join(format!("{}.patch", req.job_id));
             std::fs::write(&patch_path, &patch)?;
-            if gold {
-                match git(&req.repo, &["apply", "--whitespace=nowarn", &patch_path.to_string_lossy()]) {
+            result.gold = gold;
+            if gold && !extras.hold_gold && !unanswered {
+                match git(
+                    &req.repo,
+                    &[
+                        "apply",
+                        "--whitespace=nowarn",
+                        &patch_path.to_string_lossy(),
+                    ],
+                ) {
                     Ok(_) => {
                         result.applied = true;
                         wt.remove(true);
                     }
-                    Err(e) => result.warnings.push(format!("gold apply failed, branch and patch kept: {e:#}")),
+                    Err(e) => result
+                        .warnings
+                        .push(format!("gold apply failed, branch and patch kept: {e:#}")),
                 }
             }
             if !result.applied {
-                wt.commit(&format!("sidekick job {}", req.job_id))?;
+                wt.commit(&tree, &format!("sidekick job {}", req.job_id))?;
+                result.tree = Some(tree);
                 wt.remove(false);
                 result.branch = Some(wt.branch.clone());
             }
@@ -716,6 +1454,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_final_answer_is_the_text_not_the_json_event_stream_for_opencode() {
+        let cfg: crate::config::Config = toml::from_str("[backends.dgx]\nharness = \"opencode\"\nprovider = \"ollama\"\nbase_url = \"http://127.0.0.1:1\"\nmodel = \"m\"\ndescription = \"d\"\ndefault = true\n").unwrap();
+        let defaults = crate::backends::ResolveDefaults {
+            home: None,
+            legacy_agent_config_dir: None,
+            config_dir: Some(std::env::temp_dir().join("sk-final-answer-cfg")),
+        };
+        let backends = crate::backends::resolve_with(&cfg, &defaults).unwrap();
+        let backend = backends.get("dgx").unwrap();
+        let raw = [
+            r#"{"type":"step_start","sessionID":"s1","part":{"type":"step-start"}}"#,
+            r#"{"type":"text","sessionID":"s1","part":{"type":"text","text":"the inventory: a.rs, b.rs"}}"#,
+            r#"{"type":"step_finish","sessionID":"s1","part":{"reason":"stop","tokens":{"input":1,"output":1},"cost":0.0}}"#,
+        ]
+        .join("\n");
+        let answer = final_answer(backend, None, &raw);
+        assert!(
+            answer.starts_with("the inventory: a.rs, b.rs") && !answer.contains("\"type\""),
+            "{answer}"
+        );
+        assert_eq!(final_answer(backend, Some("report"), &raw), "report");
+    }
+
+    #[test]
     fn globs() {
         assert!(glob_match("tests/**", "tests/a/b.rs"));
         assert!(!glob_match("tests/**", "src/tests.rs"));
@@ -731,10 +1493,73 @@ mod tests {
     #[test]
     fn term_removal_needs_readd() {
         let protected = ProtectedRow::defaults();
-        let checker = DiffChecker { protected: &protected, dimension: Dimension::WriteCode, limits: GLOBAL_LIMITS, scope: &Scope::Global };
+        let checker = DiffChecker {
+            protected: &protected,
+            dimension: Dimension::WriteCode,
+            limits: GLOBAL_LIMITS,
+            scope: &Scope::Global,
+        };
         let removed = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-assert!(x);\n+x;\n";
-        assert_eq!(checker.check(&["src/a.rs".into()], removed).violations.len(), 1);
+        assert_eq!(
+            checker
+                .check(&["src/a.rs".into()], removed)
+                .violations
+                .len(),
+            1
+        );
         let moved = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-assert!(x);\n+assert!(y);\n";
-        assert!(checker.check(&["src/a.rs".into()], moved).violations.is_empty());
+        assert!(checker
+            .check(&["src/a.rs".into()], moved)
+            .violations
+            .is_empty());
+    }
+
+    #[test]
+    fn sidekick_git_ignores_global_and_system_config_but_the_data_repo_helper_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("gitconfig");
+        std::fs::write(
+            &global,
+            "[alias]\n\tleak = status\n[user]\n\tname = leaky\n",
+        )
+        .unwrap();
+        std::env::set_var("GIT_CONFIG_GLOBAL", &global);
+        git(dir.path(), &["init", "-q"]).unwrap();
+        assert!(git(dir.path(), &["config", "--get", "alias.leak"]).is_err());
+        assert!(git(dir.path(), &["config", "--get", "user.name"]).is_err());
+        assert!(git_user_config(dir.path(), &["config", "--get", "alias.leak"]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_diff_never_runs_textconv_or_external_diff_drivers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let marker = dir.path().join("ran");
+        let driver = dir.path().join("driver.sh");
+        std::fs::write(
+            &driver,
+            format!("#!/bin/sh\ntouch {}\ncat \"$1\"\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |args: &[&str]| {
+            let mut full = GIT_IDENT.to_vec();
+            full.extend(args);
+            git(&repo, &full).unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&["config", "diff.x.textconv", &driver.to_string_lossy()]);
+        run(&["config", "diff.external", &driver.to_string_lossy()]);
+        std::fs::write(repo.join(".gitattributes"), "*.txt diff=x\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "1\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "a"]);
+        std::fs::write(repo.join("a.txt"), "2\n").unwrap();
+        run(&["commit", "-q", "-am", "b"]);
+        let out = tree_diff(&repo, &["--binary", "-U3"], "HEAD~1", "HEAD").unwrap();
+        assert!(out.contains("+2") && !marker.exists(), "{out}");
     }
 }

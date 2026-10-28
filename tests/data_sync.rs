@@ -6,14 +6,35 @@ use agent_sidekick::sync::{DataStore, ExperienceInput};
 use agent_sidekick::trust::{Dimension, Event, ModelKey, Outcome, Scope, Sperre, Visibility};
 
 fn sh(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout).unwrap()
 }
 
 fn commit_all(dir: &Path, msg: &str) {
     sh(dir, &["add", "-A"]);
-    sh(dir, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg]);
+    sh(
+        dir,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            msg,
+        ],
+    );
 }
 
 fn model() -> ModelRow {
@@ -55,7 +76,12 @@ fn fx() -> Fx {
     let peer = dir.path().join("peer");
     init_remote(&bare, &peer);
     let base = dir.path().join("app");
-    Fx { _dir: dir, bare, peer, base }
+    Fx {
+        _dir: dir,
+        bare,
+        peer,
+        base,
+    }
 }
 
 fn open(f: &Fx) -> DataStore {
@@ -82,7 +108,11 @@ fn input(outcome: Outcome, dimension: Dimension) -> ExperienceInput {
 }
 
 fn remote_files(f: &Fx, rev: &str) -> Vec<String> {
-    sh(&f.bare, &["show", "--name-only", "--pretty=format:", rev]).lines().filter(|l| !l.is_empty()).map(String::from).collect()
+    sh(&f.bare, &["show", "--name-only", "--pretty=format:", rev])
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 #[test]
@@ -92,27 +122,62 @@ fn only_own_path_is_committed_and_pushed() {
     assert!(s.checkout.join("models.parquet").exists());
     assert!(s.checkout.join("README.md").exists());
     std::fs::write(s.checkout.join("stray.txt"), "x").unwrap();
-    let (_, pushed) = s.record(input(Outcome::Accepted, Dimension::WriteCode)).unwrap();
+    let (_, pushed) = s
+        .record(input(Outcome::Accepted, Dimension::WriteCode))
+        .unwrap();
     assert!(pushed);
     let files = remote_files(&f, "main");
     assert_eq!(files.len(), 1);
     assert!(files[0].starts_with("experiences/me/") && files[0].ends_with(".parquet"));
     assert!(sh(&f.bare, &["log", "-1", "--format=%s", "main"]).starts_with("data: "));
     assert!(sh(&s.checkout, &["status", "--porcelain"]).contains("stray.txt"));
-    assert!(s.local_root.join("experiences/me").read_dir().unwrap().count() == 1);
+    assert!(
+        s.local_root
+            .join("experiences/me")
+            .read_dir()
+            .unwrap()
+            .count()
+            == 1
+    );
 }
 
 #[test]
 fn rebase_retry_after_concurrent_push() {
     let f = fx();
     let s = open(&f);
-    s.record(input(Outcome::Accepted, Dimension::Search)).unwrap();
+    s.record(input(Outcome::Accepted, Dimension::Search))
+        .unwrap();
     let other = f.peer.join("experiences/other/o.parquet");
-    write_events(&other, &[Event::new(&model().model_id(), Dimension::Search, Scope::Global, Outcome::Accepted, 1)]).unwrap();
+    write_events(
+        &other,
+        &[Event::new(
+            &model().model_id(),
+            Dimension::Search,
+            Scope::Global,
+            Outcome::Accepted,
+            1,
+        )],
+    )
+    .unwrap();
     commit_all(&f.peer, "data: other");
-    sh(&f.peer, &["pull", "-q", "--rebase", "origin", "main"]);
+    sh(
+        &f.peer,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "pull",
+            "-q",
+            "--rebase",
+            "origin",
+            "main",
+        ],
+    );
     sh(&f.peer, &["push", "-q", "origin", "main"]);
-    let (_, pushed) = s.record(input(Outcome::Rejected, Dimension::Search)).unwrap();
+    let (_, pushed) = s
+        .record(input(Outcome::Rejected, Dimension::Search))
+        .unwrap();
     assert!(pushed);
     let log = sh(&f.bare, &["log", "--format=%s", "main"]);
     assert!(log.contains("data: other") && log.matches("data: me").count() == 2);
@@ -126,24 +191,38 @@ fn offline_keeps_pending_and_pushes_on_sync() {
     let gone = f.bare.with_file_name("gone.git");
     let s = open(&f);
     std::fs::rename(&f.bare, &gone).unwrap();
-    let (_, pushed) = s.record(input(Outcome::Accepted, Dimension::Search)).unwrap();
+    let (_, pushed) = s
+        .record(input(Outcome::Accepted, Dimension::Search))
+        .unwrap();
     assert!(!pushed && s.pending());
     assert!(s.sync().unwrap().contains("pending"));
     std::fs::rename(&gone, &f.bare).unwrap();
     let report = s.sync().unwrap();
     assert!(report.contains("pushed"), "{report}");
     assert!(!s.pending());
-    assert!(remote_files(&f, "main").iter().any(|p| p.starts_with("experiences/me/")));
+    assert!(remote_files(&f, "main")
+        .iter()
+        .any(|p| p.starts_with("experiences/me/")));
 }
 
 #[test]
 fn pseudonyms_are_stable_and_raw_values_stay_local() {
     let f = fx();
     let s = open(&f);
-    s.record(input(Outcome::Accepted, Dimension::Search)).unwrap();
-    s.record(input(Outcome::Accepted, Dimension::Search)).unwrap();
+    s.record(input(Outcome::Accepted, Dimension::Search))
+        .unwrap();
+    s.record(input(Outcome::Accepted, Dimension::Search))
+        .unwrap();
     let clone = f.peer.parent().unwrap().join("check");
-    sh(f.peer.parent().unwrap(), &["clone", "-q", &f.bare.to_string_lossy(), &clone.to_string_lossy()]);
+    sh(
+        f.peer.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            &f.bare.to_string_lossy(),
+            &clone.to_string_lossy(),
+        ],
+    );
     let file = DataDir::experience_files(&clone).unwrap().remove(0);
     let events = read_events(&file).unwrap();
     assert_eq!(events.len(), 2);
@@ -172,7 +251,11 @@ fn record_experience_validation() {
     let s = open(&f);
     let mut seed = input(Outcome::Seed, Dimension::WriteCode);
     seed.seed_value = Some(0.9);
-    assert!(s.record(seed.clone()).unwrap_err().to_string().contains("only allowed for search and inventory"));
+    assert!(s
+        .record(seed.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("only allowed for search and inventory"));
     seed.dimension = Dimension::Decisions;
     assert!(s.record(seed.clone()).is_err());
     seed.dimension = Dimension::Search;
@@ -180,7 +263,9 @@ fn record_experience_validation() {
     assert!(s.record(seed.clone()).is_err());
     seed.seed_value = Some(0.55);
     assert!(s.record(seed).is_ok());
-    assert!(s.record(input(Outcome::Blocked, Dimension::WriteCode)).is_err());
+    assert!(s
+        .record(input(Outcome::Blocked, Dimension::WriteCode))
+        .is_err());
     let mut unknown = input(Outcome::Note, Dimension::Search);
     unknown.model_id = "nope".into();
     assert!(s.record(unknown).is_err());
@@ -190,18 +275,30 @@ fn record_experience_validation() {
 fn hmac_matches_rfc4231() {
     let mac = agent_sidekick::data::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
     let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    assert_eq!(
+        hex,
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
 }
 
 #[test]
 fn pushed_copy_of_a_private_block_reason_has_no_file_paths() {
     use agent_sidekick::data::shared_copy;
-    let mut e = Event::new("0123456789abcdef", Dimension::WriteCode, Scope::Global, Outcome::Blocked, 1);
+    let mut e = Event::new(
+        "0123456789abcdef",
+        Dimension::WriteCode,
+        Scope::Global,
+        Outcome::Blocked,
+        1,
+    );
     e.visibility = Visibility::Private;
     let full = "protected path src/secret/validate.rs (matches **/validate*); removed protected term `decided_by` in src/secret/a.rs; 20 changed lines exceed limit 10";
     e.block_reason = Some(full.into());
     let pushed = shared_copy(&e, None);
-    assert_eq!(pushed.block_reason.as_deref(), Some("protected path; removed term decided_by; 20 changed lines exceed limit 10"));
+    assert_eq!(
+        pushed.block_reason.as_deref(),
+        Some("protected path; removed term decided_by; 20 changed lines exceed limit 10")
+    );
     assert_eq!(e.block_reason.as_deref(), Some(full));
     e.visibility = Visibility::Shared;
     assert_eq!(shared_copy(&e, None).block_reason.as_deref(), Some(full));
@@ -210,7 +307,34 @@ fn pushed_copy_of_a_private_block_reason_has_no_file_paths() {
 #[test]
 fn repo_slug_becomes_github_url_and_paths_stay() {
     use agent_sidekick::sync::remote_url;
-    assert_eq!(remote_url("AAPPHH/sidekick-data"), "https://github.com/AAPPHH/sidekick-data.git");
+    assert_eq!(
+        remote_url("AAPPHH/sidekick-data"),
+        "https://github.com/AAPPHH/sidekick-data.git"
+    );
     assert_eq!(remote_url("/tmp/x/remote.git"), "/tmp/x/remote.git");
-    assert_eq!(remote_url("https://example.com/a/b.git"), "https://example.com/a/b.git");
+    assert_eq!(
+        remote_url("https://example.com/a/b.git"),
+        "https://example.com/a/b.git"
+    );
+}
+
+#[test]
+fn data_commits_carry_the_sidekick_identity_even_without_any_git_identity() {
+    let f = fx();
+    let empty = f._dir.path().join("empty.gitconfig");
+    std::fs::write(&empty, "").unwrap();
+    std::env::set_var("GIT_CONFIG_GLOBAL", &empty);
+    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    std::env::set_var("GIT_CONFIG_COUNT", "1");
+    std::env::set_var("GIT_CONFIG_KEY_0", "user.useConfigOnly");
+    std::env::set_var("GIT_CONFIG_VALUE_0", "true");
+    let s = open(&f);
+    let (_, pushed) = s
+        .record(input(Outcome::Accepted, Dimension::WriteCode))
+        .unwrap();
+    assert!(pushed);
+    assert_eq!(
+        sh(&f.bare, &["log", "-1", "--format=%an <%ae>", "main"]).trim(),
+        "agent-sidekick <me@agent-sidekick.invalid>"
+    );
 }

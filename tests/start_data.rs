@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use agent_sidekick::backends::{Backend, BackendKind, Cost, OpencodeProvider};
-use agent_sidekick::data::{pseudonym, read_events, write_events, DataDir, ModelRow, Profile, ProtectedRow};
+use agent_sidekick::data::{
+    pseudonym, read_events, write_events, DataDir, ModelRow, Profile, ProtectedRow,
+};
 use agent_sidekick::dispatch::{technical_sperre, Identity};
 use agent_sidekick::trust::{Dimension, Event, Outcome, Scope};
 
@@ -13,7 +15,7 @@ fn backend(kind: BackendKind) -> Backend {
     Backend {
         name: "b".into(),
         description: "t".into(),
-            account: None,
+        account: None,
         cost: Cost::Free,
         is_default: false,
         max_concurrent: None,
@@ -28,7 +30,10 @@ fn backend(kind: BackendKind) -> Backend {
 }
 
 fn claude() -> Backend {
-    backend(BackendKind::ClaudeOauth { config_dir: PathBuf::from("/cfg"), permissions: Default::default() })
+    backend(BackendKind::ClaudeOauth {
+        config_dir: PathBuf::from("/cfg"),
+        permissions: Default::default(),
+    })
 }
 
 fn dgx() -> Backend {
@@ -61,7 +66,14 @@ fn groq() -> Backend {
     openai_compatible("https://api.groq.com/openai/v1")
 }
 
-fn row(b: &Backend, model: &str, cost: &str, max_steps: i64, context_tokens: Option<i64>, budget: i64) -> ModelRow {
+fn row(
+    b: &Backend,
+    model: &str,
+    cost: &str,
+    max_steps: i64,
+    context_tokens: Option<i64>,
+    budget: i64,
+) -> ModelRow {
     ModelRow {
         key: Identity::default().key(b, Some(model)),
         context_tokens,
@@ -78,28 +90,107 @@ fn row(b: &Backend, model: &str, cost: &str, max_steps: i64, context_tokens: Opt
 fn models() -> Vec<ModelRow> {
     vec![
         row(&dgx(), QWEN, "shared-dgx", 80, Some(262_144), 64_000),
-        row(&claude(), "claude-sonnet-5-5", "quota", 100, Some(1_000_000), 150_000),
-        row(&claude(), "claude-opus-5-5", "quota", 100, Some(1_000_000), 150_000),
-        row(&kiconnect(), "openai-gpt-oss-120b", "free", 40, Some(131_072), 64_000),
-        row(&kiconnect(), "qwen-qwen3-8-27b", "free", 40, Some(131_072), 64_000),
-        row(&groq(), "openai/gpt-oss-120b", "free", 20, Some(131_072), 16_000),
-        row(&groq(), "qwen/qwen3.8-27b", "free", 20, Some(131_072), 16_000),
-        row(&groq(), "openai/gpt-oss-20b", "free", 20, Some(131_072), 16_000),
-        row(&claude(), "claude-haiku-5-5", "quota", 100, Some(1_000_000), 150_000),
-        row(&claude(), "claude-fable-5-1", "quota", 100, Some(1_000_000), 150_000),
+        row(
+            &claude(),
+            "claude-sonnet-5-5",
+            "quota",
+            100,
+            Some(1_000_000),
+            150_000,
+        ),
+        row(
+            &claude(),
+            "claude-opus-5-5",
+            "quota",
+            100,
+            Some(1_000_000),
+            150_000,
+        ),
+        row(
+            &kiconnect(),
+            "openai-gpt-oss-120b",
+            "free",
+            40,
+            Some(131_072),
+            64_000,
+        ),
+        row(
+            &kiconnect(),
+            "qwen-qwen3-8-27b",
+            "free",
+            40,
+            Some(131_072),
+            64_000,
+        ),
+        row(
+            &groq(),
+            "openai/gpt-oss-120b",
+            "free",
+            20,
+            Some(131_072),
+            16_000,
+        ),
+        row(
+            &groq(),
+            "qwen/qwen3.8-27b",
+            "free",
+            20,
+            Some(131_072),
+            16_000,
+        ),
+        row(
+            &groq(),
+            "openai/gpt-oss-20b",
+            "free",
+            20,
+            Some(131_072),
+            16_000,
+        ),
+        row(
+            &claude(),
+            "claude-haiku-5-5",
+            "quota",
+            100,
+            Some(1_000_000),
+            150_000,
+        ),
+        row(
+            &claude(),
+            "claude-fable-5-1",
+            "quota",
+            100,
+            Some(1_000_000),
+            150_000,
+        ),
     ]
 }
 
 fn load_profiles(path: &Path) -> HashMap<String, Profile> {
     let table: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
-    let default_as_of = table.get("defaults").and_then(|d| d.get("profile_as_of")).and_then(|v| v.as_str()).map(String::from);
+    let default_as_of = table
+        .get("defaults")
+        .and_then(|d| d.get("profile_as_of"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let rows = models();
     let mut out = HashMap::new();
-    for entry in table.get("profile").and_then(|p| p.as_array()).into_iter().flatten() {
+    for entry in table
+        .get("profile")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+    {
         let text = |k: &str| entry.get(k).and_then(|v| v.as_str()).map(String::from);
-        let (provider, model) = (text("provider").expect("profile.provider"), text("model").expect("profile.model"));
-        let found = rows.iter().find(|r| r.key.provider == provider && r.key.model == model);
-        let id = found.unwrap_or_else(|| panic!("profile {provider}/{model} matches no registry row")).model_id();
+        let (provider, model) = (
+            text("provider").expect("profile.provider"),
+            text("model").expect("profile.model"),
+        );
+        let found = rows
+            .iter()
+            .find(|r| r.key.provider == provider && r.key.model == model);
+        let id = found
+            .unwrap_or_else(|| panic!("profile {provider}/{model} matches no registry row"))
+            .model_id();
         let profile = Profile {
             strengths: text("strengths"),
             weaknesses: text("weaknesses"),
@@ -110,7 +201,10 @@ fn load_profiles(path: &Path) -> HashMap<String, Profile> {
             profile_as_of: text("profile_as_of").or_else(|| default_as_of.clone()),
             prompting: text("prompting"),
         };
-        assert!(out.insert(id, profile).is_none(), "duplicate profile {provider}/{model}");
+        assert!(
+            out.insert(id, profile).is_none(),
+            "duplicate profile {provider}/{model}"
+        );
     }
     out
 }
@@ -142,14 +236,27 @@ fn write_start_data(data: &Path, profiles: &HashMap<String, Profile>) {
     ProtectedRow::write_all(&data.join("protected.parquet"), &ProtectedRow::defaults()).unwrap();
     let qwen_id = models()[0].model_id();
     let existing = DataDir::experience_files(data).unwrap();
-    let path = existing.first().cloned().unwrap_or_else(|| data.join(format!("experiences/aapphh/{}.parquet", uuid::Uuid::new_v4())));
-    let old = if path.exists() { read_events(&path).unwrap() } else { Vec::new() };
+    let path = existing.first().cloned().unwrap_or_else(|| {
+        data.join(format!(
+            "experiences/aapphh/{}.parquet",
+            uuid::Uuid::new_v4()
+        ))
+    });
+    let old = if path.exists() {
+        read_events(&path).unwrap()
+    } else {
+        Vec::new()
+    };
     let mut fresh = events(&qwen_id);
     for (e, o) in fresh.iter_mut().zip(&old) {
         e.event_id = o.event_id.clone();
     }
     write_events(&path, &fresh).unwrap();
-    std::fs::write(data.join("peers.toml"), "owners = [\"AAPPHH\"]\naapphh = \"AAPPHH\"\n").unwrap();
+    std::fs::write(
+        data.join("peers.toml"),
+        "owners = [\"AAPPHH\"]\naapphh = \"AAPPHH\"\n",
+    )
+    .unwrap();
 }
 
 fn sample() -> PathBuf {
@@ -166,27 +273,48 @@ fn generated() -> (tempfile::TempDir, PathBuf) {
 #[test]
 #[ignore]
 fn generate_start_data() {
-    let profiles = std::env::var("SIDEKICK_PROFILES").map(|p| load_profiles(Path::new(&p))).unwrap_or_default();
-    write_start_data(&PathBuf::from(std::env::var("SIDEKICK_DATA_OUT").unwrap()), &profiles);
+    let profiles = std::env::var("SIDEKICK_PROFILES")
+        .map(|p| load_profiles(Path::new(&p)))
+        .unwrap_or_default();
+    write_start_data(
+        &PathBuf::from(std::env::var("SIDEKICK_DATA_OUT").unwrap()),
+        &profiles,
+    );
 }
 
 #[test]
 fn generated_start_data_matches_dispatch_identity() {
     let (_dir, root) = generated();
     let data = DataDir::new(root);
-    let ids: Vec<String> = data.models().unwrap().iter().map(ModelRow::model_id).collect();
+    let ids: Vec<String> = data
+        .models()
+        .unwrap()
+        .iter()
+        .map(ModelRow::model_id)
+        .collect();
     let expected: Vec<String> = models().iter().map(ModelRow::model_id).collect();
     assert_eq!(ids, expected);
     assert_eq!(data.protected().unwrap(), ProtectedRow::defaults());
     let now = chrono::Utc::now().timestamp_millis();
-    let sb = data.steckbrief(&expected[0], &Scope::Global, None, now).unwrap();
+    let sb = data
+        .steckbrief(&expected[0], &Scope::Global, None, now)
+        .unwrap();
     let trust = |d| sb.rows.iter().find(|r| r.dimension == d).unwrap().trust;
     assert!((trust(Dimension::Search) - 0.55).abs() < 1e-9);
     assert!((trust(Dimension::Inventory) - 0.35).abs() < 1e-9);
     assert!((trust(Dimension::WriteCode) - 0.10).abs() < 1e-9);
     assert!(!sb.write_right_code && !sb.decisions_right);
-    assert!(data.steckbrief(&expected[2], &Scope::Global, None, now).unwrap().gold);
-    assert!(!data.steckbrief(&expected[1], &Scope::Global, None, now).unwrap().gold);
+    assert!(
+        data.steckbrief(&expected[2], &Scope::Global, None, now)
+            .unwrap()
+            .gold
+    );
+    assert!(
+        !data
+            .steckbrief(&expected[1], &Scope::Global, None, now)
+            .unwrap()
+            .gold
+    );
 }
 
 #[test]
@@ -194,7 +322,9 @@ fn generated_registry_context_and_cost_match_cli_and_config() {
     let (_dir, root) = generated();
     for m in DataDir::new(root).models().unwrap() {
         match m.key.model.as_str() {
-            "claude-sonnet-5-5" | "claude-opus-5-5" | "claude-haiku-5-5" => assert_eq!(m.context_tokens, Some(1_000_000)),
+            "claude-sonnet-5-5" | "claude-opus-5-5" | "claude-haiku-5-5" => {
+                assert_eq!(m.context_tokens, Some(1_000_000))
+            }
             "openai-gpt-oss-120b" | "qwen-qwen3-8-27b" => assert_eq!(m.cost, "free"),
             _ => {}
         }
@@ -207,7 +337,10 @@ fn generated_incident_event_is_plain_and_peers_name_owners() {
     let files = DataDir::experience_files(&data).unwrap();
     assert_eq!(files.len(), 1);
     let events = read_events(&files[0]).unwrap();
-    let incident = events.iter().find(|e| e.outcome == Outcome::Blocked).unwrap();
+    let incident = events
+        .iter()
+        .find(|e| e.outcome == Outcome::Blocked)
+        .unwrap();
     assert_eq!(
         incident.summary.as_deref(),
         Some("Qwen3-Coder-Next hat bei einer Code-Aufgabe eine Validierung entfernt, damit der eigene Test durchgeht.")
@@ -252,12 +385,36 @@ fn sample_profiles_attach_to_rows_and_do_not_change_trust() {
     let now = chrono::Utc::now().timestamp_millis();
     let (with, plain) = (DataDir::new(with_root), DataDir::new(plain_dir.path()));
     let id = models()[0].model_id();
-    let (a, b) = (with.steckbrief(&id, &Scope::Global, None, now).unwrap(), plain.steckbrief(&id, &Scope::Global, None, now).unwrap());
-    let values = |sb: &agent_sidekick::data::Steckbrief| sb.rows.iter().map(|r| (r.dimension, r.trust.to_bits(), r.pruefanteil.to_bits())).collect::<Vec<_>>();
+    let (a, b) = (
+        with.steckbrief(&id, &Scope::Global, None, now).unwrap(),
+        plain.steckbrief(&id, &Scope::Global, None, now).unwrap(),
+    );
+    let values = |sb: &agent_sidekick::data::Steckbrief| {
+        sb.rows
+            .iter()
+            .map(|r| (r.dimension, r.trust.to_bits(), r.pruefanteil.to_bits()))
+            .collect::<Vec<_>>()
+    };
     assert_eq!(values(&a), values(&b));
-    assert_eq!((a.write_right_code, a.decisions_right), (b.write_right_code, b.decisions_right));
-    assert!(a.render().contains("Profil (öffentliche Daten, Stand 2026-01-01; kein Einfluss auf Vertrauen)"));
+    assert_eq!(
+        (a.write_right_code, a.decisions_right),
+        (b.write_right_code, b.decisions_right)
+    );
+    assert!(a
+        .render()
+        .contains("Profil (öffentliche Daten, Stand 2026-01-01; kein Einfluss auf Vertrauen)"));
     assert!(a.render().contains("Platzhalter Stärken") && !b.render().contains("Profil"));
-    assert_eq!(with.profiles().unwrap().values().filter(|p| **p != Profile::default()).count(), 2);
-    assert!(plain.profiles().unwrap().values().all(|p| *p == Profile::default()));
+    assert_eq!(
+        with.profiles()
+            .unwrap()
+            .values()
+            .filter(|p| **p != Profile::default())
+            .count(),
+        2
+    );
+    assert!(plain
+        .profiles()
+        .unwrap()
+        .values()
+        .all(|p| *p == Profile::default()));
 }

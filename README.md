@@ -222,6 +222,10 @@ Seit Version 0.5.0 liest agent-sidekick die `config.toml` beim nächsten Aufruf 
 
 Für registrierte Modelle läuft `sidekick_run` über den Dispatch-Pfad (dann mit `dimension`); Urteile gehen über `sidekick_record_experience` mit `job_id`. Neben `sidekick_run` gibt es `sidekick_steckbrief`, `sidekick_dispatch`, `sidekick_record_experience`, `sidekick_query` und `sidekick_sync`. Erfahrungsdaten liegen im privaten Repo `AAPPHH/sidekick-data`; `data_repo` (`owner/name`, volle Git-URL oder lokaler Pfad) und `data_name` in der `config.toml` legen Repo und Präfix fest (ohne `data_name` wird nichts gepusht). Nutzer- und Maschinen-IDs werden vor dem Push pseudonymisiert. Details: [docs/REFERENCE.md](docs/REFERENCE.md#trust-tools).
 
+### Rückfragen und Workflows
+
+Jeder Dispatch-Worker kann dem Steuermodell über das Werkzeug `ask_orchestrator` eine Rückfrage stellen. Der wartende `sidekick_dispatch`/`sidekick_run`-Aufruf kehrt dann sofort mit Status `question` und der `job_id` zurück; mit `sidekick_answer(job_id, answer, question_id)` antwortest du und bekommst das nächste Ereignis des Jobs (weitere Frage oder Ergebnis). Die Wartezeit zählt nicht zum `timeout_s`; ohne Antwort nach 30 Minuten bekommt der Worker die Anweisung, seinen Stand abzuliefern. Aufgaben, die mehrere Dimensionen mischen, gibst du mit `sidekick_workflow` als Schritte mit Abhängigkeiten ab; Schreibschritte landen auf einem gemeinsamen Branch, ins Arbeitsverzeichnis wird nie angewendet, du bekommst Branch und kombinierten Patch. Details: [docs/REFERENCE.md](docs/REFERENCE.md#questions-and-workflows).
+
 ### Der KI:connect-Schlüssel ist abgelaufen
 
 Erzeuge im KI:connect-Webinterface unter **API Key Management** mit **Rotate** einen neuen Schlüssel und speichere ihn mit `agent-sidekick setup --backend kiconnect` (siehe [KI:connect-API-Schlüssel erzeugen](#kiconnect-api-schlüssel-erzeugen)).

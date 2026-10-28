@@ -222,8 +222,12 @@ pub fn oauth_profile_account(token: &str) -> Result<String, String> {
     if status != 200 {
         return Err(format!("profile endpoint answered HTTP {status}"));
     }
-    let body = resp.body_mut().read_to_string().map_err(|e| format!("profile unreadable: {e}"))?;
-    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("profile unreadable: {e}"))?;
+    let body = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("profile unreadable: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("profile unreadable: {e}"))?;
     json.pointer("/account/email")
         .or_else(|| json.pointer("/account/email_address"))
         .and_then(|v| v.as_str())
@@ -233,15 +237,19 @@ pub fn oauth_profile_account(token: &str) -> Result<String, String> {
 
 pub fn detect_account(backend: &Backend) -> Result<String, String> {
     match &backend.kind {
-        BackendKind::ClaudeOauth { config_dir, .. } => match super::claude_account(Some(config_dir.clone())) {
-            Some(email) => Ok(email),
-            None => match load_credential(backend)? {
-                (Credential::OauthToken(t), _) => oauth_profile_account(t.expose()),
-                _ => Err("no OAuth token".to_owned()),
-            },
-        },
-        BackendKind::Codex { base_dir, .. } => super::codex_account(&base_dir.join(crate::harness::codex::AUTH_FILE))
-            .ok_or_else(|| "no e-mail in the Codex login".to_owned()),
+        BackendKind::ClaudeOauth { config_dir, .. } => {
+            match super::claude_account(Some(config_dir.clone())) {
+                Some(email) => Ok(email),
+                None => match load_credential(backend)? {
+                    (Credential::OauthToken(t), _) => oauth_profile_account(t.expose()),
+                    _ => Err("no OAuth token".to_owned()),
+                },
+            }
+        }
+        BackendKind::Codex { base_dir, .. } => {
+            super::codex_account(&base_dir.join(crate::harness::codex::AUTH_FILE))
+                .ok_or_else(|| "no e-mail in the Codex login".to_owned())
+        }
         _ => Err("no account to detect".to_owned()),
     }
 }

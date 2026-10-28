@@ -8,7 +8,7 @@ fn opencode(provider: OpencodeProvider, base_url: Option<&str>) -> Backend {
     Backend {
         name: "b".into(),
         description: "t".into(),
-            account: None,
+        account: None,
         cost: Cost::Free,
         is_default: false,
         max_concurrent: None,
@@ -38,14 +38,32 @@ fn provider_of(b: &Backend) -> String {
 
 #[test]
 fn openai_compatible_opencode_uses_base_url_host() {
-    let kic = opencode(OpencodeProvider::OpenaiCompatible, Some("https://chat.kiconnect.nrw/api/v1"));
-    let groq = opencode(OpencodeProvider::OpenaiCompatible, Some("https://api.groq.com/openai/v1"));
-    let dgx = opencode(OpencodeProvider::OpenaiCompatible, Some("http://dgx.mv.intern.hs-duesseldorf.de:18080/v1"));
+    let kic = opencode(
+        OpencodeProvider::OpenaiCompatible,
+        Some("https://chat.kiconnect.nrw/api/v1"),
+    );
+    let groq = opencode(
+        OpencodeProvider::OpenaiCompatible,
+        Some("https://api.groq.com/openai/v1"),
+    );
+    let dgx = opencode(
+        OpencodeProvider::OpenaiCompatible,
+        Some("http://dgx.mv.intern.hs-duesseldorf.de:18080/v1"),
+    );
     assert_eq!(provider_of(&kic), "chat.kiconnect.nrw");
     assert_eq!(provider_of(&groq), "api.groq.com");
     assert_eq!(provider_of(&dgx), "dgx.mv.intern.hs-duesseldorf.de");
-    assert_eq!(provider_of(&opencode(OpencodeProvider::Ollama, Some("http://localhost:11434"))), "ollama");
-    assert_eq!(provider_of(&opencode(OpencodeProvider::Openrouter, None)), "openrouter");
+    assert_eq!(
+        provider_of(&opencode(
+            OpencodeProvider::Ollama,
+            Some("http://localhost:11434")
+        )),
+        "ollama"
+    );
+    assert_eq!(
+        provider_of(&opencode(OpencodeProvider::Openrouter, None)),
+        "openrouter"
+    );
 }
 
 #[test]

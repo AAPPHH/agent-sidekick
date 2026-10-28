@@ -644,11 +644,21 @@ fn run_step(step: &Step, backends: &Backends, token_stdin: bool, single: bool) -
     Ok(())
 }
 
-fn account_answer(input: &str, default: Option<&str>, required: bool) -> Result<Option<String>, String> {
+fn account_answer(
+    input: &str,
+    default: Option<&str>,
+    required: bool,
+) -> Result<Option<String>, String> {
     let input = input.trim();
-    let value = if input.is_empty() { default.unwrap_or("") } else { input };
+    let value = if input.is_empty() {
+        default.unwrap_or("")
+    } else {
+        input
+    };
     match value {
-        "" if required => Err("this backend is bound to an account: enter its e-mail address".to_owned()),
+        "" if required => {
+            Err("this backend is bound to an account: enter its e-mail address".to_owned())
+        }
         "" => Ok(None),
         v if v.contains('@') && !v.contains(char::is_whitespace) => Ok(Some(v.to_owned())),
         _ => Err("not an e-mail address".to_owned()),
@@ -656,8 +666,11 @@ fn account_answer(input: &str, default: Option<&str>, required: bool) -> Result<
 }
 
 pub(crate) fn store_account(config: &Path, name: &str, email: &str) -> Result<()> {
-    let text = std::fs::read_to_string(config).with_context(|| format!("reading {}", config.display()))?;
-    let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("parsing {}", config.display()))?;
+    let text =
+        std::fs::read_to_string(config).with_context(|| format!("reading {}", config.display()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", config.display()))?;
     let table = doc
         .get_mut("backends")
         .and_then(|b| b.as_table_like_mut())
@@ -684,7 +697,10 @@ fn ask_account(name: &str, backends: &Backends, token_stdin: bool, single: bool)
         }
         return Ok(());
     }
-    let default = backend.account.clone().or_else(|| backends::detect_account(backend).ok());
+    let default = backend
+        .account
+        .clone()
+        .or_else(|| backends::detect_account(backend).ok());
     let hint = match (&default, bound) {
         (Some(d), _) => format!(" [{d}]"),
         (None, true) => " (required)".to_owned(),
@@ -694,7 +710,9 @@ fn ask_account(name: &str, backends: &Backends, token_stdin: bool, single: bool)
         print!("Account e-mail of backend `{name}`{hint}: ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).context("reading the account")?;
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading the account")?;
         match account_answer(&line, default.as_deref(), bound) {
             Ok(v) => break v,
             Err(e) => println!("{e}"),
@@ -1154,8 +1172,14 @@ mod tests {
 
     #[test]
     fn account_answers() {
-        assert_eq!(account_answer("", Some("a@x.com"), true), Ok(Some("a@x.com".to_owned())));
-        assert_eq!(account_answer(" b@x.com ", Some("a@x.com"), true), Ok(Some("b@x.com".to_owned())));
+        assert_eq!(
+            account_answer("", Some("a@x.com"), true),
+            Ok(Some("a@x.com".to_owned()))
+        );
+        assert_eq!(
+            account_answer(" b@x.com ", Some("a@x.com"), true),
+            Ok(Some("b@x.com".to_owned()))
+        );
         assert_eq!(account_answer("", None, false), Ok(None));
         assert!(account_answer("", None, true).is_err());
         assert!(account_answer("nope", None, false).is_err());
@@ -1165,10 +1189,14 @@ mod tests {
     fn account_is_written_into_the_backend_section_keeping_comments() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("config.toml");
-        std::fs::write(&f, "# top
+        std::fs::write(
+            &f,
+            "# top
 [backends.a]
 type = \"claude-oauth\"  # kept
-description = \"d\"\n[backends.b]\ndescription = \"e\"\n").unwrap();
+description = \"d\"\n[backends.b]\ndescription = \"e\"\n",
+        )
+        .unwrap();
         store_account(&f, "a", "me@x.com").unwrap();
         let t = std::fs::read_to_string(&f).unwrap();
         assert!(t.contains("# top") && t.contains("# kept"), "{t}");

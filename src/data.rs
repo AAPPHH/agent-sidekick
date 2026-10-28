@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    Array, ArrayRef, AsArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMillisecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit, TimestampMillisecondType};
 use arrow::util::pretty::pretty_format_batches;
@@ -14,12 +15,12 @@ use datafusion::execution::context::SQLOptions;
 use datafusion::prelude::SessionContext;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use parquet::file::metadata::KeyValue;
+use parquet::file::properties::WriterProperties;
 
 use crate::trust::{
-    DECISIONS_RIGHT_MIN, WRITE_RIGHT_MIN,
-    dedup_sorted, Counters, Dimension, Event, LastBlock, ModelKey, Outcome, Scope, Sperre, Standing, Visibility,
+    dedup_sorted, Counters, Dimension, Event, LastBlock, ModelKey, Outcome, Scope, Sperre,
+    Standing, Visibility, DECISIONS_RIGHT_MIN, WRITE_RIGHT_MIN,
 };
 
 pub const SCHEMA_VERSION: i32 = 1;
@@ -33,7 +34,10 @@ const EPSILON: f64 = 1e-9;
 const WRITE_FREE_MIN: f64 = 0.85;
 
 fn version_error(path: &Path, found: &str) -> anyhow::Error {
-    anyhow!("{}: unsupported schema_version `{found}` (this build reads {READ_VERSIONS:?})", path.display())
+    anyhow!(
+        "{}: unsupported schema_version `{found}` (this build reads {READ_VERSIONS:?})",
+        path.display()
+    )
 }
 
 fn ts_type() -> DataType {
@@ -41,11 +45,20 @@ fn ts_type() -> DataType {
 }
 
 fn schema_of(fields: &[(&str, DataType, bool)]) -> SchemaRef {
-    Arc::new(Schema::new(fields.iter().map(|(n, t, nullable)| Field::new(*n, t.clone(), *nullable)).collect::<Vec<_>>()))
+    Arc::new(Schema::new(
+        fields
+            .iter()
+            .map(|(n, t, nullable)| Field::new(*n, t.clone(), *nullable))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 fn strs<T: Into<String>>(v: impl IntoIterator<Item = Option<T>>) -> ArrayRef {
-    Arc::new(StringArray::from(v.into_iter().map(|s| s.map(Into::into)).collect::<Vec<Option<String>>>()))
+    Arc::new(StringArray::from(
+        v.into_iter()
+            .map(|s| s.map(Into::into))
+            .collect::<Vec<Option<String>>>(),
+    ))
 }
 
 fn ts_array(v: Vec<i64>) -> ArrayRef {
@@ -58,7 +71,10 @@ fn write_batch(path: &Path, batch: &RecordBatch, version: i32) -> Result<()> {
     }
     let tmp = path.with_extension("parquet.tmp");
     let props = WriterProperties::builder()
-        .set_key_value_metadata(Some(vec![KeyValue::new(VERSION_KEY.to_string(), version.to_string())]))
+        .set_key_value_metadata(Some(vec![KeyValue::new(
+            VERSION_KEY.to_string(),
+            version.to_string(),
+        )]))
         .build();
     let file = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
@@ -70,7 +86,8 @@ fn write_batch(path: &Path, batch: &RecordBatch, version: i32) -> Result<()> {
 
 fn read_batches(path: &Path) -> Result<Vec<RecordBatch>> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).with_context(|| format!("read {}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("read {}", path.display()))?;
     let found = builder
         .metadata()
         .file_metadata()
@@ -86,7 +103,10 @@ fn read_batches(path: &Path) -> Result<Vec<RecordBatch>> {
 
 pub fn read_schema(path: &Path) -> Result<SchemaRef> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    Ok(ParquetRecordBatchReaderBuilder::try_new(file).with_context(|| format!("read {}", path.display()))?.schema().clone())
+    Ok(ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("read {}", path.display()))?
+        .schema()
+        .clone())
 }
 
 struct Row<'a> {
@@ -96,23 +116,32 @@ struct Row<'a> {
 
 impl Row<'_> {
     fn col(&self, name: &str) -> Option<&ArrayRef> {
-        self.batch.column_by_name(name).filter(|c| !c.is_null(self.i))
+        self.batch
+            .column_by_name(name)
+            .filter(|c| !c.is_null(self.i))
     }
 
     fn str(&self, name: &str) -> Option<String> {
-        self.col(name).and_then(|c| c.as_string_opt::<i32>()).map(|a| a.value(self.i).to_string())
+        self.col(name)
+            .and_then(|c| c.as_string_opt::<i32>())
+            .map(|a| a.value(self.i).to_string())
     }
 
     fn req(&self, name: &str) -> Result<String> {
-        self.str(name).ok_or_else(|| anyhow!("row {}: missing `{name}`", self.i))
+        self.str(name)
+            .ok_or_else(|| anyhow!("row {}: missing `{name}`", self.i))
     }
 
     fn f64(&self, name: &str) -> Option<f64> {
-        self.col(name).and_then(|c| c.as_primitive_opt::<arrow::datatypes::Float64Type>()).map(|a| a.value(self.i))
+        self.col(name)
+            .and_then(|c| c.as_primitive_opt::<arrow::datatypes::Float64Type>())
+            .map(|a| a.value(self.i))
     }
 
     fn i64(&self, name: &str) -> Option<i64> {
-        self.col(name).and_then(|c| c.as_primitive_opt::<arrow::datatypes::Int64Type>()).map(|a| a.value(self.i))
+        self.col(name)
+            .and_then(|c| c.as_primitive_opt::<arrow::datatypes::Int64Type>())
+            .map(|a| a.value(self.i))
     }
 
     fn ts(&self, name: &str) -> Result<i64> {
@@ -123,7 +152,10 @@ impl Row<'_> {
     }
 
     fn version(&self) -> Result<()> {
-        let v = self.col(VERSION_KEY).and_then(|c| c.as_primitive_opt::<arrow::datatypes::Int32Type>()).map(|a| a.value(self.i));
+        let v = self
+            .col(VERSION_KEY)
+            .and_then(|c| c.as_primitive_opt::<arrow::datatypes::Int32Type>())
+            .map(|a| a.value(self.i));
         match v {
             Some(v) if READ_VERSIONS.contains(&v) => Ok(()),
             other => bail!("row {}: unsupported schema_version {other:?}", self.i),
@@ -132,7 +164,9 @@ impl Row<'_> {
 }
 
 fn rows(batches: &[RecordBatch]) -> impl Iterator<Item = Row<'_>> {
-    batches.iter().flat_map(|batch| (0..batch.num_rows()).map(move |i| Row { batch, i }))
+    batches
+        .iter()
+        .flat_map(|batch| (0..batch.num_rows()).map(move |i| Row { batch, i }))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -161,15 +195,43 @@ pub struct Profile {
 }
 
 impl Profile {
-    pub const COLUMNS: [&'static str; 8] = ["strengths", "weaknesses", "task_scope", "dims_prior", "benchmarks", "sources", "profile_as_of", "prompting"];
+    pub const COLUMNS: [&'static str; 8] = [
+        "strengths",
+        "weaknesses",
+        "task_scope",
+        "dims_prior",
+        "benchmarks",
+        "sources",
+        "profile_as_of",
+        "prompting",
+    ];
 
     pub fn fields(&self) -> [&Option<String>; 8] {
-        [&self.strengths, &self.weaknesses, &self.task_scope, &self.dims_prior, &self.benchmarks, &self.sources, &self.profile_as_of, &self.prompting]
+        [
+            &self.strengths,
+            &self.weaknesses,
+            &self.task_scope,
+            &self.dims_prior,
+            &self.benchmarks,
+            &self.sources,
+            &self.profile_as_of,
+            &self.prompting,
+        ]
     }
 
     fn read(r: &Row) -> Self {
-        let [strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of, prompting] = Self::COLUMNS.map(|c| r.str(c));
-        Self { strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of, prompting }
+        let [strengths, weaknesses, task_scope, dims_prior, benchmarks, sources, profile_as_of, prompting] =
+            Self::COLUMNS.map(|c| r.str(c));
+        Self {
+            strengths,
+            weaknesses,
+            task_scope,
+            dims_prior,
+            benchmarks,
+            sources,
+            profile_as_of,
+            prompting,
+        }
     }
 
     pub fn render(&self) -> String {
@@ -177,7 +239,10 @@ impl Profile {
             ("Stärken", &self.strengths),
             ("Schwächen", &self.weaknesses),
             ("Umfang", &self.task_scope),
-            ("Einschätzung je Dimension (abgeleitet aus öffentlichen Daten, nicht gemessen)", &self.dims_prior),
+            (
+                "Einschätzung je Dimension (abgeleitet aus öffentlichen Daten, nicht gemessen)",
+                &self.dims_prior,
+            ),
             ("Benchmarks", &self.benchmarks),
             ("Quellen", &self.sources),
             ("Formulierung", &self.prompting),
@@ -234,9 +299,14 @@ impl ModelRow {
         Self::to_batch_with(models, &HashMap::new())
     }
 
-    pub fn to_batch_with(models: &[ModelRow], profiles: &HashMap<String, Profile>) -> Result<RecordBatch> {
+    pub fn to_batch_with(
+        models: &[ModelRow],
+        profiles: &HashMap<String, Profile>,
+    ) -> Result<RecordBatch> {
         let s = |f: fn(&ModelRow) -> String| strs(models.iter().map(|m| Some(f(m))));
-        let i = |f: fn(&ModelRow) -> Option<i64>| -> ArrayRef { Arc::new(Int64Array::from(models.iter().map(f).collect::<Vec<_>>())) };
+        let i = |f: fn(&ModelRow) -> Option<i64>| -> ArrayRef {
+            Arc::new(Int64Array::from(models.iter().map(f).collect::<Vec<_>>()))
+        };
         let cols = vec![
             s(|m| m.model_id()),
             s(|m| m.key.provider.clone()),
@@ -255,32 +325,58 @@ impl ModelRow {
         ];
         let empty = Profile::default();
         let profile_cols = (0..Profile::COLUMNS.len()).map(|i| {
-            strs(models.iter().map(|m| profiles.get(&m.model_id()).unwrap_or(&empty).fields()[i].clone()))
+            strs(
+                models
+                    .iter()
+                    .map(|m| profiles.get(&m.model_id()).unwrap_or(&empty).fields()[i].clone()),
+            )
         });
-        Ok(RecordBatch::try_new(Self::schema(), cols.into_iter().chain(profile_cols).collect())?)
+        Ok(RecordBatch::try_new(
+            Self::schema(),
+            cols.into_iter().chain(profile_cols).collect(),
+        )?)
     }
 
     pub fn write_all(path: &Path, models: &[ModelRow]) -> Result<()> {
         Self::write_all_with(path, models, &HashMap::new())
     }
 
-    pub fn write_all_with(path: &Path, models: &[ModelRow], profiles: &HashMap<String, Profile>) -> Result<()> {
-        write_batch(path, &Self::to_batch_with(models, profiles)?, SCHEMA_VERSION)
+    pub fn write_all_with(
+        path: &Path,
+        models: &[ModelRow],
+        profiles: &HashMap<String, Profile>,
+    ) -> Result<()> {
+        write_batch(
+            path,
+            &Self::to_batch_with(models, profiles)?,
+            SCHEMA_VERSION,
+        )
     }
 
     pub fn read_profiles(path: &Path) -> Result<HashMap<String, Profile>> {
         let batches = read_batches(path)?;
-        rows(&batches).map(|r| Ok((r.req("model_id")?, Profile::read(&r)))).collect()
+        rows(&batches)
+            .map(|r| Ok((r.req("model_id")?, Profile::read(&r))))
+            .collect()
     }
 
     pub fn read_all(path: &Path) -> Result<Vec<ModelRow>> {
         let batches = read_batches(path)?;
         rows(&batches)
             .map(|r| {
-                let key = ModelKey::new(&r.req("provider")?, &r.req("model")?, &r.req("checkpoint")?, &r.req("quant")?, &r.req("harness")?);
+                let key = ModelKey::new(
+                    &r.req("provider")?,
+                    &r.req("model")?,
+                    &r.req("checkpoint")?,
+                    &r.req("quant")?,
+                    &r.req("harness")?,
+                );
                 let stored = r.req("model_id")?;
                 if stored != key.model_id() {
-                    bail!("{}: model_id {stored} does not match its quintuple", path.display());
+                    bail!(
+                        "{}: model_id {stored} does not match its quintuple",
+                        path.display()
+                    );
                 }
                 Ok(ModelRow {
                     key,
@@ -331,11 +427,21 @@ impl ProtectedRow {
     pub fn defaults() -> Vec<ProtectedRow> {
         let globs = ["tests/**", "spec/**", "**/validate*"].map(|v| (ProtectedKind::PathGlob, v));
         let terms = ["decided_by", "assert"].map(|v| (ProtectedKind::RemovedTerm, v));
-        globs.into_iter().chain(terms).map(|(kind, v)| ProtectedRow { kind, value: v.into() }).collect()
+        globs
+            .into_iter()
+            .chain(terms)
+            .map(|(kind, v)| ProtectedRow {
+                kind,
+                value: v.into(),
+            })
+            .collect()
     }
 
     pub fn schema() -> SchemaRef {
-        schema_of(&[("kind", DataType::Utf8, false), ("value", DataType::Utf8, false)])
+        schema_of(&[
+            ("kind", DataType::Utf8, false),
+            ("value", DataType::Utf8, false),
+        ])
     }
 
     pub fn to_batch(protected: &[ProtectedRow]) -> Result<RecordBatch> {
@@ -353,7 +459,12 @@ impl ProtectedRow {
     pub fn read_all(path: &Path) -> Result<Vec<ProtectedRow>> {
         let batches = read_batches(path)?;
         rows(&batches)
-            .map(|r| Ok(ProtectedRow { kind: ProtectedKind::parse(&r.req("kind")?)?, value: r.req("value")? }))
+            .map(|r| {
+                Ok(ProtectedRow {
+                    kind: ProtectedKind::parse(&r.req("kind")?)?,
+                    value: r.req("value")?,
+                })
+            })
             .collect()
     }
 }
@@ -380,6 +491,7 @@ pub fn experience_schema() -> SchemaRef {
         ("conclusion", DataType::Utf8, true),
         ("visibility", DataType::Utf8, false),
         (VERSION_KEY, DataType::Int32, false),
+        ("questions", DataType::Int64, true),
     ])
 }
 
@@ -404,17 +516,28 @@ pub fn events_to_batch(events: &[Event]) -> Result<RecordBatch> {
         s(|e| e.scope.to_string()),
         o(|e| e.repo.clone()),
         o(|e| e.job_id.clone()),
-        Arc::new(Int64Array::from(events.iter().map(|e| e.steps).collect::<Vec<_>>())),
-        Arc::new(Float64Array::from(events.iter().map(|e| e.duration_s).collect::<Vec<_>>())),
-        Arc::new(Float64Array::from(events.iter().map(|e| e.review_s).collect::<Vec<_>>())),
+        Arc::new(Int64Array::from(
+            events.iter().map(|e| e.steps).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            events.iter().map(|e| e.duration_s).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            events.iter().map(|e| e.review_s).collect::<Vec<_>>(),
+        )),
         s(|e| e.outcome.as_str().into()),
-        Arc::new(Float64Array::from(events.iter().map(|e| e.seed_value).collect::<Vec<_>>())),
+        Arc::new(Float64Array::from(
+            events.iter().map(|e| e.seed_value).collect::<Vec<_>>(),
+        )),
         o(|e| e.block_reason.clone()),
         o(|e| e.evidence_hash.clone()),
         o(|e| e.summary.clone()),
         o(|e| e.conclusion.clone()),
         s(|e| e.visibility.as_str().into()),
         Arc::new(Int32Array::from(vec![events_version(events); events.len()])),
+        Arc::new(Int64Array::from(
+            events.iter().map(|e| e.questions).collect::<Vec<_>>(),
+        )),
     ];
     Ok(RecordBatch::try_new(experience_schema(), cols)?)
 }
@@ -448,6 +571,7 @@ pub fn read_events(path: &Path) -> Result<Vec<Event>> {
                 summary: r.str("summary"),
                 conclusion: r.str("conclusion"),
                 visibility: Visibility::parse(&r.req("visibility")?)?,
+                questions: r.i64("questions"),
             })
         })
         .collect()
@@ -470,13 +594,19 @@ pub fn redact_block_reason(reason: &str) -> String {
             if part.starts_with("protected path ") {
                 "protected path".to_string()
             } else if let Some(rest) = part.strip_prefix("removed protected term `") {
-                format!("removed term {}", rest.split('`').next().unwrap_or_default())
+                format!(
+                    "removed term {}",
+                    rest.split('`').next().unwrap_or_default()
+                )
             } else if part.starts_with("path ") && part.contains(" outside module path ") {
                 "path outside module path".to_string()
             } else if part.starts_with("write-tests touches non-test path ") {
                 "write-tests touches non-test path".to_string()
             } else if let Some(rest) = part.strip_prefix("diff without write right (") {
-                format!("diff without write right ({})", rest.split("):").next().unwrap_or_default())
+                format!(
+                    "diff without write right ({})",
+                    rest.split("):").next().unwrap_or_default()
+                )
             } else {
                 part.to_string()
             }
@@ -494,7 +624,8 @@ fn clauses(text: &str) -> Vec<String> {
     let mut cur = String::new();
     for (i, c) in chars.iter().enumerate() {
         let next = chars.get(i + 2).copied();
-        let split = chars.get(i + 1) == Some(&' ') && (*c == ';' || (*c == '.' && next.is_some_and(|n| n.is_uppercase())));
+        let split = chars.get(i + 1) == Some(&' ')
+            && (*c == ';' || (*c == '.' && next.is_some_and(|n| n.is_uppercase())));
         if split {
             if *c == ';' {
                 cur.push(*c);
@@ -505,7 +636,10 @@ fn clauses(text: &str) -> Vec<String> {
         }
     }
     out.push(cur);
-    out.into_iter().map(|s| s.trim().trim_end_matches([';', '.']).to_string()).filter(|s| !s.is_empty()).collect()
+    out.into_iter()
+        .map(|s| s.trim().trim_end_matches([';', '.']).to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn fit(items: Vec<String>, max: usize) -> Vec<String> {
@@ -527,8 +661,14 @@ pub fn block_lesson(reason: &str, scope: &Scope) -> Option<String> {
     for part in reason.split("; ") {
         let lesson = if part.starts_with("protected path") {
             Some("geschützte Pfade im Auftrag nennen; Tests sind unveränderlich".to_string())
-        } else if let Some(rest) = part.strip_prefix("removed protected term `").or_else(|| part.strip_prefix("removed term ")) {
-            Some(format!("Begriff {} darf nicht entfernt werden – im Auftrag nennen", rest.split(['`', ' ']).next().unwrap_or_default()))
+        } else if let Some(rest) = part
+            .strip_prefix("removed protected term `")
+            .or_else(|| part.strip_prefix("removed term "))
+        {
+            Some(format!(
+                "Begriff {} darf nicht entfernt werden – im Auftrag nennen",
+                rest.split(['`', ' ']).next().unwrap_or_default()
+            ))
         } else if part.starts_with("write-tests touches non-test path") {
             Some("Auftrag auf Testdateien begrenzen".to_string())
         } else if part.starts_with("path ") && part.contains("outside module path") {
@@ -561,12 +701,23 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
         block[..key.len()].copy_from_slice(key);
     }
     let pad = |b: u8| block.map(|k| k ^ b);
-    let inner = Sha256::new().chain_update(pad(0x36)).chain_update(msg).finalize();
-    Sha256::new().chain_update(pad(0x5c)).chain_update(inner).finalize().into()
+    let inner = Sha256::new()
+        .chain_update(pad(0x36))
+        .chain_update(msg)
+        .finalize();
+    Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .into()
 }
 
 pub fn pseudonym(secret: &[u8], raw: &str) -> String {
-    hmac_sha256(secret, raw.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+    hmac_sha256(secret, raw.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub fn shared_copy(event: &Event, secret: Option<&[u8]>) -> Event {
@@ -588,13 +739,27 @@ pub struct SessionLog {
 
 impl SessionLog {
     pub fn open(shared_root: &Path, local_root: &Path, name: &str, session: &str) -> Result<Self> {
-        if [name, session].iter().any(|p| p.is_empty() || p.contains(['/', '\\']) || p.starts_with('.')) {
+        if [name, session]
+            .iter()
+            .any(|p| p.is_empty() || p.contains(['/', '\\']) || p.starts_with('.'))
+        {
             bail!("invalid experience name or session id");
         }
-        let rel = Path::new("experiences").join(name).join(format!("{session}.parquet"));
+        let rel = Path::new("experiences")
+            .join(name)
+            .join(format!("{session}.parquet"));
         let local_path = local_root.join(&rel);
-        let events = if local_path.exists() { read_events(&local_path)? } else { Vec::new() };
-        Ok(Self { shared_path: shared_root.join(rel), local_path, events, secret: None })
+        let events = if local_path.exists() {
+            read_events(&local_path)?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            shared_path: shared_root.join(rel),
+            local_path,
+            events,
+            secret: None,
+        })
     }
 
     pub fn with_secret(mut self, secret: Vec<u8>) -> Self {
@@ -613,7 +778,10 @@ impl SessionLog {
         let mut next = self.events.clone();
         next.push(event);
         write_events(&self.local_path, &next)?;
-        let shared: Vec<Event> = next.iter().map(|e| shared_copy(e, self.secret.as_deref())).collect();
+        let shared: Vec<Event> = next
+            .iter()
+            .map(|e| shared_copy(e, self.secret.as_deref()))
+            .collect();
         write_events(&self.shared_path, &shared)?;
         self.events = next;
         Ok(())
@@ -677,7 +845,9 @@ impl DataDir {
         let mut out = Vec::new();
         let mut stack = vec![root.join("experiences")];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in entries {
                 let path = entry?.path();
                 if path.is_dir() {
@@ -699,7 +869,11 @@ impl DataDir {
         self.collect_events(None, false)
     }
 
-    fn collect_events(&self, local_root: Option<&Path>, with_aggregate: bool) -> Result<Vec<Event>> {
+    fn collect_events(
+        &self,
+        local_root: Option<&Path>,
+        with_aggregate: bool,
+    ) -> Result<Vec<Event>> {
         let mut files = Vec::new();
         if let Some(local) = local_root {
             files.extend(Self::experience_files(local)?);
@@ -716,25 +890,47 @@ impl DataDir {
     }
 
     pub fn event_ids(&self, local_root: Option<&Path>) -> Result<HashSet<String>> {
-        Ok(self.events(local_root)?.into_iter().map(|e| e.event_id).collect())
+        Ok(self
+            .events(local_root)?
+            .into_iter()
+            .map(|e| e.event_id)
+            .collect())
     }
 
-    pub fn steckbrief(&self, model_id: &str, scope: &Scope, local_root: Option<&Path>, now_ms: i64) -> Result<Steckbrief> {
+    pub fn steckbrief(
+        &self,
+        model_id: &str,
+        scope: &Scope,
+        local_root: Option<&Path>,
+        now_ms: i64,
+    ) -> Result<Steckbrief> {
         let model = self.model(model_id)?;
-        Ok(Steckbrief::build(&model, &self.events(local_root)?, scope, now_ms).with_profile(self.profiles()?.remove(model_id)))
+        Ok(
+            Steckbrief::build(&model, &self.events(local_root)?, scope, now_ms)
+                .with_profile(self.profiles()?.remove(model_id)),
+        )
     }
 
     pub async fn query(&self, local_root: Option<&Path>, sql: &str) -> Result<String> {
         let ctx = SessionContext::new();
         let tables = [
-            ("models", ModelRow::to_batch_with(&self.models()?, &self.profiles()?)?),
+            (
+                "models",
+                ModelRow::to_batch_with(&self.models()?, &self.profiles()?)?,
+            ),
             ("protected", ProtectedRow::to_batch(&self.protected()?)?),
             ("experiences", events_to_batch(&self.events(local_root)?)?),
         ];
         for (name, batch) in tables {
-            ctx.register_table(name, Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?))?;
+            ctx.register_table(
+                name,
+                Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?),
+            )?;
         }
-        let options = SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false);
+        let options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
         let batches = ctx.sql_with_options(sql, options).await?.collect().await?;
         Ok(pretty_format_batches(&batches)?.to_string())
     }
@@ -775,10 +971,15 @@ pub struct Steckbrief {
     pub profile: Option<Profile>,
     pub effective: Vec<(Dimension, f64)>,
     pub lessons: Vec<String>,
+    pub proven: Vec<String>,
+    pub questions: u32,
 }
 
 fn utc(ts_ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ts_ms).map_or_else(|| ts_ms.to_string(), |t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+    chrono::DateTime::from_timestamp_millis(ts_ms).map_or_else(
+        || ts_ms.to_string(),
+        |t| t.format("%Y-%m-%d %H:%M UTC").to_string(),
+    )
 }
 
 impl Steckbrief {
@@ -787,7 +988,11 @@ impl Steckbrief {
         let chain = scope.chain();
         let mut rows = Vec::new();
         for dimension in Dimension::ALL {
-            let cells: Vec<_> = chain.iter().rev().filter_map(|s| standing.book.cell(dimension, s).map(|c| (s, c))).collect();
+            let cells: Vec<_> = chain
+                .iter()
+                .rev()
+                .filter_map(|s| standing.book.cell(dimension, s).map(|c| (s, c)))
+                .collect();
             let shown: Vec<_> = if standing.gold || cells.is_empty() {
                 let cell = standing.book.resolve(dimension, scope);
                 vec![(if standing.gold { scope } else { &Scope::Global }, cell)]
@@ -806,18 +1011,45 @@ impl Steckbrief {
                 });
             }
         }
-        let own: Vec<&Event> = events.iter().filter(|e| e.model_id == standing.model_id).collect();
+        let own: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.model_id == standing.model_id)
+            .collect();
         let mut conclusions: Vec<Conclusion> = own
             .iter()
-            .filter_map(|e| e.conclusion.as_ref().map(|t| Conclusion { ts_ms: e.ts_ms, scope: e.scope.clone(), text: t.clone() }))
+            .filter_map(|e| {
+                e.conclusion.as_ref().map(|t| Conclusion {
+                    ts_ms: e.ts_ms,
+                    scope: e.scope.clone(),
+                    text: t.clone(),
+                })
+            })
             .collect();
         conclusions.sort_by_key(|c| std::cmp::Reverse(c.ts_ms));
         let mut lesson_events: Vec<(i64, String)> = own
             .iter()
-            .filter(|e| matches!(e.outcome, Outcome::Rejected | Outcome::Blocked) && chain.contains(&e.scope))
+            .filter(|e| {
+                matches!(e.outcome, Outcome::Rejected | Outcome::Blocked)
+                    && chain.contains(&e.scope)
+            })
             .filter_map(|e| {
-                let derived = || e.block_reason.as_deref().filter(|_| e.outcome == Outcome::Blocked).and_then(|r| block_lesson(r, &e.scope).or_else(|| Some(format!("Blockiert: {r} – im Auftrag ausdrücklich verbieten"))));
-                e.conclusion.clone().filter(|c| !c.trim().is_empty()).or_else(derived).map(|t| (e.ts_ms, t))
+                let derived = || {
+                    e.block_reason
+                        .as_deref()
+                        .filter(|_| e.outcome == Outcome::Blocked)
+                        .and_then(|r| {
+                            block_lesson(r, &e.scope).or_else(|| {
+                                Some(format!(
+                                    "Blockiert: {r} – im Auftrag ausdrücklich verbieten"
+                                ))
+                            })
+                        })
+                };
+                e.conclusion
+                    .clone()
+                    .filter(|c| !c.trim().is_empty())
+                    .or_else(derived)
+                    .map(|t| (e.ts_ms, t))
             })
             .collect();
         lesson_events.sort_by_key(|l| std::cmp::Reverse(l.0));
@@ -825,6 +1057,24 @@ impl Steckbrief {
         for (_, t) in lesson_events {
             if lessons.len() < NEWEST_CONCLUSIONS && !lessons.contains(&t) {
                 lessons.push(t);
+            }
+        }
+        let mut proven: Vec<String> = Vec::new();
+        for c in own
+            .iter()
+            .filter(|e| e.outcome == Outcome::Accepted && chain.contains(&e.scope))
+            .filter_map(|e| {
+                e.conclusion
+                    .clone()
+                    .filter(|c| !c.trim().is_empty())
+                    .map(|c| (e.ts_ms, c))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .rev()
+        {
+            if proven.len() < 2 && !proven.contains(&c) {
+                proven.push(c);
             }
         }
         conclusions.truncate(NEWEST_CONCLUSIONS);
@@ -839,14 +1089,25 @@ impl Steckbrief {
             decisions_right: standing.decisions_right(scope),
             duration_s: {
                 let mut jobs = std::collections::HashSet::new();
-                own.iter().filter(|e| e.duration_s.is_some() && e.job_id.as_ref().is_none_or(|j| jobs.insert(j.clone()))).filter_map(|e| e.duration_s).sum()
+                own.iter()
+                    .filter(|e| {
+                        e.duration_s.is_some()
+                            && e.job_id.as_ref().is_none_or(|j| jobs.insert(j.clone()))
+                    })
+                    .filter_map(|e| e.duration_s)
+                    .sum()
             },
             review_s: own.iter().filter_map(|e| e.review_s).sum(),
             conclusions,
             reset_at: standing.book.reset_at(),
             profile: None,
-            effective: Dimension::ALL.iter().map(|d| (*d, standing.effective_trust(*d, scope))).collect(),
+            effective: Dimension::ALL
+                .iter()
+                .map(|d| (*d, standing.effective_trust(*d, scope)))
+                .collect(),
             lessons,
+            proven,
+            questions: crate::ask::count_questions(events, &standing.model_id),
         }
     }
 
@@ -856,7 +1117,10 @@ impl Steckbrief {
     }
 
     fn trust_of(&self, dimension: Dimension) -> f64 {
-        self.effective.iter().find(|(d, _)| *d == dimension).map_or(0.0, |(_, t)| *t)
+        self.effective
+            .iter()
+            .find(|(d, _)| *d == dimension)
+            .map_or(0.0, |(_, t)| *t)
     }
 
     fn at_least(&self, dimension: Dimension, min: f64) -> bool {
@@ -887,11 +1151,24 @@ impl Steckbrief {
         }
     }
 
-    fn rules(&self, dimensions: [Dimension; 2], label: &str, rule: impl Fn(&Self, Dimension) -> &'static str) -> Vec<String> {
-        let active: Vec<Dimension> = dimensions.into_iter().filter(|d| !self.deactivated(*d)).collect();
+    fn rules(
+        &self,
+        dimensions: [Dimension; 2],
+        label: &str,
+        rule: impl Fn(&Self, Dimension) -> &'static str,
+    ) -> Vec<String> {
+        let active: Vec<Dimension> = dimensions
+            .into_iter()
+            .filter(|d| !self.deactivated(*d))
+            .collect();
         match active.as_slice() {
-            [a, b] if rule(self, *a) == rule(self, *b) => vec![format!("{label}: {}", rule(self, *a))],
-            _ => active.iter().map(|d| format!("{d}: {}", rule(self, *d))).collect(),
+            [a, b] if rule(self, *a) == rule(self, *b) => {
+                vec![format!("{label}: {}", rule(self, *a))]
+            }
+            _ => active
+                .iter()
+                .map(|d| format!("{d}: {}", rule(self, *d)))
+                .collect(),
         }
     }
 
@@ -908,34 +1185,87 @@ impl Steckbrief {
         };
         let p = self.profile.clone().unwrap_or_default();
         let part = |v: &Option<String>| v.as_deref().map(clauses).unwrap_or_default();
-        let join = |v: Vec<String>| if v.is_empty() { "-".to_string() } else { v.join("; ") };
+        let join = |v: Vec<String>| {
+            if v.is_empty() {
+                "-".to_string()
+            } else {
+                v.join("; ")
+            }
+        };
         let mut how = Vec::new();
         if self.gold {
             how.push("keine Prüfung".to_string());
         } else {
-            how.extend(self.rules([Dimension::Search, Dimension::Inventory], "search/inventory", Self::read_rule));
-            how.extend(self.rules([Dimension::WriteTests, Dimension::WriteCode], "write", Self::write_rule));
+            how.extend(self.rules(
+                [Dimension::Search, Dimension::Inventory],
+                "search/inventory",
+                Self::read_rule,
+            ));
+            how.extend(self.rules(
+                [Dimension::WriteTests, Dimension::WriteCode],
+                "write",
+                Self::write_rule,
+            ));
             if !self.deactivated(Dimension::Decisions) {
-                how.push(if self.at_least(Dimension::Decisions, DECISIONS_RIGHT_MIN) { "darf selbst entscheiden" } else { "Entscheidungen im Auftrag vorgeben" }.to_string());
+                let free = self.at_least(Dimension::Decisions, DECISIONS_RIGHT_MIN);
+                how.push(
+                    if free {
+                        "darf selbst entscheiden"
+                    } else {
+                        "Entscheidungen im Auftrag vorgeben"
+                    }
+                    .to_string(),
+                );
+                if !free {
+                    how.push("Rückfragen erwünscht".to_string());
+                }
             }
         }
         how.extend(fit(part(&p.prompting), LINE_MAX));
-        let mut avoid: Vec<String> = part(&p.weaknesses);
-        if !self.gold {
-            avoid.extend(Dimension::ALL.iter().filter(|d| self.deactivated(**d)).map(|d| format!("nicht für {d}")));
+        let weak = part(&p.weaknesses);
+        let mut avoid: Vec<String> = weak
+            .iter()
+            .filter(|c| c.chars().filter(char::is_ascii_digit).count() < 3 && !c.contains('%'))
+            .cloned()
+            .collect();
+        if avoid.is_empty() {
+            avoid.extend(weak.into_iter().take(1));
         }
-        let good: Vec<String> = fit([&p.strengths, &p.task_scope].into_iter().flat_map(part).collect(), LINE_MAX);
-        let lessons = fit(self.lessons.clone(), LINE_MAX);
-        format!(
-            "{} ({}) – {}\nGut für: {}\nSo formulieren: {}\nNicht geben: {}\nAus Fehlern: {}\n",
+        if !self.gold {
+            avoid.extend(
+                Dimension::ALL
+                    .iter()
+                    .filter(|d| self.deactivated(**d))
+                    .map(|d| format!("nicht für {d}")),
+            );
+        }
+        let scope_clauses = part(&p.task_scope);
+        let good: Vec<String> = fit(
+            if scope_clauses.is_empty() {
+                part(&p.strengths)
+            } else {
+                scope_clauses
+            },
+            LINE_MAX,
+        );
+        let mut out = format!(
+            "{} ({}) – {}\nGut für: {}\nSo formulieren: {}\nNicht geben: {}\n",
             k.model,
             backend.unwrap_or(&k.provider),
             role,
             join(good),
             join(how),
-            join(fit(avoid, LINE_MAX)),
-            join(lessons)
-        )
+            join(fit(avoid, LINE_MAX))
+        );
+        for (label, items) in [("Bewährt", &self.proven), ("Aus Fehlern", &self.lessons)] {
+            if !items.is_empty() {
+                out.push_str(&format!(
+                    "{label}: {}\n",
+                    join(fit(items.clone(), LINE_MAX))
+                ));
+            }
+        }
+        out
     }
 
     pub fn render(&self) -> String {
@@ -967,13 +1297,25 @@ impl Steckbrief {
             let c = &r.counters;
             out.push_str(&format!(
                 "- {} @ {}: {:.2} (Prüfanteil {:.2}) acc {} rej {} abo {} blk {} note {}",
-                r.dimension, r.scope, r.trust, r.pruefanteil, c.accepted, c.rejected, c.aborted, c.blocked, c.note
+                r.dimension,
+                r.scope,
+                r.trust,
+                r.pruefanteil,
+                c.accepted,
+                c.rejected,
+                c.aborted,
+                c.blocked,
+                c.note
             ));
             if r.manual {
                 out.push_str(" [manuell gesetzt]");
             }
             if let Some(b) = &r.last_block {
-                out.push_str(&format!(" [letzter Block {} \"{}\"]", utc(b.ts_ms), b.reason));
+                out.push_str(&format!(
+                    " [letzter Block {} \"{}\"]",
+                    utc(b.ts_ms),
+                    b.reason
+                ));
             }
             out.push('\n');
         }
@@ -985,11 +1327,20 @@ impl Steckbrief {
             self.duration_s.round() as i64,
             self.review_s.round() as i64
         ));
+        out.push_str(&format!("Rückfragen der Worker: {}\n", self.questions));
         if let Some(t) = self.reset_at {
-            out.push_str(&format!("zurückgesetzt am {}\n", utc(t).split(' ').next().unwrap_or_default()));
+            out.push_str(&format!(
+                "zurückgesetzt am {}\n",
+                utc(t).split(' ').next().unwrap_or_default()
+            ));
         }
         for c in &self.conclusions {
-            out.push_str(&format!("Fazit ({}, ts {}): {}\n", c.scope, c.ts_ms, c.text));
+            out.push_str(&format!(
+                "Fazit ({}, {}): {}\n",
+                c.scope,
+                utc(c.ts_ms),
+                c.text
+            ));
         }
         out
     }
@@ -1004,7 +1355,13 @@ mod tests {
 
     fn qwen_row() -> ModelRow {
         ModelRow {
-            key: ModelKey::new("dgx", "qwen3-coder-next", "qwen3-coder-next", "q8", "opencode"),
+            key: ModelKey::new(
+                "dgx",
+                "qwen3-coder-next",
+                "qwen3-coder-next",
+                "q8",
+                "opencode",
+            ),
             context_tokens: Some(128_000),
             cost: "shared-dgx".into(),
             max_steps: Some(80),
@@ -1031,7 +1388,10 @@ mod tests {
         assert_eq!(ModelRow::read_all(&p).unwrap(), vec![qwen_row()]);
         let q = dir.path().join("protected.parquet");
         ProtectedRow::write_all(&q, &ProtectedRow::defaults()).unwrap();
-        assert_eq!(ProtectedRow::read_all(&q).unwrap(), ProtectedRow::defaults());
+        assert_eq!(
+            ProtectedRow::read_all(&q).unwrap(),
+            ProtectedRow::defaults()
+        );
         assert_eq!(ProtectedRow::defaults().len(), 5);
     }
 
@@ -1039,11 +1399,21 @@ mod tests {
     fn unknown_schema_version_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("e.parquet");
-        write_events(&p, &[ev("m", Dimension::Search, "global", Outcome::Note, 0)]).unwrap();
+        write_events(
+            &p,
+            &[ev("m", Dimension::Search, "global", Outcome::Note, 0)],
+        )
+        .unwrap();
         let batch = read_batches(&p).unwrap().remove(0);
-        let props = WriterProperties::builder().set_key_value_metadata(Some(vec![KeyValue::new(VERSION_KEY.to_string(), "99".to_string())])).build();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                VERSION_KEY.to_string(),
+                "99".to_string(),
+            )]))
+            .build();
         let bad = dir.path().join("bad.parquet");
-        let mut w = ArrowWriter::try_new(File::create(&bad).unwrap(), batch.schema(), Some(props)).unwrap();
+        let mut w =
+            ArrowWriter::try_new(File::create(&bad).unwrap(), batch.schema(), Some(props)).unwrap();
         w.write(&batch).unwrap();
         w.close().unwrap();
         let err = read_events(&bad).unwrap_err().to_string();
@@ -1054,7 +1424,13 @@ mod tests {
     fn events_roundtrip_with_nulls() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("e.parquet");
-        let mut a = ev("m", Dimension::WriteCode, "module:r/src", Outcome::Blocked, 1);
+        let mut a = ev(
+            "m",
+            Dimension::WriteCode,
+            "module:r/src",
+            Outcome::Blocked,
+            1,
+        );
         a.block_reason = Some("x".into());
         a.steps = Some(80);
         a.duration_s = Some(142.0);
@@ -1083,7 +1459,10 @@ mod tests {
         assert_eq!(s[0].summary, None);
         assert_eq!(s[0].conclusion, None);
         assert_eq!(s[1].summary.as_deref(), Some("offen"));
-        assert_eq!(read_events(&log.local_path).unwrap()[0].summary.as_deref(), Some("geheim"));
+        assert_eq!(
+            read_events(&log.local_path).unwrap()[0].summary.as_deref(),
+            Some("geheim")
+        );
         let reopened = SessionLog::open(shared.path(), local.path(), "john", "sess-1").unwrap();
         assert_eq!(reopened.events().len(), 2);
         assert!(SessionLog::open(shared.path(), local.path(), "../x", "s").is_err());
@@ -1099,8 +1478,14 @@ mod tests {
         e.conclusion = Some("c".into());
         log.append(e.clone()).unwrap();
         let mut other = SessionLog::open(shared.path(), local.path(), "anna", "s2").unwrap();
-        other.append(ev("m", Dimension::Search, "global", Outcome::Rejected, 2)).unwrap();
-        write_events(&shared.path().join("aggregate/latest.parquet"), &[strip_private(&e)]).unwrap();
+        other
+            .append(ev("m", Dimension::Search, "global", Outcome::Rejected, 2))
+            .unwrap();
+        write_events(
+            &shared.path().join("aggregate/latest.parquet"),
+            &[strip_private(&e)],
+        )
+        .unwrap();
         let dd = DataDir::new(shared.path());
         let union = dd.events(Some(local.path())).unwrap();
         assert_eq!(union.len(), 2);
@@ -1119,7 +1504,12 @@ mod tests {
         blocked.block_reason = Some("Validierung decided_by entfernt".into());
         blocked.duration_s = Some(142.0);
         blocked.conclusion = Some("brach aus".into());
-        let sb = Steckbrief::build(&row, &[seed, blocked], &Scope::parse("module:r/src").unwrap(), NOW);
+        let sb = Steckbrief::build(
+            &row,
+            &[seed, blocked],
+            &Scope::parse("module:r/src").unwrap(),
+            NOW,
+        );
         let text = sb.render();
         assert!(text.contains("search @ global: 0.55"), "{text}");
         assert!(text.contains("[manuell gesetzt]"));
@@ -1127,7 +1517,7 @@ mod tests {
         assert!(text.contains("blk 1"));
         assert!(text.contains("Validierung decided_by entfernt"));
         assert!(text.contains("Schreibrecht write-code: nein"));
-        assert!(text.contains("Fazit (global"));
+        assert!(text.contains("Fazit (global, ") && !text.contains(", ts "));
         assert!(text.contains("write-tests: nein (Vorschlagsmodus)"));
         assert!(text.contains(" UTC \"Validierung"), "{text}");
         assert!(!text.contains("-0s"));
@@ -1141,9 +1531,15 @@ mod tests {
         let mut gold = qwen_row();
         gold.key = ModelKey::new("anthropic", "claude-opus-5-5", "c", "", "claude-code");
         gold.sperre = Sperre::Technisch;
-        ModelRow::write_all(&dir.path().join("models.parquet"), &[gold.clone(), qwen_row()]).unwrap();
+        ModelRow::write_all(
+            &dir.path().join("models.parquet"),
+            &[gold.clone(), qwen_row()],
+        )
+        .unwrap();
         let dd = DataDir::new(dir.path());
-        let sb = dd.steckbrief(&gold.model_id(), &Scope::Global, None, NOW).unwrap();
+        let sb = dd
+            .steckbrief(&gold.model_id(), &Scope::Global, None, NOW)
+            .unwrap();
         assert!(sb.gold && sb.write_right_code && sb.decisions_right);
         assert!(sb.render().contains("GOLD"));
         assert!(dd.steckbrief("nope", &Scope::Global, None, NOW).is_err());
@@ -1156,15 +1552,41 @@ mod tests {
         let local = tempfile::tempdir().unwrap();
         ModelRow::write_all(&shared.path().join("models.parquet"), &[qwen_row()]).unwrap();
         let mut log = SessionLog::open(shared.path(), local.path(), "john", "s1").unwrap();
-        log.append(ev(&qwen_row().model_id(), Dimension::Search, "global", Outcome::Accepted, 1)).unwrap();
+        log.append(ev(
+            &qwen_row().model_id(),
+            Dimension::Search,
+            "global",
+            Outcome::Accepted,
+            1,
+        ))
+        .unwrap();
         let dd = DataDir::new(shared.path());
-        let out = dd.query(Some(local.path()), "select outcome, count(*) as n from experiences group by outcome").await.unwrap();
+        let out = dd
+            .query(
+                Some(local.path()),
+                "select outcome, count(*) as n from experiences group by outcome",
+            )
+            .await
+            .unwrap();
         assert!(out.contains("accepted") && out.contains('1'), "{out}");
         let out = dd.query(None, "select m.model, e.dimension from models m join experiences e on e.model_id = m.model_id").await.unwrap();
-        assert!(out.contains("qwen3-coder-next") && out.contains("search"), "{out}");
-        assert!(dd.query(None, "select value from protected where kind = 'removed_term'").await.unwrap().contains("assert"));
+        assert!(
+            out.contains("qwen3-coder-next") && out.contains("search"),
+            "{out}"
+        );
+        assert!(dd
+            .query(
+                None,
+                "select value from protected where kind = 'removed_term'"
+            )
+            .await
+            .unwrap()
+            .contains("assert"));
         assert!(dd.query(None, "create table x as select 1").await.is_err());
-        assert!(dd.query(None, "copy (select 1) to '/tmp/x.csv'").await.is_err());
+        assert!(dd
+            .query(None, "copy (select 1) to '/tmp/x.csv'")
+            .await
+            .is_err());
     }
 
     fn profile() -> Profile {
@@ -1185,7 +1607,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("models.parquet");
         let id = qwen_row().model_id();
-        ModelRow::write_all_with(&p, &[qwen_row()], &HashMap::from([(id.clone(), profile())])).unwrap();
+        ModelRow::write_all_with(&p, &[qwen_row()], &HashMap::from([(id.clone(), profile())]))
+            .unwrap();
         assert_eq!(ModelRow::read_all(&p).unwrap(), vec![qwen_row()]);
         assert_eq!(ModelRow::read_profiles(&p).unwrap()[&id], profile());
         let full = ModelRow::to_batch(&[qwen_row()]).unwrap();
@@ -1194,7 +1617,10 @@ mod tests {
         let q = dir.path().join("old.parquet");
         write_batch(&q, &old, SCHEMA_VERSION).unwrap();
         assert_eq!(ModelRow::read_all(&q).unwrap(), vec![qwen_row()]);
-        assert_eq!(ModelRow::read_profiles(&q).unwrap()[&id], Profile::default());
+        assert_eq!(
+            ModelRow::read_profiles(&q).unwrap()[&id],
+            Profile::default()
+        );
     }
 
     #[test]
@@ -1206,44 +1632,119 @@ mod tests {
         blocked.block_reason = Some("x".into());
         let mut accepted = ev(&id, Dimension::Search, "global", Outcome::Accepted, 3);
         accepted.conclusion = Some("ok".into());
-        write_events(&dir.path().join("experiences/a/s.parquet"), &[blocked, accepted]).unwrap();
-        ModelRow::write_all(&dir.path().join("models.parquet"), std::slice::from_ref(&row)).unwrap();
+        write_events(
+            &dir.path().join("experiences/a/s.parquet"),
+            &[blocked, accepted],
+        )
+        .unwrap();
+        ModelRow::write_all(
+            &dir.path().join("models.parquet"),
+            std::slice::from_ref(&row),
+        )
+        .unwrap();
         let dd = DataDir::new(dir.path());
         let plain = dd.steckbrief(&id, &Scope::Global, None, NOW).unwrap();
         assert!(!plain.render().contains("Profil"));
-        ModelRow::write_all_with(&dir.path().join("models.parquet"), &[row], &HashMap::from([(id.clone(), profile())])).unwrap();
+        ModelRow::write_all_with(
+            &dir.path().join("models.parquet"),
+            &[row],
+            &HashMap::from([(id.clone(), profile())]),
+        )
+        .unwrap();
         let with = dd.steckbrief(&id, &Scope::Global, None, NOW).unwrap();
-        let values = |sb: &Steckbrief| sb.rows.iter().map(|r| (r.dimension, r.scope.clone(), r.trust.to_bits(), r.pruefanteil.to_bits())).collect::<Vec<_>>();
+        let values = |sb: &Steckbrief| {
+            sb.rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.dimension,
+                        r.scope.clone(),
+                        r.trust.to_bits(),
+                        r.pruefanteil.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         assert_eq!(values(&plain), values(&with));
-        assert_eq!((plain.write_right_code, plain.decisions_right), (with.write_right_code, with.decisions_right));
+        assert_eq!(
+            (plain.write_right_code, plain.decisions_right),
+            (with.write_right_code, with.decisions_right)
+        );
         let text = with.render();
-        let (fixed, rest) = text.split_once("Profil (öffentliche Daten, Stand 2026-10-27; kein Einfluss auf Vertrauen)\n").unwrap();
-        assert!(fixed.contains("Kosten:") && !fixed.contains("search @"), "{text}");
-        assert!(rest.contains("- Stärken: stark") && rest.contains("- Schwächen: schwach") && rest.contains("- Umfang: klein"));
+        let (fixed, rest) = text
+            .split_once(
+                "Profil (öffentliche Daten, Stand 2026-10-27; kein Einfluss auf Vertrauen)\n",
+            )
+            .unwrap();
+        assert!(
+            fixed.contains("Kosten:") && !fixed.contains("search @"),
+            "{text}"
+        );
+        assert!(
+            rest.contains("- Stärken: stark")
+                && rest.contains("- Schwächen: schwach")
+                && rest.contains("- Umfang: klein")
+        );
         assert!(rest.contains("- Einschätzung je Dimension (abgeleitet aus öffentlichen Daten, nicht gemessen): search=mittel"));
         assert!(rest.contains("- Formulierung: XML-Tags, Ziel zuerst"));
-        assert!(rest.contains("- Benchmarks: X 1") && rest.contains("- Quellen: https://a ; https://b"));
-        assert_eq!(text.replace(&with.profile.as_ref().unwrap().render(), ""), plain.render());
+        assert!(
+            rest.contains("- Benchmarks: X 1") && rest.contains("- Quellen: https://a ; https://b")
+        );
+        assert_eq!(
+            text.replace(&with.profile.as_ref().unwrap().render(), ""),
+            plain.render()
+        );
     }
 
     #[test]
     fn block_lessons_are_mechanical() {
         let m = Scope::parse("module:r/src/a").unwrap();
         let g = Scope::Global;
-        assert_eq!(block_lesson("protected path tests/x (matches tests/**)", &g).unwrap(), "geschützte Pfade im Auftrag nennen; Tests sind unveränderlich");
-        assert_eq!(block_lesson("removed term assert", &g).unwrap(), "Begriff assert darf nicht entfernt werden – im Auftrag nennen");
-        assert_eq!(block_lesson("removed protected term `decided_by` in f.rs", &g).unwrap(), "Begriff decided_by darf nicht entfernt werden – im Auftrag nennen");
-        assert_eq!(block_lesson("path b.rs outside module path src/a", &g).unwrap(), "Auftrag auf src/a begrenzen");
-        assert_eq!(block_lesson("path outside module path", &m).unwrap(), "Auftrag auf src/a begrenzen");
-        assert_eq!(block_lesson("diff without write right (write-code): a", &g).unwrap(), "ohne Schreibrecht nur Vorschlag verlangen");
-        assert_eq!(block_lesson("9 files exceed limit 5; 900 changed lines exceed limit 500", &g).unwrap(), "Auftrag kleiner schneiden");
+        assert_eq!(
+            block_lesson("protected path tests/x (matches tests/**)", &g).unwrap(),
+            "geschützte Pfade im Auftrag nennen; Tests sind unveränderlich"
+        );
+        assert_eq!(
+            block_lesson("removed term assert", &g).unwrap(),
+            "Begriff assert darf nicht entfernt werden – im Auftrag nennen"
+        );
+        assert_eq!(
+            block_lesson("removed protected term `decided_by` in f.rs", &g).unwrap(),
+            "Begriff decided_by darf nicht entfernt werden – im Auftrag nennen"
+        );
+        assert_eq!(
+            block_lesson("path b.rs outside module path src/a", &g).unwrap(),
+            "Auftrag auf src/a begrenzen"
+        );
+        assert_eq!(
+            block_lesson("path outside module path", &m).unwrap(),
+            "Auftrag auf src/a begrenzen"
+        );
+        assert_eq!(
+            block_lesson("diff without write right (write-code): a", &g).unwrap(),
+            "ohne Schreibrecht nur Vorschlag verlangen"
+        );
+        assert_eq!(
+            block_lesson(
+                "9 files exceed limit 5; 900 changed lines exceed limit 500",
+                &g
+            )
+            .unwrap(),
+            "Auftrag kleiner schneiden"
+        );
         assert!(block_lesson("claude reported an error", &g).is_none());
     }
 
     #[test]
     fn fit_keeps_whole_clauses() {
-        assert_eq!(fit(clauses("Eins ist gut. Zwei auch; drei ca. 5 min"), 20), vec!["Eins ist gut"]);
-        assert_eq!(fit(clauses("Eins ist gut. Zwei auch; drei ca. 5 min"), 100), vec!["Eins ist gut", "Zwei auch", "drei ca. 5 min"]);
+        assert_eq!(
+            fit(clauses("Eins ist gut. Zwei auch; drei ca. 5 min"), 20),
+            vec!["Eins ist gut"]
+        );
+        assert_eq!(
+            fit(clauses("Eins ist gut. Zwei auch; drei ca. 5 min"), 100),
+            vec!["Eins ist gut", "Zwei auch", "drei ca. 5 min"]
+        );
         let long = "x ".repeat(150);
         assert_eq!(fit(clauses(&long), 20), vec![long.trim().to_string()]);
     }
@@ -1258,12 +1759,22 @@ mod tests {
     }
 
     fn short_for(events: &[Event], profile: Option<Profile>) -> String {
-        Steckbrief::build(&qwen_row(), events, &Scope::Global, NOW).with_profile(profile).render_short(Some("dgx"))
+        Steckbrief::build(&qwen_row(), events, &Scope::Global, NOW)
+            .with_profile(profile)
+            .render_short(Some("dgx"))
     }
 
     fn with_trust(model: &ModelRow, trust: &[(Dimension, f64)], gold: bool) -> String {
         let mut sb = Steckbrief::build(model, &[], &Scope::Global, NOW);
-        sb.effective = Dimension::ALL.iter().map(|d| (*d, trust.iter().find(|(x, _)| x == d).map_or(0.0, |(_, t)| *t))).collect();
+        sb.effective = Dimension::ALL
+            .iter()
+            .map(|d| {
+                (
+                    *d,
+                    trust.iter().find(|(x, _)| x == d).map_or(0.0, |(_, t)| *t),
+                )
+            })
+            .collect();
         sb.gold = gold;
         sb.render_short(None)
     }
@@ -1272,32 +1783,180 @@ mod tests {
     fn short_steckbrief_fresh_model_is_not_deactivated() {
         let text = short_for(&[], Some(profile()));
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 5, "{text}");
-        assert!(lines[0].starts_with("qwen3-coder-next (dgx) – Vorschlagsgeber"), "{text}");
-        assert_eq!(lines[1], "Gut für: stark; klein");
-        assert!(lines[2].starts_with("So formulieren: search/inventory: "), "{text}");
-        assert!(lines[2].contains("nur als Vorschlag (Diff als Text verlangen)") && lines[2].contains("Entscheidungen im Auftrag vorgeben"), "{text}");
+        assert_eq!(lines.len(), 4, "{text}");
+        assert!(
+            lines[0].starts_with("qwen3-coder-next (dgx) – Vorschlagsgeber"),
+            "{text}"
+        );
+        assert_eq!(lines[1], "Gut für: klein");
+        assert!(
+            lines[2].starts_with("So formulieren: search/inventory: "),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains("nur als Vorschlag (Diff als Text verlangen)")
+                && lines[2].contains("Entscheidungen im Auftrag vorgeben"),
+            "{text}"
+        );
         assert!(lines[2].ends_with("; XML-Tags, Ziel zuerst"), "{text}");
         assert_eq!(lines[3], "Nicht geben: schwach");
-        assert_eq!(lines[4], "Aus Fehlern: -");
         assert!(!text.contains("nicht für") && !text.contains("Benchmarks"));
     }
 
     #[test]
     fn short_steckbrief_tiers_epsilon_and_gold() {
         let qwen = qwen_row();
-        let t = with_trust(&qwen, &[(Dimension::Search, 0.55), (Dimension::Inventory, 0.35), (Dimension::WriteCode, 0.10), (Dimension::WriteTests, 0.10), (Dimension::Decisions, 0.10)], false);
-        assert!(t.contains("search: Fundstellen übernehmen, Schlüsse prüfen") || t.contains("search/inventory: Fundstellen übernehmen, Schlüsse prüfen"), "{t}");
-        assert!(t.contains("write: nur als Vorschlag (Diff als Text verlangen)") && t.contains("Nicht geben: -"), "{t}");
-        let t = with_trust(&qwen, &[(Dimension::Search, 0.90), (Dimension::Inventory, 0.05), (Dimension::WriteCode, 0.60), (Dimension::WriteTests, 0.90), (Dimension::Decisions, 0.90)], false);
-        assert!(t.contains("search: Fundstellen und Schlüsse übernehmen (Stichprobe)") && !t.contains("inventory:"), "{t}");
-        assert!(t.contains("write-tests: schreibt frei, Stichprobe") && t.contains("write-code: Test vorher fertig und unveränderlich, Diff ganz lesen"), "{t}");
-        assert!(t.contains("darf selbst entscheiden") && t.contains("Nicht geben: nicht für inventory"), "{t}");
-        let t = with_trust(&qwen, &[(Dimension::Search, 0.0500000001), (Dimension::Inventory, 0.0501)], false);
-        assert!(t.contains("nicht für search") && !t.contains("nicht für inventory") && t.contains("inventory: nur Fundstellen, alles nachprüfen"), "{t}");
-        let gold = ModelRow { key: ModelKey::new("anthropic", "claude-opus-5-5", "x", "-", "claude-code"), ..qwen_row() };
+        let t = with_trust(
+            &qwen,
+            &[
+                (Dimension::Search, 0.55),
+                (Dimension::Inventory, 0.35),
+                (Dimension::WriteCode, 0.10),
+                (Dimension::WriteTests, 0.10),
+                (Dimension::Decisions, 0.10),
+            ],
+            false,
+        );
+        assert!(
+            t.contains("search: Fundstellen übernehmen, Schlüsse prüfen")
+                || t.contains("search/inventory: Fundstellen übernehmen, Schlüsse prüfen"),
+            "{t}"
+        );
+        assert!(
+            t.contains("write: nur als Vorschlag (Diff als Text verlangen)")
+                && t.contains("Nicht geben: -"),
+            "{t}"
+        );
+        let t = with_trust(
+            &qwen,
+            &[
+                (Dimension::Search, 0.90),
+                (Dimension::Inventory, 0.05),
+                (Dimension::WriteCode, 0.60),
+                (Dimension::WriteTests, 0.90),
+                (Dimension::Decisions, 0.90),
+            ],
+            false,
+        );
+        assert!(
+            t.contains("search: Fundstellen und Schlüsse übernehmen (Stichprobe)")
+                && !t.contains("inventory:"),
+            "{t}"
+        );
+        assert!(
+            t.contains("write-tests: schreibt frei, Stichprobe")
+                && t.contains("write-code: Test vorher fertig und unveränderlich, Diff ganz lesen"),
+            "{t}"
+        );
+        assert!(
+            t.contains("darf selbst entscheiden") && t.contains("Nicht geben: nicht für inventory"),
+            "{t}"
+        );
+        let t = with_trust(
+            &qwen,
+            &[
+                (Dimension::Search, 0.0500000001),
+                (Dimension::Inventory, 0.0501),
+            ],
+            false,
+        );
+        assert!(
+            t.contains("nicht für search")
+                && !t.contains("nicht für inventory")
+                && t.contains("inventory: nur Fundstellen, alles nachprüfen"),
+            "{t}"
+        );
+        let gold = ModelRow {
+            key: ModelKey::new("anthropic", "claude-opus-5-5", "x", "-", "claude-code"),
+            ..qwen_row()
+        };
         let text = Steckbrief::build(&gold, &[], &Scope::Global, NOW).render_short(None);
-        assert!(text.contains("Gold, keine Prüfung") && text.contains("So formulieren: keine Prüfung") && !text.contains("nicht für") && text.contains("(anthropic)"), "{text}");
+        assert!(
+            text.contains("Gold, keine Prüfung")
+                && text.contains("So formulieren: keine Prüfung")
+                && !text.contains("nicht für")
+                && text.contains("(anthropic)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn short_steckbrief_asks_for_questions_below_the_decision_threshold_and_detail_counts_them() {
+        let qwen = qwen_row();
+        let low = with_trust(&qwen, &[(Dimension::Decisions, 0.84)], false);
+        assert!(
+            low.contains("Entscheidungen im Auftrag vorgeben; Rückfragen erwünscht"),
+            "{low}"
+        );
+        let high = with_trust(&qwen, &[(Dimension::Decisions, 0.85)], false);
+        assert!(
+            high.contains("darf selbst entscheiden") && !high.contains("Rückfragen erwünscht"),
+            "{high}"
+        );
+        let gold = ModelRow {
+            key: ModelKey::new("anthropic", "claude-opus-5-5", "x", "-", "claude-code"),
+            ..qwen_row()
+        };
+        assert!(!Steckbrief::build(&gold, &[], &Scope::Global, NOW)
+            .render_short(None)
+            .contains("Rückfragen"));
+        let mut note = ev(
+            &qwen.model_id(),
+            Dimension::Search,
+            "global",
+            Outcome::Note,
+            1,
+        );
+        note.questions = Some(3);
+        let sb = Steckbrief::build(&qwen, &[note.clone()], &Scope::Global, NOW);
+        assert_eq!(sb.questions, 3);
+        assert!(sb.render().contains("Rückfragen der Worker: 3"));
+        let accepted = ev(
+            &qwen.model_id(),
+            Dimension::Search,
+            "global",
+            Outcome::Accepted,
+            0,
+        );
+        let sb_cell = Steckbrief::build(&qwen, &[accepted, note.clone()], &Scope::Global, NOW);
+        assert_eq!(sb_cell.rows.iter().map(|r| r.counters.note).sum::<u32>(), 1);
+        let reset = ev(
+            &qwen.model_id(),
+            Dimension::Search,
+            "global",
+            Outcome::Reset,
+            2,
+        );
+        assert_eq!(
+            Steckbrief::build(&qwen, &[note, reset], &Scope::Global, NOW).questions,
+            0
+        );
+    }
+
+    #[test]
+    fn question_count_roundtrips_and_files_without_the_column_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = ev("m", Dimension::Search, "global", Outcome::Note, 1);
+        e.questions = Some(2);
+        let p = dir.path().join("e.parquet");
+        write_events(
+            &p,
+            &[
+                e.clone(),
+                ev("m", Dimension::Search, "global", Outcome::Note, 2),
+            ],
+        )
+        .unwrap();
+        let back = read_events(&p).unwrap();
+        assert_eq!((back[0].questions, back[1].questions), (Some(2), None));
+        let full = events_to_batch(&[e.clone()]).unwrap();
+        let old = full
+            .project(&(0..full.num_columns() - 1).collect::<Vec<_>>())
+            .unwrap();
+        let q = dir.path().join("old.parquet");
+        write_batch(&q, &old, SCHEMA_VERSION).unwrap();
+        let back = read_events(&q).unwrap();
+        assert_eq!((back.len(), back[0].questions), (1, None));
     }
 
     #[test]
@@ -1309,17 +1968,66 @@ mod tests {
         old_blk.block_reason = Some("removed term assert".into());
         let mut blk = ev(&id, Dimension::WriteCode, "global", Outcome::Blocked, 3);
         blk.block_reason = Some("protected path".into());
-        let mut other_scope = ev(&id, Dimension::WriteCode, "repo:other", Outcome::Rejected, 9);
+        let mut other_scope = ev(
+            &id,
+            Dimension::WriteCode,
+            "repo:other",
+            Outcome::Rejected,
+            9,
+        );
         other_scope.conclusion = Some("fremd".into());
         let mut accepted = ev(&id, Dimension::WriteCode, "global", Outcome::Accepted, 8);
         accepted.conclusion = Some("kein Fehler".into());
         let mut events = [rej, old_blk, blk, other_scope, accepted];
-        events.iter_mut().for_each(|e| e.visibility = Visibility::Private);
+        events
+            .iter_mut()
+            .for_each(|e| e.visibility = Visibility::Private);
         let sb = Steckbrief::build(&qwen_row(), &events, &Scope::parse("repo:r").unwrap(), NOW);
-        assert_eq!(sb.lessons, vec!["geschützte Pfade im Auftrag nennen; Tests sind unveränderlich", "Begriff assert darf nicht entfernt werden – im Auftrag nennen", "Dateinamen nennen"]);
+        assert_eq!(
+            sb.lessons,
+            vec![
+                "geschützte Pfade im Auftrag nennen; Tests sind unveränderlich",
+                "Begriff assert darf nicht entfernt werden – im Auftrag nennen",
+                "Dateinamen nennen"
+            ]
+        );
         let stripped: Vec<Event> = events.iter().map(strip_private).collect();
-        let sb = Steckbrief::build(&qwen_row(), &stripped, &Scope::parse("repo:r").unwrap(), NOW);
+        let sb = Steckbrief::build(
+            &qwen_row(),
+            &stripped,
+            &Scope::parse("repo:r").unwrap(),
+            NOW,
+        );
         assert_eq!(sb.lessons.len(), 2);
         assert!(!sb.render_short(None).contains("Dateinamen"));
+    }
+
+    #[test]
+    fn short_steckbrief_proven_weakness_filter_and_omitted_lines() {
+        let id = qwen_row().model_id();
+        let mut ok =
+            [1, 2, 3].map(|i| ev(&id, Dimension::WriteCode, "global", Outcome::Accepted, i));
+        ok[0].conclusion = Some("alt".into());
+        ok[1].conclusion = Some("mittel".into());
+        ok[2].conclusion = Some("neu".into());
+        let mut p = profile();
+        p.weaknesses = Some("SWE-bench 61.2 %; lange Refactorings".into());
+        let sb = Steckbrief::build(&qwen_row(), &ok, &Scope::Global, NOW).with_profile(Some(p));
+        let t = sb.render_short(None);
+        assert!(t.contains("Nicht geben: lange Refactorings\n"), "{t}");
+        assert!(
+            t.contains("\nBewährt: neu; mittel\n") && !t.contains("alt"),
+            "{t}"
+        );
+        assert!(!t.contains("Aus Fehlern"), "{t}");
+        let mut private = ok.clone();
+        private
+            .iter_mut()
+            .for_each(|e| e.visibility = Visibility::Private);
+        let stripped: Vec<Event> = private.iter().map(strip_private).collect();
+        let sb = Steckbrief::build(&qwen_row(), &stripped, &Scope::Global, NOW);
+        assert!(!sb.render_short(None).contains("Bewährt"));
+        let none = Steckbrief::build(&qwen_row(), &[], &Scope::Global, NOW);
+        assert!(!none.render_short(None).contains("Bewährt"));
     }
 }

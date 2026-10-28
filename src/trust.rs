@@ -37,16 +37,28 @@ impl ModelKey {
 
     pub fn model_id(&self) -> String {
         let mut hasher = Sha256::new();
-        for part in [&self.provider, &self.model, &self.checkpoint, &self.quant, &self.harness] {
+        for part in [
+            &self.provider,
+            &self.model,
+            &self.checkpoint,
+            &self.quant,
+            &self.harness,
+        ] {
             hasher.update((part.len() as u64).to_be_bytes());
             hasher.update(part.as_bytes());
         }
-        let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         hex[..MODEL_ID_LEN].to_string()
     }
 
     pub fn is_gold(&self) -> bool {
-        self.provider == "anthropic" && self.model == "claude-opus-5-5" && self.harness == "claude-code"
+        self.provider == "anthropic"
+            && self.model == "claude-opus-5-5"
+            && self.harness == "claude-code"
     }
 }
 
@@ -277,10 +289,17 @@ pub struct Event {
     pub summary: Option<String>,
     pub conclusion: Option<String>,
     pub visibility: Visibility,
+    pub questions: Option<i64>,
 }
 
 impl Event {
-    pub fn new(model_id: &str, dimension: Dimension, scope: Scope, outcome: Outcome, ts_ms: i64) -> Self {
+    pub fn new(
+        model_id: &str,
+        dimension: Dimension,
+        scope: Scope,
+        outcome: Outcome,
+        ts_ms: i64,
+    ) -> Self {
         Self {
             event_id: uuid::Uuid::new_v4().to_string(),
             ts_ms,
@@ -301,6 +320,7 @@ impl Event {
             summary: None,
             conclusion: None,
             visibility: Visibility::Shared,
+            questions: None,
         }
     }
 }
@@ -330,14 +350,26 @@ pub struct Cell {
 
 impl Cell {
     fn new(value: f64) -> Self {
-        Self { value, counters: Counters::default(), last_block: None, manual: false }
+        Self {
+            value,
+            counters: Counters::default(),
+            last_block: None,
+            manual: false,
+        }
     }
 }
 
 pub fn dedup_sorted(events: impl IntoIterator<Item = Event>) -> Vec<Event> {
     let mut seen = HashSet::new();
-    let mut out: Vec<Event> = events.into_iter().filter(|e| seen.insert(e.event_id.clone())).collect();
-    out.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.event_id.cmp(&b.event_id)));
+    let mut out: Vec<Event> = events
+        .into_iter()
+        .filter(|e| seen.insert(e.event_id.clone()))
+        .collect();
+    out.sort_by(|a, b| {
+        a.ts_ms
+            .cmp(&b.ts_ms)
+            .then_with(|| a.event_id.cmp(&b.event_id))
+    });
     out
 }
 
@@ -356,7 +388,13 @@ impl TrustBook {
         let (kept, rest) = match cut {
             Some(i) => {
                 book.reset_at = Some(sorted[i].ts_ms);
-                (sorted[..i].iter().filter(|e| e.outcome == Outcome::Blocked).collect::<Vec<_>>(), &sorted[i + 1..])
+                (
+                    sorted[..i]
+                        .iter()
+                        .filter(|e| e.outcome == Outcome::Blocked)
+                        .collect::<Vec<_>>(),
+                    &sorted[i + 1..],
+                )
             }
             None => (Vec::new(), &sorted[..]),
         };
@@ -371,11 +409,15 @@ impl TrustBook {
     }
 
     pub fn value(&self, dimension: Dimension, scope: &Scope) -> f64 {
-        self.resolve(dimension, scope).map_or(dimension.start(), |c| c.value)
+        self.resolve(dimension, scope)
+            .map_or(dimension.start(), |c| c.value)
     }
 
     pub fn resolve(&self, dimension: Dimension, scope: &Scope) -> Option<&Cell> {
-        scope.chain().into_iter().find_map(|s| self.cells.get(&(dimension, s)))
+        scope
+            .chain()
+            .into_iter()
+            .find_map(|s| self.cells.get(&(dimension, s)))
     }
 
     pub fn cell(&self, dimension: Dimension, scope: &Scope) -> Option<&Cell> {
@@ -389,9 +431,12 @@ impl TrustBook {
     fn entry(&mut self, dimension: Dimension, scope: &Scope) -> &mut Cell {
         if !self.cells.contains_key(&(dimension, scope.clone())) {
             let inherited = self.value(dimension, scope);
-            self.cells.insert((dimension, scope.clone()), Cell::new(inherited));
+            self.cells
+                .insert((dimension, scope.clone()), Cell::new(inherited));
         }
-        self.cells.get_mut(&(dimension, scope.clone())).expect("inserted above")
+        self.cells
+            .get_mut(&(dimension, scope.clone()))
+            .expect("inserted above")
     }
 
     fn count_only(&mut self, e: &Event) {
@@ -408,13 +453,18 @@ impl TrustBook {
         if matches!(e.outcome, Outcome::Note | Outcome::Aborted | Outcome::Reset) {
             return self.count_only(e);
         }
-        let weight = if now_ms - e.ts_ms > HALF_WEIGHT_AFTER_MS { 0.5 } else { 1.0 };
+        let weight = if now_ms - e.ts_ms > HALF_WEIGHT_AFTER_MS {
+            0.5
+        } else {
+            1.0
+        };
         let cell = self.entry(e.dimension, &e.scope);
         match e.outcome {
             Outcome::Accepted => {
                 cell.counters.accepted += 1;
                 if cell.value < ACCEPT_CAP {
-                    cell.value = (cell.value + (1.0 - cell.value) * ACCEPT_RATE * weight).min(ACCEPT_CAP);
+                    cell.value =
+                        (cell.value + (1.0 - cell.value) * ACCEPT_RATE * weight).min(ACCEPT_CAP);
                 }
             }
             Outcome::Rejected => {
@@ -425,11 +475,17 @@ impl TrustBook {
             Outcome::Blocked => {
                 cell.counters.blocked += 1;
                 cell.value -= cell.value * BLOCK_RATE * weight;
-                cell.last_block = Some(LastBlock { ts_ms: e.ts_ms, reason: e.block_reason.clone().unwrap_or_default() });
+                cell.last_block = Some(LastBlock {
+                    ts_ms: e.ts_ms,
+                    reason: e.block_reason.clone().unwrap_or_default(),
+                });
                 if e.scope != Scope::Global {
                     let global = self.entry(e.dimension, &Scope::Global);
                     global.value -= global.value * BLOCK_RATE * weight;
-                    global.last_block = Some(LastBlock { ts_ms: e.ts_ms, reason: e.block_reason.clone().unwrap_or_default() });
+                    global.last_block = Some(LastBlock {
+                        ts_ms: e.ts_ms,
+                        reason: e.block_reason.clone().unwrap_or_default(),
+                    });
                 }
             }
             Outcome::Seed => {
@@ -454,7 +510,12 @@ impl Standing {
     pub fn compute(key: &ModelKey, sperre: Sperre, events: &[Event], now_ms: i64) -> Self {
         let model_id = key.model_id();
         let book = TrustBook::replay(events, &model_id, now_ms);
-        Self { model_id, gold: key.is_gold(), sperre, book }
+        Self {
+            model_id,
+            gold: key.is_gold(),
+            sperre,
+            book,
+        }
     }
 
     pub fn trust(&self, dimension: Dimension, scope: &Scope) -> f64 {
@@ -487,7 +548,11 @@ impl Standing {
     }
 
     pub fn manual(&self, dimension: Dimension, scope: &Scope) -> bool {
-        !self.gold && self.book.resolve(dimension, scope).is_some_and(|c| c.manual)
+        !self.gold
+            && self
+                .book
+                .resolve(dimension, scope)
+                .is_some_and(|c| c.manual)
     }
 
     pub fn protected_locked(&self) -> bool {
@@ -517,7 +582,13 @@ mod tests {
     }
 
     fn qwen() -> ModelKey {
-        ModelKey::new("dgx", "qwen3-coder-next", "qwen3-coder-next", "q8", "opencode")
+        ModelKey::new(
+            "dgx",
+            "qwen3-coder-next",
+            "qwen3-coder-next",
+            "q8",
+            "opencode",
+        )
     }
 
     fn near(a: f64, b: f64) {
@@ -532,12 +603,22 @@ mod tests {
         let mut b = a.clone();
         b.checkpoint = "other".into();
         assert_ne!(a.model_id(), b.model_id());
-        assert_ne!(ModelKey::new("ab", "c", "", "", "").model_id(), ModelKey::new("a", "bc", "", "", "").model_id());
+        assert_ne!(
+            ModelKey::new("ab", "c", "", "", "").model_id(),
+            ModelKey::new("a", "bc", "", "", "").model_id()
+        );
     }
 
     #[test]
     fn gold_matches_only_opus_in_claude_code() {
-        assert!(ModelKey::new("anthropic", "claude-opus-5-5", "claude-opus-5-5-20261001", "fp8", "claude-code").is_gold());
+        assert!(ModelKey::new(
+            "anthropic",
+            "claude-opus-5-5",
+            "claude-opus-5-5-20261001",
+            "fp8",
+            "claude-code"
+        )
+        .is_gold());
         assert!(!ModelKey::new("anthropic", "claude-opus-5-5", "x", "", "opencode").is_gold());
         assert!(!ModelKey::new("anthropic", "claude-sonnet-5-5", "x", "", "claude-code").is_gold());
         assert!(!ModelKey::new("other", "claude-opus-5-5", "x", "", "claude-code").is_gold());
@@ -548,7 +629,10 @@ mod tests {
         let m = Scope::parse("module:r/src/a").unwrap();
         assert_eq!(m, Scope::Module("r".into(), "src/a".into()));
         assert_eq!(m.to_string(), "module:r/src/a");
-        assert_eq!(m.chain(), vec![m.clone(), Scope::Repo("r".into()), Scope::Global]);
+        assert_eq!(
+            m.chain(),
+            vec![m.clone(), Scope::Repo("r".into()), Scope::Global]
+        );
         assert!(Scope::parse("repo:").is_err());
         assert!(Scope::parse("module:r").is_err());
         assert!(Scope::parse("x").is_err());
@@ -559,7 +643,11 @@ mod tests {
         let id = qwen().model_id();
         let mut blocked = ev(&id, Dimension::WriteCode, "global", Outcome::Blocked, 1000);
         blocked.block_reason = Some("Validierung decided_by entfernt".into());
-        let events = vec![seed(&id, Dimension::Search, 0.55, 3), seed(&id, Dimension::Inventory, 0.35, 2), blocked];
+        let events = vec![
+            seed(&id, Dimension::Search, 0.55, 3),
+            seed(&id, Dimension::Inventory, 0.35, 2),
+            blocked,
+        ];
         let s = Standing::compute(&qwen(), Sperre::Technisch, &events, NOW);
         let g = Scope::Global;
         near(s.trust(Dimension::Search, &g), 0.55);
@@ -571,7 +659,16 @@ mod tests {
         assert!(!s.manual(Dimension::WriteCode, &g));
         assert!(!s.write_right(Dimension::WriteCode, &g));
         near(s.pruefanteil(Dimension::Search, &g), 0.45);
-        assert_eq!(s.book.cell(Dimension::WriteCode, &g).unwrap().last_block.as_ref().unwrap().reason, "Validierung decided_by entfernt");
+        assert_eq!(
+            s.book
+                .cell(Dimension::WriteCode, &g)
+                .unwrap()
+                .last_block
+                .as_ref()
+                .unwrap()
+                .reason,
+            "Validierung decided_by entfernt"
+        );
     }
 
     #[test]
@@ -589,22 +686,41 @@ mod tests {
     fn accepted_rejected_and_cap() {
         let g = Scope::Global;
         let acc = |ts| ev("m", Dimension::Search, "global", Outcome::Accepted, ts);
-        near(TrustBook::replay(&[acc(1)], "m", NOW).value(Dimension::Search, &g), 0.30 + 0.70 * 0.05);
+        near(
+            TrustBook::replay(&[acc(1)], "m", NOW).value(Dimension::Search, &g),
+            0.30 + 0.70 * 0.05,
+        );
         let rej = ev("m", Dimension::Search, "global", Outcome::Rejected, 1);
-        near(TrustBook::replay(&[rej], "m", NOW).value(Dimension::Search, &g), 0.30 * 0.85);
+        near(
+            TrustBook::replay(&[rej], "m", NOW).value(Dimension::Search, &g),
+            0.30 * 0.85,
+        );
         let many: Vec<Event> = (0..200).map(acc).collect();
-        near(TrustBook::replay(&many, "m", NOW).value(Dimension::Search, &g), 0.95);
+        near(
+            TrustBook::replay(&many, "m", NOW).value(Dimension::Search, &g),
+            0.95,
+        );
         let mut high = vec![seed("m", Dimension::Search, 0.97, 0)];
         high.push(acc(1));
-        near(TrustBook::replay(&high, "m", NOW).value(Dimension::Search, &g), 0.97);
+        near(
+            TrustBook::replay(&high, "m", NOW).value(Dimension::Search, &g),
+            0.97,
+        );
     }
 
     #[test]
     fn aborted_and_note_are_noops_but_counted_on_existing_cells() {
-        let events = vec![seed("m", Dimension::Search, 0.30, 0), ev("m", Dimension::Search, "global", Outcome::Aborted, 1), ev("m", Dimension::Search, "global", Outcome::Note, 2)];
+        let events = vec![
+            seed("m", Dimension::Search, 0.30, 0),
+            ev("m", Dimension::Search, "global", Outcome::Aborted, 1),
+            ev("m", Dimension::Search, "global", Outcome::Note, 2),
+        ];
         let book = TrustBook::replay(&events, "m", NOW);
         near(book.value(Dimension::Search, &Scope::Global), 0.30);
-        let c = &book.cell(Dimension::Search, &Scope::Global).unwrap().counters;
+        let c = &book
+            .cell(Dimension::Search, &Scope::Global)
+            .unwrap()
+            .counters;
         assert_eq!((c.aborted, c.note), (1, 1));
     }
 
@@ -613,13 +729,29 @@ mod tests {
         let mut events = vec![
             seed("m", Dimension::WriteCode, 0.55, 0),
             ev("m", Dimension::WriteCode, "module:r/src", Outcome::Note, 1),
-            ev("m", Dimension::WriteCode, "module:r/src", Outcome::Aborted, 2),
+            ev(
+                "m",
+                Dimension::WriteCode,
+                "module:r/src",
+                Outcome::Aborted,
+                2,
+            ),
             ev("m", Dimension::WriteCode, "repo:r", Outcome::Reset, 3),
         ];
         let book = TrustBook::replay(&events, "m", NOW);
-        assert!(book.cell(Dimension::WriteCode, &Scope::parse("module:r/src").unwrap()).is_none());
-        assert!(book.cell(Dimension::WriteCode, &Scope::parse("repo:r").unwrap()).is_none());
-        events.push(ev("m", Dimension::WriteCode, "repo:other", Outcome::Blocked, 4));
+        assert!(book
+            .cell(Dimension::WriteCode, &Scope::parse("module:r/src").unwrap())
+            .is_none());
+        assert!(book
+            .cell(Dimension::WriteCode, &Scope::parse("repo:r").unwrap())
+            .is_none());
+        events.push(ev(
+            "m",
+            Dimension::WriteCode,
+            "repo:other",
+            Outcome::Blocked,
+            4,
+        ));
         let book = TrustBook::replay(&events, "m", NOW);
         assert!(book.value(Dimension::WriteCode, &Scope::parse("module:r/src").unwrap()) < 0.55);
     }
@@ -628,11 +760,20 @@ mod tests {
     fn old_events_count_half_but_seed_does_not() {
         let old = -91 * MS_PER_DAY;
         let rej = ev("m", Dimension::Search, "global", Outcome::Rejected, old);
-        near(TrustBook::replay(&[rej], "m", NOW).value(Dimension::Search, &Scope::Global), 0.30 * (1.0 - 0.075));
+        near(
+            TrustBook::replay(&[rej], "m", NOW).value(Dimension::Search, &Scope::Global),
+            0.30 * (1.0 - 0.075),
+        );
         let acc = ev("m", Dimension::Search, "global", Outcome::Accepted, old);
-        near(TrustBook::replay(&[acc], "m", NOW).value(Dimension::Search, &Scope::Global), 0.30 + 0.70 * 0.025);
+        near(
+            TrustBook::replay(&[acc], "m", NOW).value(Dimension::Search, &Scope::Global),
+            0.30 + 0.70 * 0.025,
+        );
         let s = seed("m", Dimension::Search, 0.55, old);
-        near(TrustBook::replay(&[s], "m", NOW).value(Dimension::Search, &Scope::Global), 0.55);
+        near(
+            TrustBook::replay(&[s], "m", NOW).value(Dimension::Search, &Scope::Global),
+            0.55,
+        );
     }
 
     #[test]
@@ -644,43 +785,99 @@ mod tests {
         near(book.value(Dimension::Search, &Scope::Global), 0.30 * 0.85);
         let s = seed("m", Dimension::Search, 0.8, 2);
         let r = ev("m", Dimension::Search, "global", Outcome::Rejected, 3);
-        near(TrustBook::replay(&[r.clone(), s.clone()], "m", NOW).value(Dimension::Search, &Scope::Global), 0.8 * 0.85);
+        near(
+            TrustBook::replay(&[r.clone(), s.clone()], "m", NOW)
+                .value(Dimension::Search, &Scope::Global),
+            0.8 * 0.85,
+        );
         let r_early = ev("m", Dimension::Search, "global", Outcome::Rejected, 1);
-        near(TrustBook::replay(&[s, r_early], "m", NOW).value(Dimension::Search, &Scope::Global), 0.8);
+        near(
+            TrustBook::replay(&[s, r_early], "m", NOW).value(Dimension::Search, &Scope::Global),
+            0.8,
+        );
     }
 
     #[test]
     fn module_can_exceed_global_and_falls_back() {
-        let mut events: Vec<Event> = (0..10).map(|i| ev("m", Dimension::WriteCode, "module:r/src", Outcome::Accepted, i)).collect();
-        events.push(ev("m", Dimension::WriteCode, "global", Outcome::Rejected, 100));
+        let mut events: Vec<Event> = (0..10)
+            .map(|i| {
+                ev(
+                    "m",
+                    Dimension::WriteCode,
+                    "module:r/src",
+                    Outcome::Accepted,
+                    i,
+                )
+            })
+            .collect();
+        events.push(ev(
+            "m",
+            Dimension::WriteCode,
+            "global",
+            Outcome::Rejected,
+            100,
+        ));
         let book = TrustBook::replay(&events, "m", NOW);
         let module = book.value(Dimension::WriteCode, &Scope::parse("module:r/src").unwrap());
         let global = book.value(Dimension::WriteCode, &Scope::Global);
         assert!(module > global);
-        near(book.value(Dimension::WriteCode, &Scope::parse("module:r/other").unwrap()), global);
-        near(book.value(Dimension::WriteCode, &Scope::parse("repo:r").unwrap()), global);
+        near(
+            book.value(
+                Dimension::WriteCode,
+                &Scope::parse("module:r/other").unwrap(),
+            ),
+            global,
+        );
+        near(
+            book.value(Dimension::WriteCode, &Scope::parse("repo:r").unwrap()),
+            global,
+        );
     }
 
     #[test]
     fn blocked_in_module_also_lowers_global() {
-        let mut b = ev("m", Dimension::WriteCode, "module:r/src", Outcome::Blocked, 1);
+        let mut b = ev(
+            "m",
+            Dimension::WriteCode,
+            "module:r/src",
+            Outcome::Blocked,
+            1,
+        );
         b.block_reason = Some("x".into());
         let book = TrustBook::replay(&[b], "m", NOW);
-        near(book.value(Dimension::WriteCode, &Scope::parse("module:r/src").unwrap()), 0.10);
+        near(
+            book.value(Dimension::WriteCode, &Scope::parse("module:r/src").unwrap()),
+            0.10,
+        );
         near(book.value(Dimension::WriteCode, &Scope::Global), 0.10);
-        assert_eq!(book.cell(Dimension::WriteCode, &Scope::Global).unwrap().counters.blocked, 0);
+        assert_eq!(
+            book.cell(Dimension::WriteCode, &Scope::Global)
+                .unwrap()
+                .counters
+                .blocked,
+            0
+        );
     }
 
     #[test]
     fn events_of_other_models_are_ignored() {
         let e = ev("other", Dimension::Search, "global", Outcome::Rejected, 1);
-        near(TrustBook::replay(&[e], "m", NOW).value(Dimension::Search, &Scope::Global), 0.30);
+        near(
+            TrustBook::replay(&[e], "m", NOW).value(Dimension::Search, &Scope::Global),
+            0.30,
+        );
     }
 
     #[test]
     fn gold_is_one_everywhere() {
         let key = ModelKey::new("anthropic", "claude-opus-5-5", "c", "", "claude-code");
-        let mut b = ev(&key.model_id(), Dimension::WriteCode, "global", Outcome::Blocked, 1);
+        let mut b = ev(
+            &key.model_id(),
+            Dimension::WriteCode,
+            "global",
+            Outcome::Blocked,
+            1,
+        );
         b.block_reason = Some("x".into());
         let s = Standing::compute(&key, Sperre::Technisch, &[b], NOW);
         let scope = Scope::parse("module:r/x").unwrap();
@@ -699,8 +896,20 @@ mod tests {
         let id = key.model_id();
         let mut events = vec![];
         for i in 0..100 {
-            events.push(ev(&id, Dimension::WriteCode, "global", Outcome::Accepted, i));
-            events.push(ev(&id, Dimension::Decisions, "global", Outcome::Accepted, i));
+            events.push(ev(
+                &id,
+                Dimension::WriteCode,
+                "global",
+                Outcome::Accepted,
+                i,
+            ));
+            events.push(ev(
+                &id,
+                Dimension::Decisions,
+                "global",
+                Outcome::Accepted,
+                i,
+            ));
         }
         let g = Scope::Global;
         let tech = Standing::compute(&key, Sperre::Technisch, &events, NOW);
@@ -722,10 +931,32 @@ mod tests {
         let id = key.model_id();
         let mut blocked = ev(&id, Dimension::WriteCode, "global", Outcome::Blocked, 1000);
         blocked.block_reason = Some("Validierung decided_by entfernt".into());
-        let mut events = vec![seed(&id, Dimension::Search, 0.55, 3), seed(&id, Dimension::Inventory, 0.35, 2), blocked];
-        events.push(ev(&id, Dimension::Inventory, "global", Outcome::Accepted, 1500));
-        events.push(ev(&id, Dimension::Search, "global", Outcome::Rejected, 1600));
-        events.push(ev(&id, Dimension::Decisions, "repo:r", Outcome::Rejected, 1700));
+        let mut events = vec![
+            seed(&id, Dimension::Search, 0.55, 3),
+            seed(&id, Dimension::Inventory, 0.35, 2),
+            blocked,
+        ];
+        events.push(ev(
+            &id,
+            Dimension::Inventory,
+            "global",
+            Outcome::Accepted,
+            1500,
+        ));
+        events.push(ev(
+            &id,
+            Dimension::Search,
+            "global",
+            Outcome::Rejected,
+            1600,
+        ));
+        events.push(ev(
+            &id,
+            Dimension::Decisions,
+            "repo:r",
+            Outcome::Rejected,
+            1700,
+        ));
         events.push(ev(&id, Dimension::Search, "global", Outcome::Reset, 2000));
         let s = Standing::compute(&key, Sperre::Technisch, &events, NOW);
         let g = Scope::Global;
@@ -736,20 +967,45 @@ mod tests {
         near(s.trust(Dimension::Decisions, &g), 0.10);
         assert!(!s.manual(Dimension::Search, &g) && !s.manual(Dimension::Inventory, &g));
         assert_eq!(s.book.reset_at(), Some(BASE + 2000));
-        assert_eq!(s.book.cell(Dimension::WriteCode, &g).unwrap().counters.blocked, 1);
+        assert_eq!(
+            s.book
+                .cell(Dimension::WriteCode, &g)
+                .unwrap()
+                .counters
+                .blocked,
+            1
+        );
         assert!(s.book.cell(Dimension::Search, &g).is_none());
-        events.push(ev(&id, Dimension::Search, "global", Outcome::Rejected, 3000));
+        events.push(ev(
+            &id,
+            Dimension::Search,
+            "global",
+            Outcome::Rejected,
+            3000,
+        ));
         let later = Standing::compute(&key, Sperre::Technisch, &events, NOW);
         near(later.trust(Dimension::Search, &g), 0.30 * 0.85);
         let mut again = events.clone();
         again.push(ev(&id, Dimension::Search, "global", Outcome::Reset, 4000));
-        near(Standing::compute(&key, Sperre::Technisch, &again, NOW).trust(Dimension::WriteCode, &g), 0.10);
-        near(Standing::compute(&key, Sperre::Technisch, &again, NOW).trust(Dimension::Search, &g), 0.30);
+        near(
+            Standing::compute(&key, Sperre::Technisch, &again, NOW).trust(Dimension::WriteCode, &g),
+            0.10,
+        );
+        near(
+            Standing::compute(&key, Sperre::Technisch, &again, NOW).trust(Dimension::Search, &g),
+            0.30,
+        );
     }
 
     #[test]
     fn reset_of_other_model_is_ignored() {
-        let events = vec![ev("other", Dimension::Search, "global", Outcome::Reset, 5), ev("m", Dimension::Search, "global", Outcome::Rejected, 1)];
-        near(TrustBook::replay(&events, "m", NOW).value(Dimension::Search, &Scope::Global), 0.30 * 0.85);
+        let events = vec![
+            ev("other", Dimension::Search, "global", Outcome::Reset, 5),
+            ev("m", Dimension::Search, "global", Outcome::Rejected, 1),
+        ];
+        near(
+            TrustBook::replay(&events, "m", NOW).value(Dimension::Search, &Scope::Global),
+            0.30 * 0.85,
+        );
     }
 }
