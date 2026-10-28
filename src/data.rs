@@ -1068,20 +1068,30 @@ impl Steckbrief {
                 lessons.push(t);
             }
         }
-        let mut proven: Vec<String> = Vec::new();
-        for c in own
+        let mut accepted: Vec<(bool, i64, String)> = own
             .iter()
-            .filter(|e| e.outcome == Outcome::Accepted && chain.contains(&e.scope))
+            .filter(|e| e.outcome == Outcome::Accepted)
             .filter_map(|e| {
+                let local = chain.contains(&e.scope);
                 e.conclusion
                     .clone()
                     .filter(|c| !c.trim().is_empty())
-                    .map(|c| (e.ts_ms, c))
+                    .map(|c| {
+                        (
+                            local,
+                            e.ts_ms,
+                            if local {
+                                c
+                            } else {
+                                format!("[{}] {c}", e.scope)
+                            },
+                        )
+                    })
             })
-            .collect::<std::collections::BTreeMap<_, _>>()
-            .into_values()
-            .rev()
-        {
+            .collect();
+        accepted.sort_by_key(|(local, ts, _)| (!*local, std::cmp::Reverse(*ts)));
+        let mut proven: Vec<String> = Vec::new();
+        for (_, _, c) in accepted {
             if proven.len() < 2 && !proven.contains(&c) {
                 proven.push(c);
             }
@@ -2122,5 +2132,61 @@ mod tests {
         assert_eq!(r.counters.accepted, 3);
         assert!(sb.rows.iter().all(|r| !r.scope.to_string().contains("p-")));
         assert!(!sb.render().contains("repo:p-"));
+    }
+
+    #[test]
+    fn global_steckbrief_shows_repo_successes_with_scope_prefix_after_chain_ones() {
+        let id = qwen_row().model_id();
+        let mut a = ev(
+            &id,
+            Dimension::WriteCode,
+            "repo:Deep_Frame",
+            Outcome::Accepted,
+            5,
+        );
+        a.conclusion = Some("82/82 green".into());
+        let mut b = ev(
+            &id,
+            Dimension::WriteCode,
+            "repo:Other",
+            Outcome::Accepted,
+            4,
+        );
+        b.conclusion = Some("alt".into());
+        let mut g = ev(&id, Dimension::WriteCode, "global", Outcome::Accepted, 1);
+        g.conclusion = Some("global ok".into());
+        let sb = Steckbrief::build(&qwen_row(), &[a.clone(), b, g.clone()], &Scope::Global, NOW);
+        assert_eq!(
+            sb.proven,
+            vec!["global ok", "[repo:Deep_Frame] 82/82 green"]
+        );
+        let sb = Steckbrief::build(
+            &qwen_row(),
+            &[a, g],
+            &Scope::parse("repo:Deep_Frame").unwrap(),
+            NOW,
+        );
+        assert_eq!(sb.proven, vec!["82/82 green", "global ok"]);
+        assert!(sb
+            .render_short(None)
+            .contains("Bewährt: 82/82 green; global ok\n"));
+    }
+
+    #[test]
+    fn peer_private_success_yields_no_proven_entry_and_no_pseudonym() {
+        let id = qwen_row().model_id();
+        let mut e = private_repo_event("p1", 3);
+        e.model_id = id;
+        let peer = shared_copy(&e, Some(b"peer-secret"));
+        let alias = pseudonym(b"peer-secret", "Deep_Frame");
+        assert!(peer.scope.to_string().contains(&alias));
+        let sb = Steckbrief::build(&qwen_row(), &[peer], &Scope::Global, NOW);
+        assert!(sb.proven.is_empty());
+        for text in [sb.render(), sb.render_short(None)] {
+            assert!(
+                !text.contains(&alias) && !text.contains("p-") && !text.contains("Bewährt"),
+                "{text}"
+            );
+        }
     }
 }
